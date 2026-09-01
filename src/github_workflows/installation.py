@@ -1,4 +1,4 @@
-"""Install the repository's Qwen extension and Codex skills."""
+"""Install the repository's user policies, Qwen extension, and Codex skills."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 POLARS_URL = "https://github.com/polars-inc/skills"
+USER_POLICY_MARKER = "<!-- managed by agent-workflows; edit user-policies sources -->"
 
 
 def repository_root() -> Path:
@@ -66,6 +67,7 @@ class Installer:
         self.cache = Path(os.environ.get("XDG_CACHE_HOME", self.home / ".cache"))
         self.changes: list[str] = []
         self.warnings: list[str] = []
+        self.changed_components: set[str] = set()
 
     def notice(self, message: str) -> None:
         if self.args.verbose:
@@ -99,6 +101,7 @@ class Installer:
         executable = self.root / ".venv" / "bin" / "agent-workflows"
         if current != expected or not executable.is_file():
             self.changes.append("install the Python environment")
+            self.changed_components.add("runtime")
         else:
             self.notice("Python environment is current")
 
@@ -113,8 +116,58 @@ class Installer:
                 self.notice(f"Codex skill {source.name} is current")
             elif not target.exists() and not target.is_symlink():
                 self.changes.append(f"link Codex skill {source.name}")
+                self.changed_components.add("codex")
             else:
                 self.warnings.append(f"refusing unmanaged Codex skill: {target}")
+
+    def user_policy_targets(self) -> tuple[tuple[Path, Path, str], ...]:
+        return (
+            (
+                self.root / "user-policies" / "codex.md",
+                self.home / ".codex" / "AGENTS.md",
+                "Codex user instructions",
+            ),
+            (
+                self.root / "user-policies" / "qwen.md",
+                self.home / ".qwen" / "QWEN.md",
+                "Qwen user instructions",
+            ),
+        )
+
+    def rendered_user_policy(self, source: Path) -> str:
+        sections = [USER_POLICY_MARKER, source.read_text(encoding="utf-8").strip()]
+        if self.args.machine_role == "remote":
+            sections.append(
+                (self.root / "user-policies" / "remote-compute.md")
+                .read_text(encoding="utf-8")
+                .strip()
+            )
+        return "\n\n".join(sections) + "\n"
+
+    def managed_user_policy(self, target: Path) -> bool:
+        linked = resolved_link(target)
+        sources = {source.resolve() for source, _target, _label in self.user_policy_targets()}
+        if linked in sources:
+            return True
+        if not target.is_file() or target.is_symlink():
+            return False
+        content = target.read_text(encoding="utf-8")
+        if content.startswith(USER_POLICY_MARKER):
+            return True
+        return any(content == source.read_text(encoding="utf-8") for source in sources)
+
+    def plan_user_policies(self) -> None:
+        for source, target, label in self.user_policy_targets():
+            expected = self.rendered_user_policy(source)
+            if target.is_file() and not target.is_symlink() and target.read_text() == expected:
+                self.notice(f"{label} are current")
+            elif (not target.exists() and not target.is_symlink()) or self.managed_user_policy(
+                target
+            ):
+                self.changes.append(f"install {label}")
+                self.changed_components.add("user-policies")
+            else:
+                self.warnings.append(f"refusing unmanaged {label}: {target}")
 
     def plan_qwen(self) -> None:
         if command_path("qwen") is None:
@@ -127,6 +180,7 @@ class Installer:
             self.notice("Qwen extension is current")
         elif not target.exists() and not target.is_symlink():
             self.changes.append("link the Qwen github-workflows extension")
+            self.changed_components.add("qwen")
         else:
             self.warnings.append(f"refusing unmanaged Qwen extension: {target}")
 
@@ -134,6 +188,7 @@ class Installer:
         checkout = self.cache / "agent-workflows" / "upstream" / "polars-skills"
         if not checkout.is_dir():
             self.changes.append("clone the official Polars skill")
+            self.changed_components.add("polars")
         for agent in ("codex", "qwen"):
             target = self.home / f".{agent}" / "skills" / "polars"
             source = checkout / "polars"
@@ -142,6 +197,7 @@ class Installer:
                 self.notice(f"{agent} Polars skill is current")
             elif not target.exists() and not target.is_symlink():
                 self.changes.append(f"link the Polars skill for {agent}")
+                self.changed_components.add("polars")
             else:
                 self.warnings.append(f"refusing unmanaged Polars skill: {target}")
 
@@ -184,10 +240,23 @@ class Installer:
             self.run(str(pre_commit), "install")
 
     def replace_link(self, source: Path, target: Path) -> None:
-        if target.is_symlink():
+        if target.is_symlink() or target.is_file():
             target.unlink()
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.symlink_to(source, target_is_directory=True)
+        target.symlink_to(source, target_is_directory=source.is_dir())
+
+    def apply_user_policies(self) -> None:
+        for source, target, _label in self.user_policy_targets():
+            expected = self.rendered_user_policy(source)
+            if target.is_file() and not target.is_symlink() and target.read_text() == expected:
+                continue
+            if (not target.exists() and not target.is_symlink()) or self.managed_user_policy(
+                target
+            ):
+                if target.is_symlink() or target.is_file():
+                    target.unlink()
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(expected, encoding="utf-8")
 
     def apply_codex(self) -> None:
         destination = self.home / ".codex" / "skills"
@@ -242,20 +311,33 @@ class Installer:
 
     def install(self) -> int:
         self.plan_runtime()
+        self.plan_user_policies()
         self.plan_codex()
         self.plan_qwen()
         self.plan_polars()
         if not self.approve():
             return 0
-        self.apply_runtime()
-        self.apply_codex()
-        self.apply_qwen()
-        self.apply_polars()
+        if "runtime" in self.changed_components:
+            self.apply_runtime()
+        if "user-policies" in self.changed_components:
+            self.apply_user_policies()
+        if "codex" in self.changed_components:
+            self.apply_codex()
+        if "qwen" in self.changed_components:
+            self.apply_qwen()
+        if "polars" in self.changed_components:
+            self.apply_polars()
         print(f"[OK] Installation complete ({len(self.changes)} changes)")
         return 0
 
 
 def add_install_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--machine-role",
+        choices=("local", "remote"),
+        default="local",
+        help="include remote compute-environment instructions only on remote machines",
+    )
     parser.add_argument(
         "--dev", action="store_true", help="also install development tools and Git hook"
     )

@@ -235,6 +235,16 @@ def _action_requirement(
 def _public_input_schema(name: str, schema: dict[str, Any]) -> dict[str, Any]:
     """Add compact client-side checks for statically knowable request mistakes."""
     result = deepcopy(schema)
+    if name == "task_manage":
+        report = result.get("properties", {}).get("report", {})
+        object_schema = next(
+            (variant for variant in report.get("anyOf", []) if variant.get("type") == "object"),
+            {"type": "object", "additionalProperties": True},
+        )
+        result["properties"]["report"] = {
+            **object_schema,
+            "description": "Structured report object; do not JSON-encode it as a string.",
+        }
     conditions = result.setdefault("allOf", [])
     contract = ACTION_REQUIREMENTS.get(name)
     if contract is not None:

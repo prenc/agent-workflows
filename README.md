@@ -15,10 +15,15 @@ Install `uv`, Qwen Code, and/or Codex first, then run:
 uv run agent-workflows install
 ```
 
-The command installs the project into `.venv`, links this checkout as the Qwen extension,
-links the Codex skills, and installs the official Polars skill for both agents.
+The command installs the project into `.venv`, renders the user-level Codex and
+Qwen instruction files, links this checkout as the Qwen extension, links the
+Codex skills, and installs the official Polars skill for both agents.
+The neutral source artifacts live under `user-policies/`; their filenames do
+not trigger repository instruction discovery before installation.
 It is safe to rerun. Use `--dry-run` to inspect changes, `--yes` for unattended
-installation, and `--verbose` to include unchanged integrations.
+installation, and `--verbose` to include unchanged integrations. The default
+`--machine-role local` omits cluster-specific compute instructions; use
+`--machine-role remote` when installing on a shared remote or HPC machine.
 
 For development setup, including the Git pre-commit hook:
 

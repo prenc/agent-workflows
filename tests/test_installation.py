@@ -10,8 +10,14 @@ import pytest
 from github_workflows import installation
 
 
-def arguments(**overrides: bool) -> argparse.Namespace:
-    values = {"dev": False, "dry_run": True, "yes": False, "verbose": False}
+def arguments(**overrides: object) -> argparse.Namespace:
+    values = {
+        "dev": False,
+        "dry_run": True,
+        "yes": False,
+        "verbose": False,
+        "machine_role": "local",
+    }
     values.update(overrides)
     return argparse.Namespace(**values)
 
@@ -19,6 +25,9 @@ def arguments(**overrides: bool) -> argparse.Namespace:
 @pytest.fixture
 def repository(tmp_path: Path) -> Path:
     (tmp_path / "pyproject.toml").write_text("[project]\nname = 'fixture'\n")
+    (tmp_path / "user-policies").mkdir()
+    (tmp_path / "user-policies" / "codex.md").write_text("Codex policy\n")
+    (tmp_path / "user-policies" / "qwen.md").write_text("Qwen policy\n")
     (tmp_path / "codex" / "skills" / "gh-audit-repo").mkdir(parents=True)
     (tmp_path / "extensions" / "github-workflows").mkdir(parents=True)
     return tmp_path
@@ -38,6 +47,8 @@ def test_dry_run_lists_only_required_changes(
 
     output = capsys.readouterr().out
     assert "install the Python environment" in output
+    assert "install Codex user instructions" in output
+    assert "install Qwen user instructions" in output
     assert "link Codex skill gh-audit-repo" in output
     assert "clone the official Polars skill" in output
     assert "Installation complete" not in output
@@ -68,6 +79,29 @@ def test_current_runtime_is_omitted_unless_verbose(
     assert "Python environment is current" in capsys.readouterr().out
 
 
+def test_install_applies_only_changed_components(
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(installation, "command_path", lambda _name: "/bin/tool")
+    installer = installation.Installer(arguments(dry_run=False, yes=True), repository)
+    installer.home = repository / "home"
+    installer.cache = repository / "cache"
+    applied: list[str] = []
+    monkeypatch.setattr(installer, "plan_runtime", lambda: None)
+    monkeypatch.setattr(installer, "plan_codex", lambda: None)
+    monkeypatch.setattr(installer, "plan_qwen", lambda: None)
+    monkeypatch.setattr(installer, "plan_polars", lambda: None)
+    monkeypatch.setattr(installer, "apply_runtime", lambda: applied.append("runtime"))
+    monkeypatch.setattr(installer, "apply_codex", lambda: applied.append("codex"))
+    monkeypatch.setattr(installer, "apply_qwen", lambda: applied.append("qwen"))
+    monkeypatch.setattr(installer, "apply_polars", lambda: applied.append("polars"))
+    assert installer.install() == 0
+    assert applied == []
+    assert (installer.home / ".codex" / "AGENTS.md").is_file()
+    assert (installer.home / ".qwen" / "QWEN.md").is_file()
+
+
 def test_unmanaged_codex_skill_is_never_replaced(
     repository: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -82,6 +116,58 @@ def test_unmanaged_codex_skill_is_never_replaced(
 
     assert not installer.changes
     assert installer.warnings == [f"refusing unmanaged Codex skill: {target}"]
+
+
+def test_matching_user_policy_files_are_adopted_as_managed_files(
+    repository: Path,
+) -> None:
+    installer = installation.Installer(arguments(), repository)
+    installer.home = repository / "home"
+    codex_target = installer.home / ".codex" / "AGENTS.md"
+    qwen_target = installer.home / ".qwen" / "QWEN.md"
+    codex_target.parent.mkdir(parents=True)
+    qwen_target.parent.mkdir(parents=True)
+    codex_target.write_bytes((repository / "user-policies" / "codex.md").read_bytes())
+    qwen_target.write_bytes((repository / "user-policies" / "qwen.md").read_bytes())
+
+    installer.plan_user_policies()
+    installer.apply_user_policies()
+
+    assert installer.changes == [
+        "install Codex user instructions",
+        "install Qwen user instructions",
+    ]
+    assert not codex_target.is_symlink()
+    assert not qwen_target.is_symlink()
+    assert codex_target.read_text().startswith(installation.USER_POLICY_MARKER)
+    assert qwen_target.read_text().startswith(installation.USER_POLICY_MARKER)
+
+
+def test_remote_compute_policy_is_only_rendered_for_remote_role(repository: Path) -> None:
+    remote_policy = repository / "user-policies" / "remote-compute.md"
+    remote_policy.write_text("## Remote only\n\nSlurm policy\n")
+
+    local = installation.Installer(arguments(), repository)
+    remote = installation.Installer(arguments(machine_role="remote"), repository)
+
+    local_policy = local.rendered_user_policy(repository / "user-policies" / "codex.md")
+    remote_policy_text = remote.rendered_user_policy(repository / "user-policies" / "codex.md")
+    assert "Slurm policy" not in local_policy
+    assert remote_policy_text.endswith("## Remote only\n\nSlurm policy\n")
+
+
+def test_unmanaged_user_policy_is_never_replaced(repository: Path) -> None:
+    installer = installation.Installer(arguments(), repository)
+    installer.home = repository / "home"
+    target = installer.home / ".codex" / "AGENTS.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("local policy\n")
+
+    installer.plan_user_policies()
+    installer.apply_user_policies()
+
+    assert target.read_text() == "local policy\n"
+    assert installer.warnings == [f"refusing unmanaged Codex user instructions: {target}"]
 
 
 def test_noninteractive_install_requires_yes(

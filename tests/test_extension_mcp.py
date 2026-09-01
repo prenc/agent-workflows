@@ -83,6 +83,10 @@ class TestExtensionMcp:
                     properties = tools[name].input_schema["properties"]
                     assert ("action" if name != "audit_probe" else "kind") in properties
                 assert "task" in tools["task_manage"].input_schema["properties"]
+                report_schema = tools["task_manage"].input_schema["properties"]["report"]
+                assert report_schema["type"] == "object"
+                assert "anyOf" not in report_schema
+                assert "report" not in tools["task_manage"].input_schema["required"]
                 assert "candidate_id" in tools["audit_probe"].input_schema["required"]
                 history_properties = tools["history_manage"].input_schema["properties"]
                 assert "records" in history_properties
