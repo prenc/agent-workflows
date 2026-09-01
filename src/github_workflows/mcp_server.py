@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -43,6 +44,55 @@ LOCAL_WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempot
 CONTROL_WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True)
 LOGGER = logging.getLogger(__name__)
 SDK_PREFIX = re.compile(r"^Error executing tool [^:]+:\s*")
+
+ACTION_REQUIREMENTS: dict[str, tuple[str, dict[str, tuple[str, ...]]]] = {
+    "run_manage": ("action", {"start": ("repository",)}),
+    "task_manage": (
+        "action",
+        {
+            "plan": ("task",),
+            "retry": ("task_id",),
+            "mark_running": ("task_id",),
+            "checkpoint": ("task_id", "report"),
+            "complete": ("task_id", "report"),
+            "fail": ("task_id",),
+            "abandon": ("task_id",),
+            "integration_begin": ("task_id",),
+            "integration_end": ("task_id",),
+        },
+    ),
+    "audit_inventory": (
+        "action",
+        {
+            "program": ("programs",),
+            "record_declared": ("facts",),
+            "record_context": ("fact",),
+        },
+    ),
+    "audit_knowledge": (
+        "action",
+        {
+            "reconcile": ("areas",),
+            "update": ("area", "findings"),
+            "context": ("area",),
+        },
+    ),
+    "audit_probe": ("kind", {"pytest": ("selectors",), "python": ("code",)}),
+    "audit_record": (
+        "action",
+        {
+            "phase": ("phase",),
+            "shard": ("shard",),
+            "candidate": ("candidate",),
+            "verdict": ("verdict",),
+            "limitation": ("limitation",),
+            "pending": ("pending",),
+            "head_drift": ("head_drift",),
+            "supervisor_start": ("activity",),
+        },
+    ),
+    "audit_publish": ("action", {"finish": ("receipt",)}),
+}
 
 
 @dataclass(frozen=True)
@@ -168,8 +218,91 @@ def _expected_message(error: ToolError) -> str:
     return message or "tool request failed"
 
 
+def _action_requirement(
+    discriminator: str, action: str, required: tuple[str, ...]
+) -> dict[str, Any]:
+    return {
+        "if": {
+            "properties": {discriminator: {"const": action}},
+            "required": [discriminator],
+        },
+        # Qwen's draft-07 validator renders a dependency as one grouped error,
+        # rather than reporting only the first missing member of ``required``.
+        "then": {"dependencies": {discriminator: list(required)}},
+    }
+
+
+def _public_input_schema(name: str, schema: dict[str, Any]) -> dict[str, Any]:
+    """Add compact client-side checks for statically knowable request mistakes."""
+    result = deepcopy(schema)
+    conditions = result.setdefault("allOf", [])
+    contract = ACTION_REQUIREMENTS.get(name)
+    if contract is not None:
+        discriminator, requirements = contract
+        conditions.extend(
+            _action_requirement(discriminator, action, required)
+            for action, required in requirements.items()
+        )
+    if name == "history_manage":
+        conditions.append(
+            {
+                "if": {
+                    "properties": {"action": {"const": "ingest"}},
+                    "required": ["action"],
+                },
+                "then": {
+                    "oneOf": [
+                        {
+                            "required": ["records"],
+                            "properties": {"records": {"type": "array", "minItems": 1}},
+                            "not": {"required": ["artifacts"]},
+                        },
+                        {
+                            "required": ["artifacts"],
+                            "properties": {"artifacts": {"type": "array", "minItems": 1}},
+                            "not": {"required": ["records"]},
+                        },
+                    ]
+                },
+            }
+        )
+    if name == "history_query":
+        conditions.append(
+            {
+                "anyOf": [
+                    {
+                        "required": ["terms"],
+                        "properties": {"terms": {"type": "string", "minLength": 1}},
+                    },
+                    {"required": ["kind"]},
+                    {"required": ["state"]},
+                    {
+                        "required": ["cutoff"],
+                        "properties": {"cutoff": {"type": "string", "minLength": 1}},
+                    },
+                    {
+                        "required": ["linked"],
+                        "properties": {"linked": {"type": "array", "minItems": 1}},
+                    },
+                ]
+            }
+        )
+    if not conditions:
+        result.pop("allOf", None)
+    return result
+
+
 class WorkflowMCPServer(MCPServer[Any]):
     """Keep SDK and model diagnostics out of agent-facing tool results."""
+
+    async def list_tools(self) -> list[Any]:
+        tools = await super().list_tools()
+        return [
+            tool.model_copy(
+                update={"input_schema": _public_input_schema(tool.name, tool.input_schema)}
+            )
+            for tool in tools
+        ]
 
     async def call_tool(
         self, name: str, arguments: dict[str, Any], context: Any | None = None

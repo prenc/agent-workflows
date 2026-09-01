@@ -183,8 +183,10 @@ presence without opening excluded files. If the primary worktree is on a
 branch other than `main` or `master`, or is detached, pause before creating run
 state and ask the user to confirm that source and explain any intended scope or
 focus. Retry with `source_confirmed: true`; the tool stores confirmation and
-creates or validates the detached worktree. Require `.worktrees/` to be
-ignored. On `--resume`, call the same tool with action `resume` and pass `n`
+creates or validates the detached worktree. Use `.worktrees/` only when Git
+reports it ignored; otherwise the server uses a project-namespaced directory
+under `${XDG_CACHE_HOME:-~/.cache}/agent-workflows/worktrees`. On `--resume`, call the same tool with
+action `resume` and pass `n`
 only when the user supplied it; the tool applies that change atomically.
 
 The server owns the run record and initializes canonical phases, shards, tasks,

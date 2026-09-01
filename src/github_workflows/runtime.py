@@ -274,8 +274,11 @@ class WorkflowRuntime:
             raw_worktree = state.get("audit_worktree")
             if isinstance(raw_worktree, str):
                 worktree = Path(raw_worktree).resolve()
-                expected_root = (self.workspace / ".worktrees").resolve()
-                if worktree.parent != expected_root or not worktree.name.startswith(
+                managed_roots = {
+                    (self.workspace / ".worktrees").resolve(),
+                    self._cache_worktree_root(),
+                }
+                if worktree.parent not in managed_roots or not worktree.name.startswith(
                     "gh-audit-repo-"
                 ):
                     raise ValueError("stale audit worktree is outside the managed location")
@@ -296,14 +299,25 @@ class WorkflowRuntime:
                     )
         shutil.rmtree(current)
 
-    def _source_and_worktree(self, confirmed: bool) -> dict[str, Any]:
-        source = self._invoke(workflow_run.audit_source, project_root=self.workspace)
-        if source.get("confirmation_required") and not confirmed:
-            raise ValueError(
-                "the audit source is not main/master; obtain user confirmation and retry"
-            )
-        sha = str(source["sha"])
-        worktree = self.workspace / ".worktrees" / f"gh-audit-repo-{sha[:7]}"
+    @staticmethod
+    def _ensure_private_directory(path: Path) -> Path:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        metadata = path.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            raise PermissionError("worktree cache must be an owned directory")
+        path.chmod(0o700)
+        return path.resolve()
+
+    def _cache_worktree_root(self) -> Path:
+        cache = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))).expanduser()
+        if not cache.is_absolute():
+            raise ValueError("XDG_CACHE_HOME must be an absolute path")
+        application = self._ensure_private_directory(cache / "agent-workflows")
+        worktrees = self._ensure_private_directory(application / "worktrees")
+        identity = hashlib.sha256(str(self.workspace).encode()).hexdigest()[:16]
+        return self._ensure_private_directory(worktrees / identity)
+
+    def _worktree_root(self) -> Path:
         ignored = subprocess.run(
             [
                 "git",
@@ -316,8 +330,20 @@ class WorkflowRuntime:
             ],
             check=False,
         )
-        if ignored.returncode != 0:
-            raise ValueError(".worktrees/ must be ignored before starting an audit")
+        return (
+            (self.workspace / ".worktrees").resolve()
+            if ignored.returncode == 0
+            else self._cache_worktree_root()
+        )
+
+    def _source_and_worktree(self, confirmed: bool) -> dict[str, Any]:
+        source = self._invoke(workflow_run.audit_source, project_root=self.workspace)
+        if source.get("confirmation_required") and not confirmed:
+            raise ValueError(
+                "the audit source is not main/master; obtain user confirmation and retry"
+            )
+        sha = str(source["sha"])
+        worktree = self._worktree_root() / f"gh-audit-repo-{sha[:7]}"
         if worktree.exists():
             actual = subprocess.run(
                 ["git", "-C", str(worktree), "rev-parse", "HEAD"],

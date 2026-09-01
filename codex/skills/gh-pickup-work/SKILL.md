@@ -187,12 +187,14 @@ Keep the issue-level atomic claim authoritative over PR status.
 Use these canonical worktree paths when no safe reusable worktree exists:
 
 ```text
-single new issue:     <project>/.worktrees/issue-<N>-<slug>
-new issue bundle:    <project>/.worktrees/issues-<anchor>-<shared-outcome-slug>
-single existing PR:  <project>/.worktrees/issue-<N>-pr-<P>-continue
-bundle existing PR:  <project>/.worktrees/issues-<anchor>-pr-<P>-continue
-single branch no PR: <project>/.worktrees/issue-<N>-continue
-bundle branch no PR: <project>/.worktrees/issues-<anchor>-continue
+preferred root:      <project>/.worktrees
+fallback root:       ${XDG_CACHE_HOME:-~/.cache}/agent-workflows/worktrees/<project-id>
+single new issue:     <root>/issue-<N>-<slug>
+new issue bundle:    <root>/issues-<anchor>-<shared-outcome-slug>
+single existing PR:  <root>/issue-<N>-pr-<P>-continue
+bundle existing PR:  <root>/issues-<anchor>-pr-<P>-continue
+single branch no PR: <root>/issue-<N>-continue
+bundle branch no PR: <root>/issues-<anchor>-continue
 ```
 
 Use `issue-<N>-<slug>` as a new single-issue branch and
@@ -202,7 +204,9 @@ the shared implementation outcome, for example
 Confirm the exact local and remote branch name is unused. An existing PR keeps
 its current head branch name.
 
-Require `.worktrees/` ignored. Inspect `git worktree list --porcelain`, branch
+Use the preferred root only when `git check-ignore --no-index` confirms
+`.worktrees/` is ignored. Otherwise use the project-namespaced fallback root;
+do not modify ignore files merely to place a worktree. Inspect `git worktree list --porcelain`, branch
 state, Git-operation state, and local changes. Reuse a worktree only when it
 demonstrably belongs to the selected repository, unit, and branch. Never reset,
 clean, stash, overwrite, or repurpose unrelated state. Link `.venv` to the main

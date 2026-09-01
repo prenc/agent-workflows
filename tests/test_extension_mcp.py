@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import stat
 import subprocess
 import tempfile
 from pathlib import Path
@@ -92,6 +93,54 @@ class TestExtensionMcp:
                 audit_record_properties = tools["audit_record"].input_schema["properties"]
                 assert "candidate" in audit_record_properties
                 assert "phase" in audit_record_properties
+                conditional_required = {
+                    name: {
+                        condition["if"]["properties"][discriminator]["const"]: set(
+                            condition["then"].get("dependencies", {}).get(discriminator, [])
+                        )
+                        for condition in tools[name].input_schema["allOf"]
+                        if "if" in condition
+                        and "then" in condition
+                        and discriminator in condition["if"].get("properties", {})
+                    }
+                    for name, discriminator in {
+                        "run_manage": "action",
+                        "task_manage": "action",
+                        "audit_inventory": "action",
+                        "audit_knowledge": "action",
+                        "audit_probe": "kind",
+                        "audit_record": "action",
+                        "audit_publish": "action",
+                    }.items()
+                }
+                assert conditional_required["run_manage"]["start"] == {"repository"}
+                assert conditional_required["task_manage"]["checkpoint"] == {
+                    "task_id",
+                    "report",
+                }
+                assert conditional_required["audit_inventory"]["program"] == {"programs"}
+                assert conditional_required["audit_knowledge"]["reconcile"] == {"areas"}
+                assert conditional_required["audit_probe"]["python"] == {"code"}
+                assert conditional_required["audit_record"]["candidate"] == {"candidate"}
+                assert conditional_required["audit_publish"]["finish"] == {"receipt"}
+                ingest_contract = next(
+                    condition["then"]
+                    for condition in tools["history_manage"].input_schema["allOf"]
+                    if condition.get("if", {}).get("properties", {}).get("action", {}).get("const")
+                    == "ingest"
+                )
+                assert [branch["required"] for branch in ingest_contract["oneOf"]] == [
+                    ["records"],
+                    ["artifacts"],
+                ]
+                query_contract = tools["history_query"].input_schema["allOf"][0]
+                assert {branch["required"][0] for branch in query_contract["anyOf"]} == {
+                    "terms",
+                    "kind",
+                    "state",
+                    "cutoff",
+                    "linked",
+                }
                 with pytest.raises(ValueError, match="Extra inputs are not permitted"):
                     RunManageRequest.model_validate(
                         {
@@ -753,6 +802,7 @@ class TestExtensionMcp:
                 assert not prepared.is_error
                 assert prepared.structured_content["mode"] == "new"
                 assert prepared.structured_content["history"]["sync_status"] == "prepared"
+
                 assert prepared.structured_content["history"]["base_generation"] == 0
                 assert prepared.structured_content["history"]["record_count"] == 0
                 assert not prepared.structured_content["history"]["full_history_complete"]
@@ -928,6 +978,39 @@ class TestExtensionMcp:
                 assert validation["candidate_id"] == candidate_id
                 assert validation["status"] == "succeeded"
                 assert validation["artifact"] == "validation/probe-mcp-1/result.json"
+
+    def test_audit_worktree_uses_private_cache_when_local_root_is_not_ignored(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="github-workflows-worktree-root-") as directory:
+            root = Path(directory)
+            workspace = root / "repo"
+            workspace.mkdir()
+            self.git("init", "-b", "main", cwd=workspace)
+
+            runtime = WorkflowRuntime(workspace, root / "qwen-project")
+            cache = root / "cache"
+
+            with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": str(cache)}):
+                worktree_root = runtime._worktree_root()
+
+            assert worktree_root.parent == cache / "agent-workflows" / "worktrees"
+            assert stat.S_IMODE(worktree_root.stat().st_mode) == 0o700
+            assert stat.S_IMODE(worktree_root.parent.stat().st_mode) == 0o700
+
+    def test_audit_worktree_rejects_symlinked_application_cache(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="github-workflows-worktree-cache-") as directory:
+            root = Path(directory)
+            workspace = root / "repo"
+            workspace.mkdir()
+            cache = root / "cache"
+            cache.mkdir()
+            target = root / "untrusted"
+            target.mkdir()
+            (cache / "agent-workflows").symlink_to(target, target_is_directory=True)
+            runtime = WorkflowRuntime(workspace, root / "qwen-project")
+
+            with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": str(cache)}):
+                with pytest.raises(PermissionError):
+                    runtime._cache_worktree_root()
 
     def test_manifest_and_launcher_are_contained(self) -> None:
         manifest = json.loads((EXTENSION / "qwen-extension.json").read_text(encoding="utf-8"))

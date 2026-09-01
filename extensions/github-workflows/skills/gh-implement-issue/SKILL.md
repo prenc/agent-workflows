@@ -229,13 +229,17 @@ issue whose own accepted scope needs independently mergeable PRs to
 Use:
 
 ```text
-single new issue: <project>/.worktrees/issue-<N>-<slug>
-new issue bundle: <project>/.worktrees/issues-<anchor>-<slug>
-existing PR:      <project>/.worktrees/issue-<anchor>-pr-<P>-continue
+preferred root:   <project>/.worktrees
+fallback root:    ${XDG_CACHE_HOME:-~/.cache}/agent-workflows/worktrees/<project-id>
+single new issue: <root>/issue-<N>-<slug>
+new issue bundle: <root>/issues-<anchor>-<slug>
+existing PR:      <root>/issue-<anchor>-pr-<P>-continue
 ```
 
-Require `.worktrees/` ignored and link the secondary worktree's `.venv` to the
-main project environment. Inspect registered worktrees, branch ownership, Git
+Use the preferred root only when `git check-ignore --no-index` confirms
+`.worktrees/` is ignored. Otherwise use the project-namespaced fallback root;
+do not modify ignore files merely to place a worktree. Link the secondary
+worktree's `.venv` to the main project environment. Inspect registered worktrees, branch ownership, Git
 operation state, local changes, and remote refs. Reuse matching durable Qwen or
 Codex state when repository, unit, and branch ownership are unambiguous.
 
