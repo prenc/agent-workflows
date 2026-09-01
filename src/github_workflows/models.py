@@ -43,11 +43,7 @@ class RunManageRequest(StrictRequest):
     repository: str | None = None
     n: int | None = None
     targets: list[str] = Field(default_factory=list)
-    areas: list[str] = Field(default_factory=list)
-    scopes: list[str] = Field(default_factory=list)
-    focus: str | None = None
-    use_skills: list[str] = Field(default_factory=list)
-    history_days: int | None = None
+    instructions: str | None = None
     refresh_history: bool = False
     regression_sweep: bool = False
     dry_run: bool = False
@@ -56,13 +52,20 @@ class RunManageRequest(StrictRequest):
     source_confirmed: bool = False
     note: str | None = None
 
-    @field_validator("n", "history_days", mode="before")
+    @field_validator("n", mode="before")
     @classmethod
     def positive_integer(cls, value: Any, info: Any) -> Any:
         if value is not None and (
             isinstance(value, bool) or not isinstance(value, int) or value < 1
         ):
             raise ValueError(f"{info.field_name} must be a positive integer")
+        return value
+
+    @field_validator("instructions")
+    @classmethod
+    def non_empty_instructions(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("instructions must not be blank")
         return value
 
     @model_validator(mode="after")
@@ -76,11 +79,7 @@ class RunManageRequest(StrictRequest):
                 "repository",
                 "n",
                 "targets",
-                "areas",
-                "scopes",
-                "focus",
-                "use_skills",
-                "history_days",
+                "instructions",
                 "refresh_history",
                 "regression_sweep",
                 "dry_run",
@@ -93,7 +92,7 @@ class RunManageRequest(StrictRequest):
         elif self.action == "directive":
             if self.workflow != "gh-audit-repo":
                 raise ValueError("directives are supported only by repository audits")
-            allowed = {"n", "areas", "scopes", "focus", "use_skills"}
+            allowed = {"n", "instructions"}
         else:
             allowed = set()
         unexpected = supplied - allowed
@@ -102,17 +101,13 @@ class RunManageRequest(StrictRequest):
         if self.action == "start":
             workflow_fields = {
                 "gh-audit-repo": {
-                    "areas",
-                    "scopes",
-                    "focus",
-                    "use_skills",
+                    "instructions",
                     "refresh_history",
                     "regression_sweep",
                     "dry_run",
                 },
                 "gh-curate-issues": {
                     "targets",
-                    "history_days",
                     "refresh_history",
                     "dry_run",
                     "pending",
@@ -131,10 +126,7 @@ class RunManageRequest(StrictRequest):
         if self.workflow == "gh-audit-repo":
             return {
                 **common,
-                "areas": self.areas,
-                "scopes": self.scopes,
-                "focus": self.focus,
-                "use_skills": self.use_skills,
+                "instructions": self.instructions,
                 "refresh_history": self.refresh_history,
                 "regression_sweep": self.regression_sweep,
                 "dry_run": self.dry_run,
@@ -143,7 +135,7 @@ class RunManageRequest(StrictRequest):
             return {
                 **common,
                 "targets": self.targets,
-                "history_days": self.history_days or 365,
+                "history_days": 365,
                 "refresh_history": self.refresh_history,
                 "dry_run": self.dry_run,
             }
@@ -154,7 +146,7 @@ class RunManageRequest(StrictRequest):
         values: dict[str, Any] = {}
         if self.n is not None:
             values["concurrency"] = self.n
-        for name in ("areas", "scopes", "focus", "use_skills"):
+        for name in ("instructions",):
             if name in self.model_fields_set:
                 values[name] = getattr(self, name)
         if self.note is not None:

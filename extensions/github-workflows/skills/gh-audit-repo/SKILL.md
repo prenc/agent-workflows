@@ -2,7 +2,7 @@
 name: gh-audit-repo
 description: Run a long, resumable repository audit against complete GitHub issue and pull-request history, refine matching untouched open issues, close independently verified obsolete issues, and create findings that are genuinely new. Use when asked for a broad or focused codebase audit, including overnight audits.
 priority: 20
-argument-hint: '\[-n <N>\] \[--resume | [--refresh-history] [--regression-sweep] \[area/<slug> ...\] \[--scope <path-or-symbol> ...\] \[--focus <question>\] \[--use-skill <name> ...\] [--dry-run]\]'
+argument-hint: '[-n <N>] [--resume | [--refresh-history] [--regression-sweep] [--dry-run] [instructions]]'
 allowedTools:
 
   - task
@@ -147,15 +147,12 @@ write.
 
 ## Inputs
 
-- Optional `area/<slug>` values restrict discovery to those areas.
-- Repeatable `--scope` narrows discovery to exact paths or symbols within the
-  selected area while allowing enough surrounding reads for reachability and
-  duplicate checks.
-- Treat `--focus` as a question to investigate and require evidence before
-  concluding that a defect exists.
-- Each `--use-skill` names installed guidance that supervisor and workers must
-  read. Missing or ambiguous requested guidance stops the run.
-- Without area/scope/focus, audit the complete repository.
+- The user may provide free-form instructions about desired coverage,
+  priorities, exclusions, questions, methods, or other constraints. Follow all
+  compatible instructions throughout planning, discovery, verification, and
+  publication; report any conflict with repository policy instead of silently
+  ignoring or rewriting it.
+- Without instructions, audit the complete repository.
 - `-n` changes scheduling while preserving coverage,
   verification, mutation ordering, and issue required outcomes.
 - `--refresh-history` changes only GitHub synchronization; it never changes the
@@ -167,8 +164,9 @@ write.
 
 Call `mcp__github_workflows__run_manage` with action `start`, workflow
 `gh-audit-repo`, `repository` as `OWNER/REPO`, and parsed invocation fields
-as top-level tool arguments. For example, `-n 4 --dry-run area/vim` becomes
-`n: 4`, `dry_run: true`, and `areas: ["area/vim"]`. Never add an `inputs`
+as top-level tool arguments. For example, `-n 4 --dry-run prioritize the CLI`
+becomes `n: 4`, `dry_run: true`, and `instructions: "prioritize the CLI"`.
+Never add an `inputs`
 or `request` wrapper, never stringify tool arguments as JSON, and do not use
 `concurrency`; the typed field is `n`. It resolves the
 primary worktree, current branch, exact local `HEAD`, upstream divergence,
@@ -206,8 +204,8 @@ If `run_status.helper_integrity.valid` is false, do not launch or mutate audit
 work. Report the changed helper paths, abort the incompatible run, and start a
 new audit run; a process restart cannot make old helper fingerprints compatible.
 
-On `--resume`, load repository, branch, SHA, confirmation, scope, focus,
-guidance, and dry-run state from `mcp__github_workflows__run_status`. Reconcile every recorded issue
+On `--resume`, load repository, branch, SHA, confirmation, instructions, and
+dry-run state from `mcp__github_workflows__run_status`. Reconcile every recorded issue
 mutation against live GitHub, reuse safe same-run work, and continue only
 pending work. Never repeat an uncertain mutation;
 stop and report it for manual reconciliation. Refresh through
@@ -296,7 +294,8 @@ records and only the resolved records selected by the targeted gate. Without
 changed after resolution, a current lead matches its root cause, or it is needed
 for duplicate or closure reasoning. Do not assign every historical fix as a
 mandatory regression gate. With `--regression-sweep`, include all resolved
-records relevant to the selected areas and report the additional count.
+records relevant to the areas selected under the user's instructions and
+report the additional count.
 
 Issue/PR history supplies scope and duplicate evidence, not proof that current
 code has the reported behavior. Trace every candidate into the immutable audit

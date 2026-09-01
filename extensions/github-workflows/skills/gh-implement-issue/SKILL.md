@@ -2,7 +2,7 @@
 name: gh-implement-issue
 description: Immediately resolve and lock supplied GitHub issues, then supervise them or supplied implementation PRs as automatically grouped one-PR implementation units with bounded fresh-context workers, reusable isolated worktrees, verified rebases, worker-owned draft PR publication, native issue linkage, and supervisor-owned promotion and finalization.
 priority: 20
-argument-hint: '\[-n <N>\] \[--resume | [--separate] <issue-or-PR> ...\]'
+argument-hint: '[-n <N>] [--resume | [--separate] <issue-or-PR> ...]'
 allowedTools:
 
   - task

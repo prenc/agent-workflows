@@ -66,6 +66,7 @@ class TestExtensionMcp:
                 assert "repository" in run_properties
                 assert "inputs" not in run_properties
                 assert "concurrency" not in run_properties
+                assert "instructions" in run_properties
                 for name in (
                     "task_manage",
                     "history_manage",
@@ -87,6 +88,15 @@ class TestExtensionMcp:
                             "inputs": {"n": 2},
                         }
                     )
+                audit_request = RunManageRequest(
+                    action="start",
+                    workflow="gh-audit-repo",
+                    repository="example/repo",
+                    instructions="Prioritize public CLI behavior",
+                )
+                assert audit_request.invocation()["instructions"] == (
+                    "Prioritize public CLI behavior"
+                )
                 assert tools["run_status"].annotations.read_only_hint
                 assert not tools["task_manage"].annotations.read_only_hint
                 assert not tools["audit_probe"].annotations.read_only_hint

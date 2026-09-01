@@ -2,7 +2,7 @@
 name: gh-curate-issues
 description: Curate selected or all current open GitHub issues by enforcing the shared issue format and taxonomy, reconciling issue/PR relationships, splitting oversized scope safely, and maintaining evidence-backed statuses without auditing or implementing code.
 priority: 20
-argument-hint: '\[-n <N>\] \[--resume | \[--history-days <N>\] [--refresh-history] [issue-number-or-URL ...] [--dry-run]\]'
+argument-hint: '[-n <N>] [--resume | [--refresh-history] [issue-number-or-URL ...] [--dry-run]]'
 allowedTools:
 
   - task
@@ -49,16 +49,15 @@ be positive and defaults to 3. Queue one worker per issue and keep at most `N`
 workers active. GitHub mutations are always performed serially by the
 supervisor.
 
-`--history-days N` sets the rolling closed-record history window and defaults
-to 365. It must be positive. Normal runs incrementally synchronize the private
-GitHub history cache; `--refresh-history` re-fetches every record in the
-configured history view. Dry runs may refresh local history while still making
-zero GitHub writes.
+Normal runs incrementally synchronize a 365-day closed-record view in the
+private GitHub history cache; `--refresh-history` re-fetches every record in
+that view. Dry runs may refresh local history while still making zero GitHub
+writes.
 
 Every new run creates durable state through
 `mcp__github_workflows__run_manage` with workflow `gh-curate-issues`.
-`--resume` uses its `resume` action and loads the original targets,
-history window, and dry-run state after reconciling live GitHub state; it may be
+`--resume` uses its `resume` action and loads the original targets and dry-run
+state after reconciling live GitHub state; it may be
 combined only with `-n`.
 
 For a legacy invocation, replace `--refresh-index` with `--refresh-history`
@@ -103,7 +102,7 @@ Resolve `OWNER/REPO`, the remote default branch, and its immutable latest SHA.
 Resolve each selected target as an open issue rather than a pull request.
 Before analysis or mutation, initialize the run with
 `mcp__github_workflows__run_manage`. Pass `repository`, `n`, `targets`,
-`history_days`, `refresh_history`, and `dry_run` as top-level tool arguments;
+`refresh_history`, and `dry_run` as top-level tool arguments;
 never wrap them in `request` or `inputs`, and never stringify them as JSON. On
 resume, pass only an explicitly supplied `n` in
 addition to the action and workflow. Maintain
