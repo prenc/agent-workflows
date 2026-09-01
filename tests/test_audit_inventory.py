@@ -50,6 +50,11 @@ class TestAuditInventory:
             env=env,
         )
 
+    def program_input(self, programs: list[dict[str, object]]) -> Path:
+        path = self.project / "programs.json"
+        path.write_text(json.dumps(programs))
+        return path
+
     def test_initialize_falls_back_to_system_python(self) -> None:
         result = json.loads(self.call("initialize").stdout)
         assert result["revision"] == 1
@@ -66,15 +71,17 @@ class TestAuditInventory:
 
     def test_program_probe_updates_shared_inventory(self) -> None:
         self.call("initialize")
-        result = self.call(
-            "program", "--name", "git", "--argument=--version", "--expected-revision", "1"
+        source = self.program_input(
+            [{"name": "git", "arguments": ["--version"]}, {"name": "missing-fixture"}]
         )
+        result = self.call("program", "--input", str(source), "--expected-revision", "1")
         payload = json.loads(result.stdout)
         assert payload["revision"] == 2
         assert payload["state_revision"] == 3
-        assert payload["fact"]["available"]
-        assert payload["fact"]["probe_status"] == "succeeded"
-        assert "git version" in payload["fact"]["stdout"]
+        assert payload["facts"]["git"]["available"]
+        assert payload["facts"]["git"]["probe_status"] == "succeeded"
+        assert "git version" in payload["facts"]["git"]["stdout"]
+        assert payload["facts"]["missing-fixture"]["probe_status"] == "not-found"
 
     def test_initialize_uses_existing_project_venv_and_its_packages(self) -> None:
         venv.EnvBuilder(with_pip=False).create(self.project / ".venv")
@@ -94,14 +101,9 @@ class TestAuditInventory:
 
     def test_revision_conflict_does_not_replace_inventory(self) -> None:
         self.call("initialize")
+        source = self.program_input([{"name": "git", "arguments": ["--version"]}])
         failed = self.call(
-            "program",
-            "--name",
-            "git",
-            "--argument=--version",
-            "--expected-revision",
-            "0",
-            check=False,
+            "program", "--input", str(source), "--expected-revision", "0", check=False
         )
         assert failed.returncode == 2
         inventory = json.loads((self.run_dir / "state.json").read_text())["inventory"]
@@ -148,16 +150,11 @@ class TestAuditInventory:
             executable.chmod(0o755)
             environment = os.environ.copy()
             environment["PATH"] = f"{binary_dir}:{environment['PATH']}"
+            source = self.program_input([{"name": "inventory-fixture", "arguments": ["--version"]}])
             result = self.call(
-                "program",
-                "--name",
-                "inventory-fixture",
-                "--argument=--version",
-                "--expected-revision",
-                "1",
-                env=environment,
+                "program", "--input", str(source), "--expected-revision", "1", env=environment
             )
-        fact = json.loads(result.stdout)["fact"]
+        fact = json.loads(result.stdout)["facts"]["inventory-fixture"]
         assert fact["available"]
         assert "isolated version" in fact["stdout"]
         assert not (self.worktree / "forbidden-write").exists()
@@ -170,16 +167,11 @@ class TestAuditInventory:
             executable.chmod(0o755)
             environment = os.environ.copy()
             environment["PATH"] = f"{binary_dir}:{environment['PATH']}"
+            source = self.program_input([{"name": "versionless", "arguments": ["--version"]}])
             result = self.call(
-                "program",
-                "--name",
-                "versionless",
-                "--argument=--version",
-                "--expected-revision",
-                "1",
-                env=environment,
+                "program", "--input", str(source), "--expected-revision", "1", env=environment
             )
-        fact = json.loads(result.stdout)["fact"]
+        fact = json.loads(result.stdout)["facts"]["versionless"]
         assert fact["available"]
         assert fact["probe_status"] == "failed"
         assert fact["returncode"] == 7

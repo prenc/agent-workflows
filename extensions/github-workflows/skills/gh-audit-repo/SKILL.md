@@ -344,10 +344,15 @@ Perform a lightweight technology survey from manifests, pinned versions,
 imports, and configuration. Call `mcp__github_workflows__audit_inventory`
 with action `initialize` to
 create a revisioned inventory record through the tool. It records installed
-distribution versions without importing packages, repository manifest
+distribution versions from the repository's `.venv` in one bulk snapshot without
+importing packages (falling back to the selected system interpreter only when no project
+`.venv` exists), repository manifest
 identities, and whether the selected interpreter is `project-venv` or `system`.
-Then use action `program` for current-host versions of relevant configured programs through
-bounded sandboxed probes. Record
+Reuse that snapshot for Python-library versions; do not issue one inventory call per
+library.
+Then use action `program` with one `programs` list containing the relevant configured
+programs and their optional version/help arguments. The tool runs the bounded sandboxed
+probes as one batch and records them in one inventory revision. Record
 declared target constraints separately from current-host facts; the audit host
 does not represent every deployment target.
 
@@ -392,7 +397,7 @@ kind (`program-version`, `program-help`, `program-doc`, `python-package`,
 `capability`, or `documentation-budget`),
 name, and reason. Pause only that assignment. The supervisor deduplicates the
 request, uses the inventory tool or relevant documentation MCP, records the
-result through `program` or `record_context`, atomically updates the inventory
+result through a batched `program` call or `record_context`, atomically updates the inventory
 and event stream, then resumes the same task with
 `send_message`. Notify other active workers of the new revision. Before
 consolidation, resume any completed worker whose version-dependent conclusion

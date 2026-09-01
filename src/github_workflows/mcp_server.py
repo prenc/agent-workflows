@@ -288,12 +288,11 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
         action: Literal[
             "initialize", "refresh", "status", "program", "record_declared", "record_context"
         ],
-        name: str | None = None,
-        arguments: list[str] | None = None,
+        programs: list[dict[str, Any]] | None = None,
         request_id: str | None = None,
         value: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Initialize, refresh, inspect, or update the audit environment inventory."""
+        """Manage audit inventory; pass program probes together in `programs`."""
         return _request_call(runtime.audit_inventory, InventoryRequest, **locals())
 
     @mcp.tool(annotations=LOCAL_WRITE, structured_output=True)

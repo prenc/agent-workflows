@@ -1088,16 +1088,14 @@ class WorkflowRuntime:
             if request.action == "refresh":
                 return self._invoke(audit_inventory.refresh, **common, expected_revision=revision)
             if request.action == "program":
-                if not request.name:
-                    raise ValueError("program inspection requires a name")
-                return self._invoke(
-                    audit_inventory.inspect_program,
-                    **common,
-                    name=request.name,
-                    argument=request.arguments or None,
-                    request_id=request.request_id,
-                    expected_revision=revision,
-                )
+                probes = [program.model_dump(mode="json") for program in request.programs]
+                with self._json_file(probes) as source:
+                    return self._invoke(
+                        audit_inventory.inspect_programs,
+                        **common,
+                        input=source,
+                        expected_revision=revision,
+                    )
             with self._json_file(request.value) as source:
                 if request.action == "record_declared":
                     return self._invoke(

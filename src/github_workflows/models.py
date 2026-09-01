@@ -324,11 +324,15 @@ class InventorySimpleRequest(StrictRequest):
     action: Literal["initialize", "refresh", "status"]
 
 
-class InventoryProgramRequest(StrictRequest):
-    action: Literal["program"]
+class ProgramProbe(StrictRequest):
     name: str
     arguments: list[str] = Field(default_factory=list)
     request_id: str | None = None
+
+
+class InventoryProgramRequest(StrictRequest):
+    action: Literal["program"]
+    programs: list[ProgramProbe] = Field(min_length=1)
 
 
 class InventoryDeclaredRequest(StrictRequest):

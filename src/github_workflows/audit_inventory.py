@@ -281,16 +281,15 @@ def check_revision(value: dict[str, Any], expected: int) -> None:
         )
 
 
-def inspect_program(args: argparse.Namespace) -> None:
-    project, worktree, run_dir = validate_paths(args)
-    if not NAME_RE.fullmatch(args.name):
+def probe_program(
+    project: Path, worktree: Path, run_dir: Path, name: str, arguments: list[str]
+) -> dict[str, Any]:
+    if not NAME_RE.fullmatch(name):
         raise ValueError("program name contains unsupported characters")
-    arguments = args.argument or PROGRAM_ARGUMENTS.get(args.name, ["--version"])
+    arguments = arguments or PROGRAM_ARGUMENTS.get(name, ["--version"])
     if not arguments or any(argument not in ALLOWED_ARGUMENTS for argument in arguments):
         raise ValueError("program probes accept only version/help arguments")
-    value = load_inventory(run_dir)
-    check_revision(value, args.expected_revision)
-    executable_name = shutil.which(args.name)
+    executable_name = shutil.which(name)
     now = utc_now()
     fact: dict[str, Any]
     if executable_name is None:
@@ -352,19 +351,45 @@ def inspect_program(args: argparse.Namespace) -> None:
                     "collected_at": now,
                     "source": "current-audit-host",
                 }
-    value["sources"]["programs"][args.name] = fact
-    if args.request_id:
-        value["requests"][args.request_id] = {"status": "resolved", "fact": f"program:{args.name}"}
+    return fact
+
+
+def inspect_programs(args: argparse.Namespace) -> None:
+    project, worktree, run_dir = validate_paths(args)
+    probes = json.loads(args.input.read_text(encoding="utf-8"))
+    if not isinstance(probes, list) or not probes:
+        raise ValueError("program probes input must be a non-empty JSON list")
+    value = load_inventory(run_dir)
+    check_revision(value, args.expected_revision)
+    facts: dict[str, dict[str, Any]] = {}
+    request_ids: dict[str, str] = {}
+    for probe in probes:
+        if not isinstance(probe, dict) or not isinstance(probe.get("name"), str):
+            raise ValueError("each program probe requires a name")
+        name = probe["name"]
+        arguments = probe.get("arguments", [])
+        request_id = probe.get("request_id")
+        if not isinstance(arguments, list) or not all(isinstance(item, str) for item in arguments):
+            raise ValueError(f"program {name} arguments must be a list of strings")
+        if request_id is not None:
+            if not isinstance(request_id, str) or not NAME_RE.fullmatch(request_id):
+                raise ValueError(f"program {name} request_id contains unsupported characters")
+            request_ids[request_id] = name
+        facts[name] = probe_program(project, worktree, run_dir, name, arguments)
+    value["sources"]["programs"].update(facts)
+    for request_id, name in request_ids.items():
+        value["requests"][request_id] = {"status": "resolved", "fact": f"program:{name}"}
     value["revision"] += 1
-    value["updated_at"] = now
+    value["updated_at"] = utc_now()
     state_revision = write_inventory(
         run_dir,
         value,
         {
             "type": "inventory_updated",
             "revision": value["revision"],
-            "fact": f"program:{args.name}",
-            "timestamp": now,
+            "fact": "programs",
+            "facts": [f"program:{name}" for name in facts],
+            "timestamp": value["updated_at"],
         },
     )
     print(
@@ -373,7 +398,7 @@ def inspect_program(args: argparse.Namespace) -> None:
                 "inventory": str(inventory_path(run_dir)),
                 "revision": value["revision"],
                 "state_revision": state_revision,
-                "fact": fact,
+                "facts": facts,
             }
         )
     )
@@ -474,11 +499,9 @@ def parser() -> argparse.ArgumentParser:
     command.set_defaults(handler=refresh)
     command = sub.add_parser("program")
     common(command)
-    command.add_argument("--name", required=True)
-    command.add_argument("--argument", action="append")
-    command.add_argument("--request-id")
+    command.add_argument("--input", type=Path, required=True)
     command.add_argument("--expected-revision", type=int, required=True)
-    command.set_defaults(handler=inspect_program)
+    command.set_defaults(handler=inspect_programs)
     command = sub.add_parser("record-declared")
     common(command)
     command.add_argument("--input", type=Path, required=True)
