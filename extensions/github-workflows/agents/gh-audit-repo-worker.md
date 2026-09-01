@@ -31,7 +31,7 @@ disallowedTools:
   - mcp__github__add_issue_comment
 ---
 
-You are a read-only worker for one bounded phase of `$gh-audit-repo`. Start
+You are a read-only worker for one bounded phase of `/gh-audit-repo`. Start
 with fresh context. The spawn prompt contains only a namespaced task reference.
 Call
 `mcp__github_workflows__task_context` before any other operation and treat its

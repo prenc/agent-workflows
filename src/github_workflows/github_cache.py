@@ -318,6 +318,9 @@ def prepare_database(args: argparse.Namespace, kind: str) -> None:
             mode = "recovery"
         else:
             shutil.copy2(live, work)
+            if kind == "records":
+                with connect(work) as connection, connection:
+                    compact_existing_records(connection)
             mode = "reuse"
     if not reuse_live:
         with connect(work) as connection:
@@ -366,12 +369,7 @@ def normalize_record(
     number = first(record, "number", "issue_number", "pull_number")
     if not isinstance(number, int):
         raise ValueError("record number must be an integer")
-    body = first(record, "body")
-    body = body if isinstance(body, str) else ""
     labels = names(first(record, "labels") or [])
-    comments = first(record, "comments") or []
-    relationships = first(record, "relationships", "closed_by_pull_requests") or {}
-    commits = first(record, "commits") or []
     assignees = names(first(record, "assignees") or [])
     base = first(record, "base_ref", "base")
     head = first(record, "head_ref", "head")
@@ -379,49 +377,57 @@ def normalize_record(
         base = first(base, "ref", "name")
     if isinstance(head, dict):
         head = first(head, "ref", "name")
-    hydration = (
-        "detail"
-        if any(
-            key in record
-            for key in ("comments", "relationships", "commits", "closed_by_pull_requests")
-        )
-        else "summary"
-    )
+    title = str(first(record, "title") or "")
+    state = str(first(record, "state") or "unknown").lower()
+    created_at = first(record, "created_at", "createdAt")
+    updated_at = first(record, "updated_at", "updatedAt")
+    closed_at = first(record, "closed_at", "closedAt")
+    merged_at = first(record, "merged_at", "mergedAt")
+    url = first(record, "url", "html_url")
+    head_sha = first(record, "head_sha", "headSha")
     canonical = json.dumps(
         {
-            "body": body,
-            "comments": comments,
+            "state": state,
+            "title": title,
             "labels": labels,
-            "relationships": relationships,
-            "commits": commits,
+            "assignees": assignees,
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "closed_at": closed_at,
+            "merged_at": merged_at,
+            "url": url,
+            "base_ref": base,
+            "head_ref": head,
+            "head_sha": head_sha,
         },
         sort_keys=True,
     )
-    return {
+    result = {
         "kind": kind,
         "number": number,
-        "state": str(first(record, "state") or "unknown").lower(),
+        "state": state,
         "state_reason": first(record, "state_reason", "stateReason"),
-        "title": str(first(record, "title") or ""),
-        "body": body,
-        "comments_json": json.dumps(comments, sort_keys=True),
+        "title": title,
+        "body": "",
+        "comments_json": "[]",
         "labels_json": json.dumps(labels, sort_keys=True),
         "assignees_json": json.dumps(assignees, sort_keys=True),
-        "relationships_json": json.dumps(relationships, sort_keys=True),
-        "commits_json": json.dumps(commits, sort_keys=True),
-        "created_at": first(record, "created_at", "createdAt"),
-        "updated_at": first(record, "updated_at", "updatedAt"),
-        "closed_at": first(record, "closed_at", "closedAt"),
-        "merged_at": first(record, "merged_at", "mergedAt"),
-        "url": first(record, "url", "html_url"),
+        "relationships_json": "{}",
+        "commits_json": "[]",
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "closed_at": closed_at,
+        "merged_at": merged_at,
+        "url": url,
         "base_ref": base,
         "head_ref": head,
-        "head_sha": first(record, "head_sha", "headSha"),
+        "head_sha": head_sha,
         "content_sha256": hashlib.sha256(canonical.encode()).hexdigest(),
-        "hydration": hydration,
+        "hydration": "summary",
         "source": source,
         "fetched_at": fetched_at,
     }
+    return result
 
 
 def record_list(payload: Any) -> list[dict[str, Any]]:
@@ -439,28 +445,6 @@ def record_list(payload: Any) -> list[dict[str, Any]]:
 
 
 def upsert_record(connection: sqlite3.Connection, item: dict[str, Any]) -> None:
-    existing = connection.execute(
-        "SELECT hydration FROM records WHERE kind=? AND number=?", (item["kind"], item["number"])
-    ).fetchone()
-    if existing and existing["hydration"] == "detail" and item["hydration"] == "summary":
-        detail_columns = ("comments_json", "relationships_json", "commits_json", "hydration")
-        current = connection.execute(
-            "SELECT comments_json, relationships_json, commits_json, hydration FROM records WHERE kind=? AND number=?",
-            (item["kind"], item["number"]),
-        ).fetchone()
-        for column in detail_columns:
-            item[column] = current[column]
-        canonical = json.dumps(
-            {
-                "body": item["body"],
-                "comments": json.loads(item["comments_json"]),
-                "labels": json.loads(item["labels_json"]),
-                "relationships": json.loads(item["relationships_json"]),
-                "commits": json.loads(item["commits_json"]),
-            },
-            sort_keys=True,
-        )
-        item["content_sha256"] = hashlib.sha256(canonical.encode()).hexdigest()
     columns = list(item)
     assignments = ", ".join(
         f"{column}=excluded.{column}" for column in columns if column not in {"kind", "number"}
@@ -479,6 +463,22 @@ def upsert_record(connection: sqlite3.Connection, item: dict[str, Any]) -> None:
     )
 
 
+def compact_existing_records(connection: sqlite3.Connection) -> None:
+    """Remove detail payloads from every record copied from a legacy live cache."""
+    records = list(connection.execute("SELECT * FROM records"))
+    for row in records:
+        raw = dict(row)
+        raw["labels"] = json.loads(raw.pop("labels_json") or "[]")
+        raw["assignees"] = json.loads(raw.pop("assignees_json") or "[]")
+        item = normalize_record(
+            raw,
+            raw["kind"],
+            raw.get("source") or "cache-migration",
+            raw.get("fetched_at") or iso_utc(utc_now()),
+        )
+        upsert_record(connection, item)
+
+
 def ingest_records(args: argparse.Namespace) -> None:
     payload = json.loads(args.input.read_text())
     fetched_at = args.fetched_at or iso_utc(utc_now())
@@ -495,17 +495,28 @@ def ingest_records(args: argparse.Namespace) -> None:
 
 
 def row_dict(row: sqlite3.Row) -> dict[str, Any]:
-    result = dict(row)
-    for key in (
-        "comments_json",
-        "labels_json",
-        "assignees_json",
-        "relationships_json",
-        "commits_json",
-    ):
-        value = result.pop(key)
-        result[key.removesuffix("_json")] = json.loads(value)
-    return result
+    labels = json.loads(row["labels_json"])
+    title = row["title"]
+    summary = title if not labels else f"{title} [labels: {', '.join(sorted(labels))}]"
+    result = {
+        "kind": row["kind"],
+        "number": row["number"],
+        "url": row["url"],
+        "title": title,
+        "summary": summary,
+        "state": row["state"],
+        "state_reason": row["state_reason"],
+        "labels": labels,
+        "assignees": json.loads(row["assignees_json"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "closed_at": row["closed_at"],
+        "merged_at": row["merged_at"],
+        "base_ref": row["base_ref"],
+        "head_ref": row["head_ref"],
+        "head_sha": row["head_sha"],
+    }
+    return {key: value for key, value in result.items() if value is not None}
 
 
 def linked_keys(path: Path | None) -> set[tuple[str, int]]:
@@ -556,7 +567,7 @@ def query_records(args: argparse.Namespace) -> None:
             rows = connection.execute(
                 "SELECT r.* FROM records_fts f JOIN records r ON r.kind=f.kind AND r.number=f.number "
                 "WHERE records_fts MATCH ? ORDER BY bm25(records_fts)",
-                (match,),
+                (f"{{title labels}} : ({match})",),
             )
         else:
             rows = connection.execute("SELECT * FROM records ORDER BY kind, number")

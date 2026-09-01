@@ -183,7 +183,43 @@ class WorkflowRuntime:
             if not isinstance(page, list) or not all(isinstance(item, dict) for item in page):
                 raise ValueError("every history artifact record must be an object")
             records.extend(page)
+            if len(records) > 100:
+                raise ValueError("history ingest accepts at most 100 records")
         return records
+
+    @staticmethod
+    def _compact_history_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Discard GitHub detail payloads before they reach private history storage."""
+        fields = {
+            "number",
+            "issue_number",
+            "pull_number",
+            "state",
+            "state_reason",
+            "stateReason",
+            "title",
+            "labels",
+            "assignees",
+            "created_at",
+            "createdAt",
+            "updated_at",
+            "updatedAt",
+            "closed_at",
+            "closedAt",
+            "merged_at",
+            "mergedAt",
+            "url",
+            "html_url",
+            "base_ref",
+            "base",
+            "head_ref",
+            "head",
+            "head_sha",
+            "headSha",
+        }
+        return [
+            {key: value for key, value in record.items() if key in fields} for record in records
+        ]
 
     def _audit_paths(self) -> tuple[dict[str, Any], Path, Path]:
         state = self.state("gh-audit-repo")
@@ -979,6 +1015,7 @@ class WorkflowRuntime:
                     records = [
                         item.model_dump(mode="json", exclude_none=True) for item in request.records
                     ]
+                records = self._compact_history_records(records)
                 with self._json_file({"records": records}) as source:
                     result = self._invoke(
                         github_cache.ingest_records,
@@ -1124,18 +1161,22 @@ class WorkflowRuntime:
             if request.action in {"reconcile", "update"} and state.get("status") != "in-progress":
                 raise ValueError("the current audit run is not active")
             sha = str(state.get("sha") or "unknown")
-            if request.action == "show":
-                return self._invoke(audit_knowledge.show, project_dir=self.project_dir)
-            if request.action in {"status", "reconcile"}:
-                area_values = [item.model_dump(mode="json") for item in request.areas]
+            if request.action in {"show", "status"}:
+                return self._invoke(
+                    audit_knowledge.show,
+                    project_dir=self.project_dir,
+                    area=getattr(request, "area", None),
+                )
+            if request.action == "reconcile":
+                area_values = [
+                    item.model_dump(mode="json", exclude_none=True) for item in request.areas
+                ]
                 with self._json_file({"areas": area_values}) as areas:
-                    handler = (
-                        audit_knowledge.status
-                        if request.action == "status"
-                        else audit_knowledge.reconcile
-                    )
                     return self._invoke(
-                        handler, project_dir=self.project_dir, areas=areas, repo_sha=sha
+                        audit_knowledge.reconcile,
+                        project_dir=self.project_dir,
+                        areas=areas,
+                        repo_sha=sha,
                     )
             if not request.area:
                 raise ValueError("knowledge update/context requires an area")

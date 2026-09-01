@@ -101,29 +101,41 @@ class TestExtensionMcp:
                 assert audit_request.invocation()["instructions"] == (
                     "Prioritize public CLI behavior"
                 )
-                assert KnowledgeRequest.model_validate({"action": "status"}).areas == []
+                KnowledgeRequest.model_validate({"action": "status"})
                 knowledge_request = KnowledgeRequest.model_validate(
                     {
                         "action": "reconcile",
                         "areas": [
                             {
-                                "id": "area/core",
-                                "title": "Core",
+                                "area": "area/core",
                                 "description": "Core behavior",
                                 "paths": ["src/"],
-                                "fingerprint": "abc123",
                                 "boundaries": "Owns the core runtime",
                             }
                         ],
                     }
                 )
                 assert knowledge_request.areas[0].boundaries == ["Owns the core runtime"]
+                assert knowledge_request.areas[0].area == "area/core"
+                assert knowledge_request.areas[0].title == "Core"
+                legacy_area = KnowledgeRequest.model_validate(
+                    {
+                        "action": "reconcile",
+                        "areas": [
+                            {
+                                "id": "area/legacy",
+                                "description": "Legacy input",
+                                "paths": [],
+                                "fingerprint": "ignored",
+                            }
+                        ],
+                    }
+                )
+                assert legacy_area.areas[0].area == "area/legacy"
                 invalid_area = {
-                    "id": "area/core",
-                    "title": "Core",
+                    "area": "area/core",
                     "description": "Core behavior",
                     "paths": "src/",
-                    "fingerprint": "abc123",
                 }
                 with pytest.raises(ValidationError) as validation:
                     KnowledgeRequest.model_validate(
@@ -808,7 +820,12 @@ class TestExtensionMcp:
                         "limit": 1,
                     },
                 )
-                assert cached.structured_content["records"][0]["body"] == "Large body " * 3000
+                compact = cached.structured_content["records"][0]
+                assert compact["summary"] == "Artifact issue"
+                assert "body" not in compact
+                assert "comments" not in compact
+                assert "relationships" not in compact
+                assert "commits" not in compact
                 history_status = await client.call_tool(
                     "history_manage",
                     {

@@ -60,9 +60,15 @@ def slug(area: str) -> str:
 def canonical_area(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("each area must be a JSON object")
-    area = value.get("id")
+    area = value.get("area") or value.get("id")
+    if area is None and isinstance(value.get("title"), str) and value["title"].startswith("area/"):
+        area = value["title"]
     slug(area)
     title = value.get("title")
+    if title == area:
+        title = None
+    if title is None:
+        title = slug(area).replace("-", " ").replace("_", " ").capitalize()
     description = value.get("description")
     if not isinstance(title, str) or not title.strip():
         raise ValueError(f"{area} requires a title")
@@ -261,9 +267,7 @@ def plan_reconciliation(
 
 
 def status(args: argparse.Namespace) -> None:
-    root = knowledge_root(args)
-    areas = load_areas(args.areas)
-    print(json.dumps(plan_reconciliation(areas, active_documents(root)), indent=2, sort_keys=True))
+    show(args)
 
 
 def reconcile(args: argparse.Namespace) -> None:
@@ -402,19 +406,43 @@ def context(args: argparse.Namespace) -> None:
 
 def show(args: argparse.Namespace) -> None:
     root = knowledge_root(args)
+    active = active_documents(root)
+    requested_area = getattr(args, "area", None)
+    if requested_area:
+        area = requested_area
+        slug(area)
+        if area not in active:
+            raise ValueError(f"knowledge area does not exist: {area}")
+        _, document = active[area]
+        print(
+            json.dumps(
+                {
+                    "area": document["area"],
+                    "revision": document["revision"],
+                    "findings": document.get("findings", []),
+                    "bootstrap_leads": document.get("bootstrap_leads", []),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
+    invalidated = []
+    for path in sorted((root / "invalidated").glob("*.md")):
+        document = parse_document(path)
+        invalidated.append(document["area"]["id"])
     print(
         json.dumps(
             {
                 "active": [
                     {
                         "area": area,
-                        "path": str(path),
                         "revision": document["revision"],
                         "findings": len(document.get("findings", [])),
                     }
-                    for area, (path, document) in active_documents(root).items()
+                    for area, (_, document) in active.items()
                 ],
-                "invalidated": [str(path) for path in sorted((root / "invalidated").glob("*.md"))],
+                "invalidated": sorted(set(invalidated)),
             },
             indent=2,
             sort_keys=True,
@@ -425,12 +453,14 @@ def show(args: argparse.Namespace) -> None:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     sub = root.add_subparsers(dest="command", required=True)
-    for name, handler in (("status", status), ("reconcile", reconcile)):
-        command = sub.add_parser(name)
-        command.add_argument("--project-dir", type=Path)
-        command.add_argument("--areas", type=Path, required=True)
-        command.add_argument("--repo-sha", required=name == "reconcile")
-        command.set_defaults(handler=handler)
+    command = sub.add_parser("status")
+    command.add_argument("--project-dir", type=Path)
+    command.set_defaults(handler=status)
+    command = sub.add_parser("reconcile")
+    command.add_argument("--project-dir", type=Path)
+    command.add_argument("--areas", type=Path, required=True)
+    command.add_argument("--repo-sha", required=True)
+    command.set_defaults(handler=reconcile)
     command = sub.add_parser("update")
     command.add_argument("--project-dir", type=Path)
     command.add_argument("--area", required=True)
@@ -445,6 +475,7 @@ def parser() -> argparse.ArgumentParser:
     command.set_defaults(handler=context)
     command = sub.add_parser("show")
     command.add_argument("--project-dir", type=Path)
+    command.add_argument("--area")
     command.set_defaults(handler=show)
     return root
 

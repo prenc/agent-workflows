@@ -222,7 +222,7 @@ and cleanup result.
 
 Require each resulting unit to fit one coherent eventual PR. Route an existing
 issue whose own accepted scope needs independently mergeable PRs to
-`$gh-curate-issues` for splitting.
+`/gh-curate-issues` for splitting.
 
 ## Stage 3: prepare or reuse the worktree
 

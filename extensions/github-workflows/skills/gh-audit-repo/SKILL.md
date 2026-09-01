@@ -243,7 +243,7 @@ closed-unmerged, and merged pull request. Mark
 
 A normal run requires the completeness marker, refreshes all open records plus
 records changed since five minutes before the successful watermark, and
-directly hydrates every plausible match. `--refresh-history` re-fetches
+reads every plausible match in full from GitHub. `--refresh-history` re-fetches
 complete history.
 Every open issue and pull request returned by the live refresh must be ingested,
 even when its timestamps appear unchanged; do not compare or normalize bulk
@@ -254,9 +254,9 @@ When a GitHub MCP response reports `<persisted-output>`, pass every reported
 tool-result path directly in the `artifacts` list of one or more
 `history_manage` ingest calls. Never read, copy, split, summarize, or
 re-transcribe those files for ingestion; the history server validates and
-normalizes them without returning their contents. Use inline `records` only
-when the GitHub response itself remained inline and the serialized records fit
-the tool's 16 KiB limit. `records` and `artifacts` are mutually exclusive.
+reduces them to compact metadata without returning their contents. Use inline
+`records` only when the GitHub response itself remained inline, with at most
+100 records per call. `records` and `artifacts` are mutually exclusive.
 
 Commit with action `commit` after all pages are ingested. The server supplies
 the transaction generation, run timestamp, and audited local SHA, takes a short lock, and rejects a
@@ -264,16 +264,22 @@ changed live generation. On conflict, prepare from the newer database, repeat
 incremental synchronization once, and retry. A second conflict blocks
 publication. Treat abandoned staging files as non-blocking artifacts.
 
-Using paginated MCP list/search/read tools, maintain full bodies, labels, state,
-and timestamps for the inventory. Bulk list calls must omit comments, commits,
-relationships, and other detail collections; hydrate relevant comments, commits/SHAs,
-native relationships, and resolution evidence for every plausible match. Use
+Using paginated MCP list tools, maintain a compact inventory containing number,
+URL, title, labels, state, assignees, timestamps, and relevant pull-request refs.
+Bulk list calls must omit bodies, comments, commits, relationships, and other detail
+collections. The history tool derives a rough summary from title and labels and
+discards detail fields even when a provider returns them. Use targeted GitHub search
+to find possible body-only matches, then call `issue_read` or `pull_request_read` for
+every plausible match and obtain relevant comments, commits/SHAs, native relationships,
+and resolution evidence live. Do not ingest those detail payloads into history. Use
 the full-timeline `gh api` fallback only when MCP relationships are incomplete
 or contradictory.
 
-Build an area-aware GitHub history view of root cause, paths/symbols, failure mode, requested
-outcome, required outcomes, state, labels, and delivered/rejected/superseded
-status. Closed issues and all PRs are read-only evidence. For every matching
+Build an area-aware GitHub history view from compact summaries, then use live full reads
+to establish root cause, paths/symbols, failure mode, requested outcome, required outcomes,
+state, labels, and delivered/rejected/superseded status. Cached summaries select
+candidates and never support publication or mutation conclusions. Closed issues and all
+PRs are read-only evidence. For every matching
 open issue, classify it as:
 
 - `update-existing` when the candidate describes the same root cause/outcome
@@ -308,8 +314,10 @@ After inferring the exclusive area map, call
 The tool is the sole interface to durable area knowledge; its storage is
 private.
 
-An area's identity is its title, description, owned paths, entrypoints, and
-boundaries. Ordinary source changes preserve the document; a boundary change,
+Pass one canonical `area/<slug>` value, description, and owned paths for each area;
+title, entrypoints, and boundaries are optional. The server derives a missing title
+and the complete identity fingerprint. Never calculate or submit fingerprints.
+Ordinary source changes preserve the document; a boundary change,
 rename, split, merge, addition, or removal archives invalidated knowledge and
 bootstraps overlapping new areas with explicitly marked leads. The tool is
 the only writer of these files.
@@ -604,7 +612,7 @@ After an area's discovery and every candidate verification finish:
 
 6. Otherwise, create only missing exact canonical label definitions required by
    accepted issues. Do not change existing label metadata; report drift for
-   `$gh-curate-issues`.
+   `/gh-curate-issues`.
 
 7. For `update-existing`, refresh immediately before writing, preserve the
    accepted root cause/intent and unrelated labels, then directly update title,
@@ -653,12 +661,12 @@ units and every attempt/status, focus/guidance/MCPs, exact Context7 and fallback
 usage, complete-history status and whether targeted or exhaustive regression was used,
 protected existing issues, rejected findings by reason, created/updated/proposed
 issues and labels, closure candidates and applied/blocked closures, GitHub-history
-generation/watermark and record counts, imported/refreshed/hydrated records,
+generation/watermark and record counts, imported/refreshed compact records,
 knowledge areas, revisions, reused version-matched conclusions, rechecked code
 findings and bootstrap leads, inventory revision and context requests, runtime validation proposals,
 executed probes and dispositions, environment fingerprints, inconclusive or
 skipped probes, helper integrity, scheduler active/idle time, task failures and
 recoveries, candidate-to-issue grouping, telemetry/token/tool totals, other validation, partial failures,
-and exact resume command (`$gh-audit-repo --resume`). Never claim
+and exact resume command (`/gh-audit-repo --resume`). Never claim
 complete coverage when any page, area, scope, verification, or publication is
 unfinished.

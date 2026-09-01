@@ -108,11 +108,11 @@ class TestRuntimeSafety:
                 records=[{"number": 1}],
                 artifacts=["artifact.json"],
             )
-        with pytest.raises(ValidationError, match="exceed 16384 bytes"):
+        with pytest.raises(ValidationError):
             HistoryManageRequest(
                 action="ingest",
                 kind="issue",
-                records=[{"number": 1, "body": "x" * (17 * 1024)}],
+                records=[{"number": number} for number in range(101)],
             )
 
     def test_history_artifacts_are_bounded_qwen_tool_results(self) -> None:

@@ -267,7 +267,7 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
         fetched_at: str | None = None,
         full_history_complete: bool | None = None,
     ) -> dict[str, Any]:
-        """Manage history; ingest large results by Qwen persisted-output artifact path."""
+        """Manage a compact GitHub index; details are discarded and read live when needed."""
         return _request_call(runtime.history_manage, HistoryManageRequest, **locals())
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
@@ -303,7 +303,7 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
         findings: list[dict[str, Any]] | None = None,
         versions: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """Reconcile, read, or update durable per-area audit knowledge."""
+        """Manage area knowledge with server-derived identities and fingerprints."""
         return _request_call(runtime.audit_knowledge, KnowledgeRequest, **locals())
 
     @mcp.tool(annotations=LOCAL_WRITE, structured_output=True)

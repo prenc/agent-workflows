@@ -92,7 +92,8 @@ class TestWorkflowRun:
             check=False,
         )
         assert blocked.returncode != 0
-        assert "use --resume" in blocked.stderr
+        current = self.project_dir / "workflows/gh-curate-issues/current/state.json"
+        assert json.loads(current.read_text())["run_id"] == resumed["run_id"]
 
     def test_terminal_current_is_replaced(self) -> None:
         first = self.initialize("gh-implement-issue")

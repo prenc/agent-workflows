@@ -25,8 +25,7 @@ class TestAuditKnowledge:
                 {
                     "areas": [
                         {
-                            "id": "area/core",
-                            "title": "Core",
+                            "area": "area/core",
                             "description": "Core behavior.",
                             "paths": [path],
                             "entrypoints": ["main"],
@@ -52,6 +51,8 @@ class TestAuditKnowledge:
         assert created["created"][0]["area"] == "area/core"
         document = self.project_dir / "workflows/gh-audit-repo/knowledge/areas/core.md"
         assert "# Core" in document.read_text()
+        marker = json.loads(document.read_text().split("\n-->", 1)[0].split("\n", 1)[1])
+        assert marker["area"]["fingerprint"]
         update = self.root / "update.json"
         update.write_text(
             json.dumps(
@@ -99,6 +100,11 @@ class TestAuditKnowledge:
         )
         reuse = {item["title"]: item["reuse"] for item in context["findings"]}
         assert reuse == {"API rule": "reusable", "Code proof": "recheck"}
+        listed = json.loads(self.call("show").stdout)
+        assert listed["active"] == [{"area": "area/core", "findings": 2, "revision": 2}]
+        shown = json.loads(self.call("show", "--area", "area/core").stdout)
+        assert shown["area"]["id"] == "area/core"
+        assert len(shown["findings"]) == 2
 
     def test_boundary_change_archives_and_bootstraps(self) -> None:
         self.call("reconcile", "--areas", str(self.areas), "--repo-sha", "sha1")

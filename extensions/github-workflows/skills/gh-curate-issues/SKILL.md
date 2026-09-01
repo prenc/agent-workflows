@@ -153,8 +153,8 @@ reported. Treat abandoned staging files as non-locking artifacts.
 When a GitHub MCP response reports `<persisted-output>`, pass every reported
 tool-result path directly in the `artifacts` list of a `history_manage` ingest
 call. Never read, copy, split, summarize, or re-transcribe those files for
-ingestion. Use inline `records` only for results that remained inline and fit
-the tool's 16 KiB limit; never provide `records` and `artifacts` together.
+ingestion. Use inline `records` only for results that remained inline, with at most
+100 compact records per call; never provide `records` and `artifacts` together.
 Keep explicit-link sets as compact inline data. On first use or automatic
 recovery, import a valid legacy
 `curation-v1.sqlite3` and the newest compatible completed audit artifact when
@@ -169,6 +169,8 @@ refresh plausible matches and every explicit older exception.
 `--refresh-history` re-fetches records in the current bounded curator view.
 Automatic recovery reconstructs complete history atomically. A changed
 default-branch SHA updates metadata without invalidating unchanged records.
+Bulk synchronization requests only number, URL, title, labels, state, assignees,
+timestamps, and pull-request refs; omit bodies and all detail collections.
 
 Advance the watermark only after every required page and direct fetch succeeds.
 A partial synchronization blocks GitHub publication and reports the exact
@@ -176,19 +178,20 @@ missing page or record.
 
 Before launching workers, create a current supervisor snapshot containing:
 
-- every selected issue's complete record, labels, assignees, relevant comments,
+- every selected issue's live-read complete record, labels, assignees, relevant comments,
   workflow markers, and native linked-PR metadata;
 - a compact view of every open issue;
 - bounded cached metadata for eligible closed issues and pull requests;
 - plausible closed-issue, duplicate, already-fixed, and implementation matches;
 - repository label definitions and the immutable default-branch SHA.
 
-Read plausible matches in full before including a relationship conclusion.
-For each selected issue, search eligible cached titles, bodies, labels, and
-explicit relationships. Also run targeted GitHub issue and pull-request searches
-whose closed/merged date qualifiers enforce the same cutoff, so metadata-only
-cached records cannot hide body-only matches. Ingest the bounded results and
-refresh every plausible match through MCP. Create each user-private candidate
+The shared cache is a compact index of number, URL, title, labels, state, timestamps,
+and pull-request refs; it never supplies bodies or relationship evidence. Search cached
+titles and labels to select plausible matches. Also run targeted GitHub issue and
+pull-request searches whose closed/merged date qualifiers enforce the same cutoff, so
+body-only matches remain discoverable. Read every selected issue and plausible match in
+full through MCP before including a duplicate, scope, body, or relationship conclusion;
+do not ingest those detail payloads into history. Create each user-private candidate
 bundle under the run's `artifacts/` directory.
 Include only that issue, plausible matches read in full, relevant relationship
 records, the repository summary, cutoff, watermark, and immutable default SHA.
@@ -196,7 +199,7 @@ Keep secrets and repository contents out of bundles.
 
 GitHub issue and PR records are the curator's evidence boundary. Treat paths,
 symbols, and implementation statements as claims from those records. Route a
-decision requiring current-code proof to `$gh-audit-repo` or
+decision requiring current-code proof to `/gh-audit-repo` or
 `$gh-reassess-work`.
 
 ## Stage 2: run one complete report per issue
@@ -372,7 +375,7 @@ Report:
 - documentation MCP queries, public sources used, and research limitations;
 - configured cutoff, history-days, history path, old/new watermark, and
   bounded-history coverage;
-- GitHub-history generation and records reused, refreshed, imported, and hydrated;
+- GitHub-history generation and compact records reused, refreshed, and imported;
 - explicit older-record exceptions and issue-specific candidate counts;
 - open and bounded closed pull-request history coverage and relationships established;
 - created children and retained original scopes;

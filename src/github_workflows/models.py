@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from typing import Annotated, Any, Literal
 
 from pydantic import (
@@ -223,22 +222,21 @@ class TaskManageRequest(ActionRequest, RootModel[TaskAction]):
 
 
 class HistoryRecord(ExtensibleRecord):
-    """One issue or pull-request record returned by the GitHub MCP server."""
+    """Compact issue or pull-request metadata returned by the GitHub MCP server."""
 
     number: int
     state: str = "unknown"
     title: str = ""
-    body: str = ""
     labels: list[Any] = Field(default_factory=list)
     assignees: list[Any] = Field(default_factory=list)
-    comments: list[Any] | None = None
-    relationships: Any | None = None
-    commits: list[Any] | None = None
     created_at: str | None = None
     updated_at: str | None = None
     closed_at: str | None = None
     merged_at: str | None = None
     url: str | None = None
+    base_ref: str | None = None
+    head_ref: str | None = None
+    head_sha: str | None = None
 
 
 class HistoryPrepareRequest(StrictRequest):
@@ -255,7 +253,7 @@ class HistoryIngestRequest(StrictRequest):
     action: Literal["ingest"]
     workflow: WorkflowName = "gh-audit-repo"
     kind: Literal["issue", "pull"]
-    records: list[HistoryRecord] = Field(default_factory=list)
+    records: list[HistoryRecord] = Field(default_factory=list, max_length=100)
     artifacts: list[str] = Field(default_factory=list, max_length=100)
     source: str = "github-mcp"
     fetched_at: str | None = None
@@ -264,16 +262,6 @@ class HistoryIngestRequest(StrictRequest):
     def validate_ingest_source(self) -> HistoryIngestRequest:
         if bool(self.records) == bool(self.artifacts):
             raise ValueError("ingest requires exactly one of records or artifacts")
-        if self.records:
-            rendered = json.dumps(
-                [record.model_dump(mode="json", exclude_none=True) for record in self.records],
-                separators=(",", ":"),
-            )
-            if len(rendered.encode("utf-8")) > 16 * 1024:
-                raise ValueError(
-                    "inline history records exceed 16384 bytes; pass Qwen persisted-output "
-                    "paths through artifacts instead"
-                )
         return self
 
 
@@ -372,22 +360,47 @@ BoundaryList = Annotated[
 
 
 class AreaDefinition(ExtensibleRecord):
-    id: str = Field(description="Canonical area/<slug> identifier.")
-    title: str
+    area: str = Field(description="Canonical area/<slug> identifier.")
+    title: str | None = None
     description: str
     paths: list[str]
     entrypoints: list[str] = Field(default_factory=list)
     boundaries: BoundaryList = Field(default_factory=list)
-    fingerprint: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_identity(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        area = normalized.get("area")
+        legacy_id = normalized.pop("id", None)
+        normalized.pop("fingerprint", None)
+        if area and legacy_id and area != legacy_id:
+            raise ValueError("area and legacy id must match")
+        inferred = area or legacy_id
+        title = normalized.get("title")
+        if inferred is None and isinstance(title, str) and title.startswith("area/"):
+            inferred = title
+            title = None
+        if inferred is None:
+            return normalized
+        normalized["area"] = inferred
+        if title == inferred:
+            title = None
+        if not title:
+            title = inferred.removeprefix("area/").replace("-", " ").replace("_", " ").capitalize()
+        normalized["title"] = title
+        return normalized
 
 
-class KnowledgeSimpleRequest(StrictRequest):
+class KnowledgeShowRequest(StrictRequest):
     action: Literal["show"]
+    area: str | None = None
 
 
 class KnowledgeStatusRequest(StrictRequest):
     action: Literal["status"]
-    areas: list[AreaDefinition] = Field(default_factory=list)
 
 
 class KnowledgeReconcileRequest(StrictRequest):
@@ -408,7 +421,7 @@ class KnowledgeUpdateRequest(StrictRequest):
 
 
 KnowledgeAction = Annotated[
-    KnowledgeSimpleRequest
+    KnowledgeShowRequest
     | KnowledgeStatusRequest
     | KnowledgeReconcileRequest
     | KnowledgeContextRequest
