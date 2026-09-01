@@ -1,0 +1,1 @@
+../../../../extensions/github-workflows/references/github-pr-template.md

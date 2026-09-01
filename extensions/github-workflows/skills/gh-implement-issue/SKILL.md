@@ -1,0 +1,385 @@
+______________________________________________________________________
+
+name: gh-implement-issue
+description: Immediately resolve and lock supplied GitHub issues, then supervise them or supplied implementation PRs as automatically grouped one-PR implementation units with bounded fresh-context workers, reusable isolated worktrees, verified rebases, worker-owned draft PR publication, native issue linkage, and supervisor-owned promotion and finalization.
+priority: 20
+argument-hint: '\[-n <N>\] \[--resume | [--separate] <issue-or-PR> ...\]'
+allowedTools:
+
+- task
+- send_message
+- list_agents
+- run_shell_command
+- grep_search
+- read_file
+- write_file
+- glob
+- mcp\_\_github_workflows\_\_run_manage
+- mcp\_\_github_workflows\_\_run_status
+- mcp\_\_github_workflows\_\_task_manage
+- mcp\_\_github\_\_add_issue_comment
+- mcp\_\_github\_\_get_me
+- mcp\_\_github\_\_issue_read
+- mcp\_\_github\_\_issue_write
+- mcp\_\_github\_\_label_write
+- mcp\_\_github\_\_list_branches
+- mcp\_\_github\_\_list_commits
+- mcp\_\_github\_\_list_issues
+- mcp\_\_github\_\_list_label
+- mcp\_\_github\_\_list_pull_requests
+- mcp\_\_github\_\_pull_request_read
+- mcp\_\_github\_\_search_pull_requests
+- mcp\_\_github\_\_update_pull_request
+
+______________________________________________________________________
+
+# Implement GitHub Issues
+
+Implement explicitly supplied GitHub issues or existing implementation pull
+requests. Read `../../references/github-issue-conventions.md`,
+`../../references/github-pr-template.md`, and
+`../../references/github-mcp-suspension.md`, plus repository instructions before changing
+state. Read `../../references/github-runtime-policy.md` and
+apply its reviewed-execution boundary to supervisors and workers. The
+supervisor owns scope resolution, worktrees, rebases, issue state, scheduling,
+independent verification, draft-to-ready promotion, and finalization.
+Fresh-context workers implement, validate, commit, push, and maintain the draft
+PR for one logical unit at a time.
+
+`-n N` limits simultaneously active implementation units. It
+must be positive and defaults to 3. Effective concurrency is the minimum of
+`N`, unresolved units, and available capacity. One unit owns exactly one
+branch, worktree, worker task, and eventual PR, but may cover multiple
+compatible issues. Each issue belongs to exactly one active unit.
+
+Automatically group compatible supplied issues into units. `--separate`
+places each supplied unimplemented issue in its own new-PR unit while keeping
+issues already covered by the same existing PR together.
+
+`--resume` uses the original targets and grouping mode recorded in the current
+unfinished run and may be combined only with `-n`. Use
+`mcp__github_workflows__run_manage` with action `resume`, then reconcile claims, issues,
+pull requests, branches, worktrees, and pending mutations before continuing.
+
+An invocation authorizes scoped assignment, temporary issue/PR `in-progress`,
+evidence-backed `partial`, removal of stale PR `ready-to-merge` when resuming
+changes, worktree/branch reuse or creation, commits, pushes, and creation or
+update of the resolved PRs. Merge, issue closure, taxonomy normalization,
+dependency changes, and heavy computation require separate authority.
+
+## Operating model
+
+Use GitHub MCP for GitHub records and mutations and local Git for repository
+and transport operations. `get_me` establishes the user used for assignments
+and safe branch ownership. Apply `../../references/github-mcp-suspension.md` when a required
+MCP operation cannot establish or retain availability. Qwen's MCP status
+display is informational.
+
+Workers receive a separate server-enforced GitHub MCP connection for targeted
+verification and the narrow creation/update of their assigned draft PR. They
+must establish the required read and draft-PR tools before analysis or edits.
+`MCP_UNAVAILABLE` from any worker
+suspends all units under `../../references/github-mcp-suspension.md`; supervisor snapshots
+are resume context rather than a fallback. The supervisor remains authoritative
+for claims, scheduling, issue/label state, final live verification, and every
+draft-to-ready transition.
+
+Use the linked project `.venv`, `uv`, and lightweight login-node checks. Keep
+repository-root `data/` contents, secrets, unrelated changes, CI/check APIs,
+merges, reviews, and reassessment outside this workflow. Validate taxonomy and
+report drift while mutating only assignment, `in-progress`, `partial`, and
+removal of stale PR `ready-to-merge`.
+
+Do not create or execute temporary orchestration scripts or invoke the
+extension's Python modules. Workers may create
+and run repository source, tests, or scripts only when required by the accepted
+implementation scope. Prefer existing project commands and transparent shell
+inspection; use visible `.venv/bin/python -c` checks only when simpler tools
+are insufficient.
+
+## Stage 1: resolve and lock requested issues immediately
+
+The first GitHub work is minimal target resolution followed by the
+`in-progress` claim. Before this gate, read only the target identity, state,
+labels, and PR relationship fields required to make the claim safely. Hydrate
+complete scope and implementation evidence after every claim succeeds.
+
+Resolve repository and issue identity for every URL, `owner/repo#N`, `#N`, and
+bare number. For a PR input, read only the PR's repository, state, body closing
+references, and native issue relationships needed to obtain its open issue
+numbers. Deduplicate issue identities. Stop an unresolved, closed, or
+relationship-free target before claiming anything.
+
+Before the first mutation, create private run state with
+`mcp__github_workflows__run_manage`. Pass `repository`, `n`, `targets`, and
+`separate` as top-level tool arguments; never wrap them in `request` or
+`inputs`, and never stringify them as JSON. On resume,
+pass only an explicitly supplied `n` in addition to the action and workflow.
+The run is stored under:
+
+```text
+$QWEN_CODE_PROJECT_DIR/workflows/gh-implement-issue/current/
+```
+
+Record supplied inputs, repositories, minimally resolved issue numbers/URLs,
+timestamps, pre-claim labels, every attempted mutation, successful claim,
+read-back, rollback, and pending cleanup in `state.json`; keep detailed unit
+results declarative and journal significant transitions. Write a checkpoint
+atomically after every GitHub mutation so interruption leaves an actionable
+recovery record.
+
+Call `get_me`, then minimally refresh every resolved issue for state and labels.
+If any issue already has `in-progress`, record its URL and stop before claiming
+the remaining set; treat that lock as authoritative. Otherwise ensure
+the exact canonical `in-progress` label exists, reporting definition drift
+without repairing it. Apply `in-progress` sequentially to every requested issue
+and read each issue back immediately. Preserve all unrelated labels.
+
+The initial claim is transactional across the complete requested issue set. If
+any application or read-back fails, release every `in-progress` claim added by
+this run, verify each rollback, and stop. Only after every requested issue is
+confirmed locked may the supervisor perform scope hydration, implementation
+discovery, grouping, assignment, worktree preparation, or worker launch.
+
+## Stage 2: hydrate, classify, group, and assign
+
+With the early claims held, fetch complete issue scopes, labels, maintainer
+clarifications, native relationships, plausible implementation PRs, and
+existing PR bodies, commits, reviews, comments, heads/bases, and immutable SHAs.
+Establish accepted scope from the issue record and explicit maintainer
+clarifications. Overlay any explicit correction or remaining-work statement
+from the authenticated user's unique current managed reassessment beginning
+`<!-- codex:github-work-reassessment:v1 -->` or the legacy
+`<!-- codex:github-issue-reevaluation:v1 -->`; stop on more than one matching
+managed comment. The concise reassessment supplements unchanged issue
+requirements rather than repeating or replacing them.
+
+Classify targets through MCP:
+
+- an issue with no unambiguous open implementation PR is eligible for a new-PR
+  unit;
+- an issue with one unambiguous open implementation PR continues that PR;
+- a PR resolves through its native relationships and closing references to at
+  least one accepted open issue;
+- supplied issues already linked to or explicitly closed by the same PR form
+  one fixed existing-PR unit;
+- repeated inputs resolving to the same branch/PR form one unit.
+
+Stop an ambiguous target without choosing between multiple PRs. Never add a
+newly supplied issue to an existing PR unless that PR already links or
+explicitly closes it.
+
+Unless `--separate` is set, partition eligible new-PR issues using a
+compatibility matrix. Issues may share a unit only when all of these hold:
+
+- they use the same repository and default base branch;
+- none has a competing implementation;
+- they affect the same component, one shared documentation/configuration
+  surface, or one cohesive behavior;
+- their required outcomes and scope boundaries do not conflict;
+- one reasonably sized diff and validation path can complete every issue;
+- merging one PR can independently satisfy every included issue.
+
+Use predicted file overlap as the primary partitioning signal. When two or
+more eligible issues are likely to modify the same files or a tightly coupled
+edit surface, group them by default to avoid serial PR merge conflicts,
+provided their combined diff remains reasonably sized and cohesive. Infer the
+likely paths from hydrated issue scope and repository structure; exact path
+certainty is not required before worker investigation.
+
+Group overlapping scopes when their combined size remains reasonably
+reviewable. Keep individually large scopes separate when the combined burden is
+large, their requirements conflict, or either change remains independently
+reviewable without creating substantial merge-conflict risk. A shared broad
+label such as `documentation` is only supporting evidence: issues in unrelated
+documents or documentation areas remain separate, while small compatible
+changes to the same files should normally share a unit.
+
+Favor a small cohesive bundle over maximizing issue count. Labels may differ
+when the implementation surface is genuinely shared; issue taxonomy remains
+per issue. The convention's same-taxonomy rule governs grouping findings into
+one issue, not grouping several existing issues into one implementation PR.
+There is no fixed issue-count limit. Keep unrelated areas, independent
+validation paths, prerequisites, and separately reviewable changes with low
+overlap risk in separate units. Record predicted overlapping paths, the
+compatibility decision, size judgment, and rejected pairings in the ledger.
+
+For a new multi-issue unit, choose the issue representing the primary
+functional outcome as its anchor; break ties by lowest issue number. The anchor
+affects naming only and grants no priority or ownership over sibling issues.
+
+For each completed unit plan, refresh every issue and confirm the exact early
+claim remains present. Assign every issue sequentially and record each
+mutation. If an assignment fails, release assignments added for that unit and
+release this run's claims for every unit that has not launched, verify rollback,
+and stop. Launch work only after all issue claims and assignments read back
+correctly.
+
+If hydration or classification determines that an issue is ambiguous,
+unsuitable, requires unresolved authority, or cannot enter any coherent unit,
+release this run's `in-progress` claim on that issue immediately and verify the
+result before continuing or stopping. Release unsuitable early claims before
+waiting for user clarification. Update the early ledger with the disposition
+and cleanup result.
+
+Require each resulting unit to fit one coherent eventual PR. Route an existing
+issue whose own accepted scope needs independently mergeable PRs to
+`$gh-curate-issues` for splitting.
+
+## Stage 3: prepare or reuse the worktree
+
+Use:
+
+```text
+single new issue: <project>/.worktrees/issue-<N>-<slug>
+new issue bundle: <project>/.worktrees/issues-<anchor>-<slug>
+existing PR:      <project>/.worktrees/issue-<anchor>-pr-<P>-continue
+```
+
+Require `.worktrees/` ignored and link the secondary worktree's `.venv` to the
+main project environment. Inspect registered worktrees, branch ownership, Git
+operation state, local changes, and remote refs. Reuse matching durable Qwen or
+Codex state when repository, unit, and branch ownership are unambiguous.
+
+Create a new branch `issue-<N>-<slug>` for a single issue or
+`issues-<anchor>-<slug>` for a bundle from the exact latest default-branch SHA.
+Confirm the chosen local and remote name is unused. For an existing PR, fetch
+its exact head and latest base, record the remote head as the lease SHA, align
+or reuse the local head branch, and rebase onto the latest base before
+implementation edits.
+
+Resolve defensible conflicts from issue scope, both sides, callers, and tests.
+Record each conflict and focused validation. Abort and restore the rebase when
+resolution requires new product, scientific, dependency, security, or data
+authority.
+
+Before each active round, refresh the unit and confirm its recorded claim. For
+an existing PR, remove `ready-to-merge`, apply PR `in-progress`, and preserve
+`partial` while accepted scope remains incomplete.
+
+## Stage 4: run bounded implementation rounds
+
+Register the complete round assignment with
+`mcp__github_workflows__task_manage`, then launch
+`gh-implement-issue-worker` with fresh context and:
+
+```text
+Task ref: <task-ref-returned-by-task-manage>
+```
+
+Maintain a ledger containing unit, semantic task ID, task reference, anchor,
+issues, grouping rationale,
+branch/worktree, PR, round, scope sources, original/base/current SHAs, claim
+ownership, per-issue coverage, checkpoint, and finalization state. One worker
+owns a unit at a time.
+
+Each round has 128 turns: 120 working turns and eight reserved checkpoint
+turns. Workers return `DRAFT_READY_FOR_SUPERVISOR`, `CONTINUE_REQUESTED`,
+`SPLIT_REQUESTED`, `CORRECTION_NEEDED`, `BLOCKED`, `MCP_UNAVAILABLE`, or
+`NO_IMPLEMENTATION`. `MCP_UNAVAILABLE` suspends the complete workflow before
+any further unit work.
+Review every checkpoint against every issue's accepted scope, unit cohesion,
+the complete base diff, validation, research semantics, and confidential-data
+safety.
+
+The worker performs a cohesion preflight before edits. For a
+`SPLIT_REQUESTED` checkpoint with no changes, independently verify the proposed
+partition, release no claims, create separate unit ledgers/worktrees, and then
+launch one worker per new unit within the concurrency limit. If the current
+diff already represents some issues, retain those issues and that diff in the
+current unit and split only untouched issues. Never copy or share an edited
+worktree between units. When changes entangle the proposed partitions, send a
+correction that restores one cohesive unit or escalate to the user when a safe
+partition requires a product, scientific, or scope decision.
+
+Continue the same task with one bounded objective, return an exact correction,
+advance to draft verification, or terminate and finalize. Two rounds blocked by the
+same explained cause trigger termination or user escalation.
+
+## Stage 5: supervisor verification of the draft
+
+For inherited and new work, require the worker's pushed draft PR and independently
+inspect the complete rebased diff, callers, tests, configuration, and required
+outcomes. Treat PR coverage and worker validation as assertions. Preserve correct
+work and send the smallest bounded correction back to the same worker for any
+missing, incorrect, unrelated, or regressive change. The worker commits, pushes,
+and updates the same draft before verification repeats.
+
+Draft-to-ready promotion requires:
+
+- every required outcome for every covered issue is complete;
+- focused tests and `.venv/bin/pre-commit run --all-files` pass;
+- the complete diff is cohesive and contains no unrelated or sensitive work;
+- no unresolved authority-sensitive decision remains;
+- the worktree has no active Git operation.
+- the draft PR body follows the shared template and its head matches the pushed commit.
+
+## Stage 6: promote centrally
+
+Refresh the worker-created draft PR, its head/base, and the remote branch. Assign
+the PR to the authenticated user when the MCP surface supports it and apply PR
+`in-progress` during active supervisor verification. Confirm the body follows
+`../../references/github-pr-template.md`, begins with
+`<!-- qwen:issue-implementation:v1 -->`, and contains meaningful validation
+evidence from checks actually run and observed results. Send body corrections to the worker so
+the draft remains worker-maintained.
+
+Refresh each fully covered issue after the PR body is current. Require the PR
+in `closed_by_pull_requests.references`, or—when that field is unavailable—
+verify the exact closing reference and default-branch target. Correct a failed
+body through one bounded worker correction; a remaining failure blocks finalized publication. For each
+incomplete unit issue, confirm that its closing reference is absent and its
+coverage remains unchecked. Confirm the PR head equals the pushed SHA. Remote
+CI is outside the completion gate.
+
+When every promotion requirement is satisfied, the supervisor updates the PR
+from draft to ready for review. A usable incomplete handoff remains a draft.
+Workers keep every created or updated PR in draft state; only the supervisor
+performs a draft-to-ready transition.
+
+## Stage 7: finalize every unit
+
+Finalization is mandatory on every normal exit and is serialized by the
+supervisor. Refresh each artifact, apply the transition, and read it back:
+
+| Outcome                                       | PR state          | Issue labels                                                                  | PR labels                                                          |
+| --------------------------------------------- | ----------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| continuing now                                | current           | `in-progress`; add `partial` only to each issue with durable incomplete scope | `in-progress`; add `partial` when any issue is incomplete          |
+| complete Qwen publication                     | ready for review  | remove `in-progress` and `partial`                                            | remove `in-progress` and `partial`                                 |
+| usable incomplete handoff                     | draft             | remove `in-progress`; apply `partial` only to incomplete issues               | remove `in-progress`; apply `partial` when any issue is incomplete |
+| blocked/terminated without usable remote work | unchanged or none | remove this workflow's `in-progress`; remove unsupported `partial`            | same                                                               |
+| `NO_IMPLEMENTATION`                           | none or unchanged | remove this workflow's `in-progress`; remove unsupported `partial`            | same                                                               |
+
+Qwen leaves `ready-to-merge` to Codex `$gh-pickup-work` or
+`$gh-reassess-work`. Assignments remain responsibility metadata after a
+successful publication; release workflow-added assignment for abandoned or
+no-implementation units.
+
+Use `NO_IMPLEMENTATION` only when no issue in the unit requires a code change.
+When it applies to only part of a multi-issue unit, process it as a
+`SPLIT_REQUESTED` per-issue disposition and continue the remaining cohesive
+issues. Verify the worker's evidence and optionally publish one concise comment
+on each affected issue before finalization. Issue state and terminal labels
+remain curator/maintainer responsibilities.
+
+A unit is finalized only after issue and PR reads confirm the intended label
+state. If authentication, authorization, interruption, or a conflicting actor
+prevents cleanup, report each retained label and URL prominently as manual
+repair state.
+
+## Final report
+
+Report resolved inputs, early-ledger path, claim order/read-backs/rollbacks and
+time from resolution to confirmed lock, automatic grouping and rejected pairings, anchors,
+units, effective concurrency, issue/PR URLs, worktrees/branches, reused or
+created state, accepted scope sources, worker GitHub evidence source and MCP
+limitations, rounds/checkpoints, inherited-work verification, per-issue
+coverage, changes, conflicts, validation and confirmed remote-head state,
+lease outcomes, PR body and native linkage for every issue, assignments,
+complete status transitions, finalization read-back, retained artifacts,
+external mutations, and blockers.
+
+Keep exact original, base, rebased, and pushed SHAs in the private ledger for
+verification, recovery, and handoff. In the user-facing report, state that the
+remote PR head was verified. Include a short SHA when it materially helps
+identify a commit, and provide a full SHA when the user explicitly requests it.

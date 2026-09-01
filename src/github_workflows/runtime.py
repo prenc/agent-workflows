@@ -1,0 +1,1286 @@
+"""High-level, path-free facade over the reviewed workflow domain modules."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import stat
+import subprocess
+import tempfile
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, redirect_stdout
+from io import StringIO
+from pathlib import Path
+from typing import Any, cast
+
+from . import (
+    audit_inventory,
+    audit_knowledge,
+    audit_metrics,
+    audit_probe,
+    github_cache,
+    workflow_run,
+)
+from .models import (
+    AuditRecordRequest,
+    HistoryManageRequest,
+    HistoryQueryRequest,
+    InventoryRequest,
+    KnowledgeRequest,
+    ProbeRequest,
+    PublishRequest,
+    RunManageRequest,
+    TaskManageRequest,
+    WorkflowName,
+)
+
+SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+HISTORY_ARTIFACT_BYTES = 5 * 1024 * 1024
+HISTORY_ARTIFACT_TOTAL_BYTES = 25 * 1024 * 1024
+
+
+class WorkflowRuntime:
+    """Resolve ambient Qwen state and expose atomic workflow operations."""
+
+    def __init__(self, workspace: Path, project_dir: Path | None = None) -> None:
+        self.workspace = workspace.expanduser().resolve()
+        if not self.workspace.is_dir():
+            raise ValueError("workspace must be an existing directory")
+        configured = project_dir or (
+            Path(os.environ["QWEN_CODE_PROJECT_DIR"])
+            if os.environ.get("QWEN_CODE_PROJECT_DIR")
+            else None
+        )
+        if configured is None:
+            raise ValueError("QWEN_CODE_PROJECT_DIR is required")
+        self.project_dir = configured.expanduser().resolve()
+
+    @contextmanager
+    def lock(self) -> Iterator[None]:
+        lock_dir = self.project_dir / "workflows"
+        lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(lock_dir, 0o700)
+        descriptor = os.open(lock_dir / ".runtime.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(descriptor)
+
+    def current(self, workflow: WorkflowName) -> Path:
+        return self.project_dir / "workflows" / workflow / "current"
+
+    def state(self, workflow: WorkflowName) -> dict[str, Any]:
+        return workflow_run.load_state(self.current(workflow))
+
+    @staticmethod
+    def _invoke(handler: Callable[[argparse.Namespace], Any], **values: Any) -> dict[str, Any]:
+        output = StringIO()
+        with redirect_stdout(output):
+            result = handler(argparse.Namespace(**values))
+        rendered = output.getvalue().strip()
+        payload = json.loads(rendered) if rendered else {}
+        if not isinstance(payload, dict):
+            raise ValueError("workflow operation returned a non-object response")
+        if isinstance(result, int) and result not in {0, payload.get("returncode")}:
+            raise RuntimeError(f"workflow operation failed with exit code {result}")
+        return payload
+
+    @staticmethod
+    @contextmanager
+    def _json_file(value: Any) -> Iterator[Path]:
+        with tempfile.TemporaryDirectory(prefix="qwen-workflow-input-") as directory:
+            path = Path(directory) / "input.json"
+            path.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+            os.chmod(path, 0o600)
+            yield path
+
+    def _base(self, workflow: WorkflowName) -> dict[str, Any]:
+        return {
+            "project_root": self.workspace,
+            "project_dir": self.project_dir,
+            "workflow": workflow,
+        }
+
+    def _event(self, payload: dict[str, Any]) -> dict[str, Any]:
+        state = self.state("gh-audit-repo")
+        with self._json_file(payload) as source:
+            return self._invoke(
+                workflow_run.audit_event,
+                **self._base("gh-audit-repo"),
+                expected_revision=state["revision"],
+                input=source,
+            )
+
+    @staticmethod
+    def _history_artifact_root() -> Path:
+        configured = os.environ.get("QWEN_HOME")
+        return (
+            Path(configured) if configured else Path.home() / ".qwen"
+        ).expanduser().resolve() / "tmp"
+
+    @classmethod
+    def _history_artifact_records(cls, paths: list[str], kind: str) -> list[dict[str, Any]]:
+        root = cls._history_artifact_root()
+        records: list[dict[str, Any]] = []
+        total_bytes = 0
+        envelopes = {
+            "issue": ("issues",),
+            "pull": ("pullRequests", "pull_requests", "pulls"),
+        }
+        wrong_envelopes = {
+            "issue": {"pullRequests", "pull_requests", "pulls"},
+            "pull": {"issues"},
+        }
+        for raw_path in paths:
+            candidate = Path(raw_path).expanduser()
+            try:
+                metadata = candidate.lstat()
+            except OSError as error:
+                raise ValueError(f"history artifact is unavailable: {raw_path}") from error
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("history artifacts must be regular, non-symlink files")
+            resolved = candidate.resolve()
+            try:
+                relative = resolved.relative_to(root)
+            except ValueError as error:
+                raise ValueError("history artifacts must be Qwen persisted-output files") from error
+            if len(relative.parts) != 3 or relative.parts[1] != "tool-results":
+                raise ValueError("history artifacts must be under Qwen tmp/*/tool-results/")
+            if metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
+                raise ValueError(
+                    "history artifacts must be owned by the current user and privately writable"
+                )
+            if metadata.st_size > HISTORY_ARTIFACT_BYTES:
+                raise ValueError(f"history artifact exceeds {HISTORY_ARTIFACT_BYTES} bytes")
+            total_bytes += metadata.st_size
+            if total_bytes > HISTORY_ARTIFACT_TOTAL_BYTES:
+                raise ValueError(
+                    f"history artifacts exceed {HISTORY_ARTIFACT_TOTAL_BYTES} bytes in total"
+                )
+            try:
+                payload = json.loads(resolved.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                raise ValueError("history artifact must contain valid UTF-8 JSON") from error
+            if isinstance(payload, list):
+                page = payload
+            elif isinstance(payload, dict):
+                mismatched = wrong_envelopes[kind].intersection(payload)
+                if mismatched:
+                    raise ValueError(f"history artifact envelope does not match kind {kind}")
+                page = None
+                for name in (*envelopes[kind], "records"):
+                    if name in payload:
+                        page = payload[name]
+                        break
+                if page is None:
+                    raise ValueError("history artifact does not contain a supported record list")
+            else:
+                raise ValueError("history artifact must contain a JSON object or array")
+            if not isinstance(page, list) or not all(isinstance(item, dict) for item in page):
+                raise ValueError("every history artifact record must be an object")
+            records.extend(page)
+        return records
+
+    def _audit_paths(self) -> tuple[dict[str, Any], Path, Path]:
+        state = self.state("gh-audit-repo")
+        if state.get("status") != "in-progress":
+            raise ValueError("the current audit run is not active")
+        workflow_run.require_audit_helper_integrity(state)
+        worktree = state.get("audit_worktree")
+        if not isinstance(worktree, str):
+            raise ValueError("current audit state does not contain an audit worktree")
+        return state, Path(worktree).resolve(), self.current("gh-audit-repo")
+
+    def _source_and_worktree(self, confirmed: bool) -> dict[str, Any]:
+        source = self._invoke(workflow_run.audit_source, project_root=self.workspace)
+        if source.get("confirmation_required") and not confirmed:
+            raise ValueError(
+                "the audit source is not main/master; obtain user confirmation and retry"
+            )
+        sha = str(source["sha"])
+        worktree = self.workspace / ".worktrees" / f"gh-audit-repo-{sha[:7]}"
+        ignored = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.workspace),
+                "check-ignore",
+                "-q",
+                "--no-index",
+                ".worktrees/probe",
+            ],
+            check=False,
+        )
+        if ignored.returncode != 0:
+            raise ValueError(".worktrees/ must be ignored before starting an audit")
+        if worktree.exists():
+            actual = subprocess.run(
+                ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            if actual != sha:
+                raise ValueError("the retained audit worktree points to a different commit")
+        else:
+            worktree.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(self.workspace),
+                    "worktree",
+                    "add",
+                    "--detach",
+                    str(worktree),
+                    sha,
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        project_venv = self.workspace / ".venv"
+        worktree_venv = worktree / ".venv"
+        if project_venv.is_dir() and not worktree_venv.exists():
+            worktree_venv.symlink_to(project_venv, target_is_directory=True)
+        return {**source, "audit_worktree": str(worktree), "source_confirmed": confirmed}
+
+    @staticmethod
+    def _receipt(
+        workflow: WorkflowName, state: dict[str, Any], changed: bool, **extra: Any
+    ) -> dict[str, Any]:
+        return {
+            "run_id": state.get("run_id"),
+            "workflow": workflow,
+            "status": state.get("status"),
+            "revision": state.get("revision"),
+            "changed": changed,
+            **extra,
+        }
+
+    @staticmethod
+    def _task_ref(workflow: WorkflowName, state: dict[str, Any], task_id: str) -> str:
+        run_id = state.get("run_id")
+        if not isinstance(run_id, str) or not SAFE_ID.fullmatch(run_id):
+            raise ValueError("current run has an invalid run_id")
+        return f"{workflow}:{run_id}:{task_id}"
+
+    @staticmethod
+    def _parse_task_ref(task_ref: str) -> tuple[WorkflowName, str, str]:
+        parts = task_ref.split(":", 2)
+        if len(parts) != 3:
+            raise ValueError("task_ref must use workflow:run-id:task-id")
+        workflow, run_id, task_id = parts
+        if workflow not in workflow_run.WORKFLOWS:
+            raise ValueError("task_ref contains an unsupported workflow")
+        if not SAFE_ID.fullmatch(run_id) or not SAFE_ID.fullmatch(task_id):
+            raise ValueError("task_ref contains an invalid run_id or task_id")
+        return cast(WorkflowName, workflow), run_id, task_id
+
+    @staticmethod
+    def _generic_scheduler_status(state: dict[str, Any]) -> dict[str, Any]:
+        scheduler = state.get("scheduler")
+        tasks = state.get("tasks")
+        if not isinstance(scheduler, dict) or not isinstance(tasks, dict):
+            raise ValueError("generic workflow scheduler state is missing")
+        limit = scheduler.get("limit")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("generic workflow concurrency must be a positive integer")
+        queue = scheduler.get("integration_queue", [])
+        if not isinstance(queue, list):
+            raise ValueError("generic workflow integration queue is invalid")
+        activity = scheduler.get("supervisor_activity")
+        running = sum(
+            task.get("status") == "running" for task in tasks.values() if isinstance(task, dict)
+        )
+        available = max(0, limit - running - (1 if activity is not None else 0))
+        if queue:
+            available = 0
+        statuses = {task.get("status") for task in tasks.values() if isinstance(task, dict)}
+        logical: dict[str, list[dict[str, Any]]] = {}
+        for task in tasks.values():
+            if isinstance(task, dict):
+                logical.setdefault(str(task.get("logical_id", "")), []).append(task)
+        missing_required = any(
+            any(attempt.get("required", True) for attempt in attempts)
+            and not any(
+                attempt.get("status") == "completed" and attempt.get("integrated")
+                for attempt in attempts
+            )
+            for attempts in logical.values()
+        )
+        if activity is not None:
+            next_action = "finish-integration"
+        elif queue:
+            next_action = "integrate-result"
+        elif "queued" in statuses and available > 0:
+            next_action = "launch-worker"
+        elif "checkpointed" in statuses:
+            next_action = "resume-worker"
+        elif running:
+            next_action = "wait"
+        elif missing_required:
+            next_action = "retry-required-task"
+        else:
+            next_action = "ready-to-finish"
+        return {
+            "limit": limit,
+            "running_workers": running,
+            "supervisor_activity": activity,
+            "integration_queue": list(queue),
+            "worker_slots": available,
+            "next_action": next_action,
+            "control_plane_available": True,
+        }
+
+    @classmethod
+    def _scheduler_status(cls, state: dict[str, Any]) -> dict[str, Any]:
+        audit = state.get("workflow") == "gh-audit-repo" and state.get("schema_version") == 2
+        status = (
+            workflow_run.audit_scheduler_status(state)
+            if audit
+            else cls._generic_scheduler_status(state)
+        )
+        run_status = state.get("status")
+        if run_status != "in-progress":
+            status = {
+                **status,
+                "worker_slots": 0,
+                "next_action": "resume" if run_status in {"suspended", "partial"} else "none",
+            }
+        return status
+
+    @staticmethod
+    def _validate_generic_terminal(state: dict[str, Any]) -> None:
+        errors: list[str] = []
+        tasks = state.get("tasks", {})
+        if not isinstance(tasks, dict):
+            raise ValueError("generic workflow tasks state is invalid")
+        terminal = {"completed", "failed", "abandoned"}
+        nonterminal = sorted(
+            task_id
+            for task_id, task in tasks.items()
+            if not isinstance(task, dict) or task.get("status") not in terminal
+        )
+        if nonterminal:
+            errors.append(f"nonterminal tasks: {nonterminal}")
+        unintegrated = sorted(
+            task_id
+            for task_id, task in tasks.items()
+            if isinstance(task, dict)
+            and task.get("status") in terminal
+            and not task.get("integrated")
+        )
+        if unintegrated:
+            errors.append(f"unintegrated terminal tasks: {unintegrated}")
+        logical: dict[str, list[dict[str, Any]]] = {}
+        for task in tasks.values():
+            if isinstance(task, dict):
+                logical.setdefault(str(task.get("logical_id", "")), []).append(task)
+        missing_required = sorted(
+            logical_id
+            for logical_id, attempts in logical.items()
+            if any(attempt.get("required", True) for attempt in attempts)
+            and not any(
+                attempt.get("status") == "completed" and attempt.get("integrated")
+                for attempt in attempts
+            )
+        )
+        if missing_required:
+            errors.append(
+                f"required logical tasks without an integrated completion: {missing_required}"
+            )
+        scheduler = state.get("scheduler", {})
+        if not isinstance(scheduler, dict):
+            errors.append("scheduler state is invalid")
+        else:
+            if scheduler.get("integration_queue"):
+                errors.append("integration queue is not empty")
+            if scheduler.get("supervisor_activity") is not None:
+                errors.append("supervisor material activity is still active")
+        if state.get("pending"):
+            errors.append("pending operations are not empty")
+        if errors:
+            raise ValueError("generic workflow cannot be finalized: " + "; ".join(errors))
+
+    def run_manage(self, request: RunManageRequest) -> dict[str, Any]:
+        with self.lock():
+            if request.action == "start":
+                inputs = {
+                    "repository": request.repository,
+                    "inputs": request.invocation(),
+                }
+                if request.workflow == "gh-audit-repo":
+                    inputs = {**inputs, **self._source_and_worktree(request.source_confirmed)}
+                else:
+                    limit = request.invocation()["n"]
+                    inputs["tasks"] = {}
+                    inputs["scheduler"] = {
+                        "limit": limit,
+                        "integration_queue": [],
+                        "supervisor_activity": None,
+                    }
+                    inputs["pending"] = request.pending
+                with self._json_file(inputs) as source:
+                    self._invoke(
+                        workflow_run.initialize, **self._base(request.workflow), input=source
+                    )
+            elif request.action == "resume":
+                if request.n is not None:
+                    state = self.state(request.workflow)
+                    scheduler = self._scheduler_status(state)
+                    if scheduler["running_workers"] > request.n:
+                        raise ValueError(
+                            "cannot lower concurrency below currently running worker count"
+                        )
+                self._invoke(workflow_run.resume, **self._base(request.workflow))
+                if request.n is not None:
+                    if request.workflow == "gh-audit-repo":
+                        self._event(
+                            {
+                                "type": "directive-update",
+                                "directive": {
+                                    "concurrency": request.n,
+                                    "kind": "resume-concurrency",
+                                },
+                            }
+                        )
+                    else:
+                        self._set_generic_concurrency(request.workflow, request.n)
+            elif request.action == "directive":
+                self._event({"type": "directive-update", "directive": request.directive()})
+            else:
+                state = self.state(request.workflow)
+                if request.action == "finish" and request.workflow != "gh-audit-repo":
+                    self._validate_generic_terminal(state)
+                status = {
+                    "checkpoint": "in-progress",
+                    "pause": "suspended",
+                    "abort": "aborted",
+                    "finish": "complete",
+                }[request.action]
+                terminal = request.action in {"abort", "finish"}
+                self._invoke(
+                    lambda args: workflow_run.update_state(args, terminal=terminal),
+                    **self._base(request.workflow),
+                    expected_revision=state["revision"],
+                    status=status,
+                    input=None,
+                    event=request.note,
+                )
+            state = self.state(request.workflow)
+            return self._receipt(
+                request.workflow, state, True, next_actions=self._next_actions(state)
+            )
+
+    def _set_generic_concurrency(self, workflow: WorkflowName, limit: int) -> None:
+        state = self.state(workflow)
+        scheduler = dict(state.get("scheduler", {}))
+        tasks = state.get("tasks", {})
+        running = (
+            sum(
+                task.get("status") == "running" for task in tasks.values() if isinstance(task, dict)
+            )
+            if isinstance(tasks, dict)
+            else 0
+        )
+        if running > limit:
+            raise ValueError("cannot lower concurrency below currently running worker count")
+        scheduler["limit"] = limit
+        invocation = dict(state.get("inputs", {}))
+        invocation["n"] = limit
+        with self._json_file({"scheduler": scheduler, "inputs": invocation}) as source:
+            self._invoke(
+                lambda args: workflow_run.update_state(args, terminal=False),
+                **self._base(workflow),
+                expected_revision=state["revision"],
+                status=state["status"],
+                input=source,
+                event="resume_concurrency_changed",
+            )
+
+    @classmethod
+    def _next_actions(cls, state: dict[str, Any]) -> list[str]:
+        if state.get("status") in workflow_run.TERMINAL:
+            return []
+        if state.get("status") in {"suspended", "partial"}:
+            return ["resume"]
+        scheduler = state.get("scheduler")
+        if isinstance(scheduler, dict):
+            return [cls._scheduler_status(state)["next_action"]]
+        return []
+
+    def run_status(self, workflow: WorkflowName) -> dict[str, Any]:
+        state = self.state(workflow)
+        raw_tasks = state.get("tasks", {})
+        tasks = (
+            {
+                task_id: {**task, "task_ref": self._task_ref(workflow, state, task_id)}
+                for task_id, task in raw_tasks.items()
+                if isinstance(task, dict)
+            }
+            if isinstance(raw_tasks, dict)
+            else {}
+        )
+        scheduler = self._scheduler_status(state)
+        summary: dict[str, Any] = {
+            "run_id": state.get("run_id"),
+            "workflow": workflow,
+            "status": state.get("status"),
+            "revision": state.get("revision"),
+            "inputs": state.get("inputs", {}),
+            "pending": state.get("pending", []),
+            "tasks": tasks,
+            "scheduler": scheduler,
+        }
+        if workflow == "gh-audit-repo" and state.get("schema_version") == 2:
+            integrity = workflow_run.audit_helper_integrity(state)
+            if not integrity["valid"]:
+                summary["scheduler"] = {
+                    **scheduler,
+                    "worker_slots": 0,
+                    "next_action": "abort-and-start-new-run",
+                }
+            summary.update(
+                {
+                    "repository": state.get("repository"),
+                    "branch": state.get("branch"),
+                    "sha": state.get("sha"),
+                    "upstream": state.get("upstream"),
+                    "ahead": state.get("ahead"),
+                    "behind": state.get("behind"),
+                    "primary_worktree": state.get("primary_worktree"),
+                    "audit_worktree": state.get("audit_worktree"),
+                    "source_confirmed": state.get("source_confirmed"),
+                    "confirmation_required": state.get("confirmation_required"),
+                    "excluded_dirty_state": state.get("excluded_dirty_state"),
+                    "helper_integrity": integrity,
+                    "phases": state.get("phases", {}),
+                    "history": state.get("history", {}),
+                    "inventory": state.get("inventory"),
+                    "shards": state.get("shards", {}),
+                    "candidates": state.get("candidates", {}),
+                    "validations": state.get("validations", {}),
+                    "verdicts": state.get("verdicts", {}),
+                    "mutations": state.get("mutations", []),
+                    "metrics": state.get("metrics", {}),
+                    "head_drift": state.get("head_drift", {}),
+                    "limitations": state.get("limitations", []),
+                }
+            )
+        return summary
+
+    def task_manage(self, request: TaskManageRequest) -> dict[str, Any]:
+        if not SAFE_ID.fullmatch(request.task_id):
+            raise ValueError("task_id contains unsupported characters")
+        with self.lock():
+            state = self.state(request.workflow)
+            if request.workflow != "gh-audit-repo":
+                return self._generic_task_manage(request, state)
+            managed_task_id = request.task_id
+            if request.action in {"plan", "retry"}:
+                attempt = 1
+                if request.action == "retry":
+                    previous = state.get("tasks", {}).get(request.task_id)
+                    if not isinstance(previous, dict):
+                        raise ValueError("retry requires an existing task_id")
+                    logical_id = str(previous["logical_id"])
+                    attempt = (
+                        max(
+                            int(item.get("attempt", 1))
+                            for item in state["tasks"].values()
+                            if item.get("logical_id") == logical_id
+                        )
+                        + 1
+                    )
+                    task_id = f"{logical_id}-{attempt}"
+                    prior = previous
+                else:
+                    logical_id = request.logical_id or request.task_id
+                    task_id = request.task_id
+                    prior = {}
+                if not SAFE_ID.fullmatch(logical_id):
+                    raise ValueError("logical_id contains unsupported characters")
+                if not SAFE_ID.fullmatch(task_id):
+                    raise ValueError("generated task_id contains unsupported characters")
+                if task_id in state.get("tasks", {}):
+                    raise ValueError(f"task already exists: {task_id}")
+                task = {
+                    "id": task_id,
+                    "logical_id": logical_id,
+                    "agent_id": request.agent_id or task_id,
+                    "role": request.role or prior.get("role") or "discover",
+                    "unit": request.unit or prior.get("unit") or task_id,
+                    "attempt": attempt,
+                    "status": "queued",
+                    "required": request.required,
+                    "assignment": request.assignment or prior.get("assignment", {}),
+                }
+                result = self._event({"type": "task-register", "task": task})
+                managed_task_id = task_id
+            elif request.action in {"integrate_start", "integrate_finish"}:
+                event = (
+                    "integration-start"
+                    if request.action == "integrate_start"
+                    else "integration-complete"
+                )
+                result = self._event({"type": event, "task_id": request.task_id})
+            else:
+                status = {
+                    "dispatch": "running",
+                    "checkpoint": "checkpointed",
+                    "report": "completed",
+                    "fail": "failed",
+                    "abandon": "abandoned",
+                }[request.action]
+                payload: dict[str, Any] = {
+                    "type": "task-transition",
+                    "task_id": request.task_id,
+                    "status": status,
+                }
+                if request.action == "report":
+                    if request.report is None:
+                        raise ValueError("report action requires a report object")
+                    task = state.get("tasks", {}).get(request.task_id)
+                    if not isinstance(task, dict) or task.get("status") not in {
+                        "running",
+                        "checkpointed",
+                    }:
+                        raise ValueError("report requires a running or checkpointed task")
+                    result_path = (
+                        self.current("gh-audit-repo") / "areas" / f"{request.task_id}.json"
+                    )
+                    rendered = json.dumps(request.report, indent=2, sort_keys=True) + "\n"
+                    try:
+                        with result_path.open("x", encoding="utf-8") as handle:
+                            handle.write(rendered)
+                        os.chmod(result_path, 0o600)
+                    except FileExistsError as error:
+                        raise ValueError("task result artifact already exists") from error
+                    except Exception:
+                        result_path.unlink(missing_ok=True)
+                        raise
+                    payload["result"] = str(result_path)
+                if request.note:
+                    payload["note"] = request.note
+                try:
+                    result = self._event(payload)
+                except Exception:
+                    if request.action == "report":
+                        result_path.unlink(missing_ok=True)
+                    raise
+            updated = self.state("gh-audit-repo")
+            return self._receipt(
+                "gh-audit-repo",
+                updated,
+                True,
+                task_id=managed_task_id,
+                task_ref=self._task_ref("gh-audit-repo", updated, managed_task_id),
+                scheduler=result.get("scheduler"),
+            )
+
+    def _generic_task_manage(
+        self, request: TaskManageRequest, state: dict[str, Any]
+    ) -> dict[str, Any]:
+        if state.get("status") != "in-progress":
+            raise ValueError("current generic workflow run is not active")
+        tasks = state.setdefault("tasks", {})
+        scheduler = state.setdefault("scheduler", {"limit": 3, "integration_queue": []})
+        queue = scheduler.setdefault("integration_queue", [])
+        managed_task_id = request.task_id
+        if request.action in {"plan", "retry"}:
+            if request.action == "retry":
+                previous = tasks.get(request.task_id)
+                if not isinstance(previous, dict) or previous.get("status") not in {
+                    "completed",
+                    "failed",
+                    "abandoned",
+                }:
+                    raise ValueError("retry requires a terminal existing task")
+                logical_id = str(previous["logical_id"])
+                attempt = (
+                    max(
+                        int(item.get("attempt", 1))
+                        for item in tasks.values()
+                        if item.get("logical_id") == logical_id
+                    )
+                    + 1
+                )
+                task_id = f"{logical_id}-{attempt}"
+            else:
+                if request.task_id in tasks:
+                    raise ValueError("task already exists")
+                previous = {}
+                logical_id = request.logical_id or request.task_id
+                attempt = 1
+                task_id = request.task_id
+            if not SAFE_ID.fullmatch(logical_id):
+                raise ValueError("logical_id contains unsupported characters")
+            if not SAFE_ID.fullmatch(task_id):
+                raise ValueError("generated task_id contains unsupported characters")
+            if task_id in tasks:
+                raise ValueError(f"task already exists: {task_id}")
+            managed_task_id = task_id
+            tasks[task_id] = {
+                "id": task_id,
+                "logical_id": logical_id,
+                "agent_id": request.agent_id or task_id,
+                "role": request.role or previous.get("role") or "worker",
+                "unit": request.unit or previous.get("unit") or task_id,
+                "attempt": attempt,
+                "status": "queued",
+                "required": request.required,
+                "assignment": request.assignment or previous.get("assignment", {}),
+                "integrated": False,
+            }
+        elif request.action in {"integrate_start", "integrate_finish"}:
+            task = tasks.get(request.task_id)
+            if not isinstance(task, dict):
+                raise ValueError("unknown task_id")
+            if request.action == "integrate_start":
+                if not queue or queue[0] != request.task_id:
+                    raise ValueError("integration must process the oldest result first")
+                if scheduler.get("supervisor_activity") is not None:
+                    raise ValueError("another supervisor integration is already active")
+                if (
+                    self._generic_scheduler_status(state)["running_workers"] + 1
+                    > scheduler["limit"]
+                ):
+                    raise ValueError(
+                        "supervisor integration would exceed material-work concurrency"
+                    )
+                scheduler["supervisor_activity"] = {
+                    "kind": "integration",
+                    "task_id": request.task_id,
+                }
+            else:
+                activity = scheduler.get("supervisor_activity")
+                if not isinstance(activity, dict) or activity.get("task_id") != request.task_id:
+                    raise ValueError("task is not being integrated")
+                task["integrated"] = True
+                queue.remove(request.task_id)
+                scheduler["supervisor_activity"] = None
+        else:
+            task = tasks.get(request.task_id)
+            if not isinstance(task, dict):
+                raise ValueError("unknown task_id")
+            status = {
+                "dispatch": "running",
+                "checkpoint": "checkpointed",
+                "report": "completed",
+                "fail": "failed",
+                "abandon": "abandoned",
+            }[request.action]
+            allowed = {
+                "queued": {"running", "abandoned"},
+                "running": {"checkpointed", "completed", "failed", "abandoned"},
+                "checkpointed": {"running", "completed", "failed", "abandoned"},
+            }
+            if status not in allowed.get(str(task.get("status")), set()):
+                raise ValueError(f"invalid task transition: {task.get('status')} -> {status}")
+            if (
+                request.action == "dispatch"
+                and self._generic_scheduler_status(state)["worker_slots"] < 1
+            ):
+                raise ValueError("generic workflow concurrency is saturated")
+            task["status"] = status
+            if request.action == "report":
+                if request.report is None:
+                    raise ValueError("report action requires a report object")
+                result_dir = self.current(request.workflow) / "results"
+                result_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+                result = result_dir / f"{request.task_id}.json"
+                rendered = json.dumps(request.report, indent=2, sort_keys=True) + "\n"
+                try:
+                    with result.open("x", encoding="utf-8") as handle:
+                        handle.write(rendered)
+                    os.chmod(result, 0o600)
+                except FileExistsError as error:
+                    raise ValueError("task result artifact already exists") from error
+                task["result"] = str(result)
+            if request.note:
+                task["note"] = request.note
+            if status in {"completed", "failed", "abandoned"} and request.task_id not in queue:
+                queue.append(request.task_id)
+        state["revision"] += 1
+        state["updated_at"] = workflow_run.utc_now()
+        workflow_run.write_state(self.current(request.workflow), state)
+        workflow_run.append_journal(
+            self.current(request.workflow),
+            "task_managed",
+            revision=state["revision"],
+            task_id=managed_task_id,
+            action=request.action,
+        )
+        return self._receipt(
+            request.workflow,
+            state,
+            True,
+            task_id=managed_task_id,
+            task_ref=self._task_ref(request.workflow, state, managed_task_id),
+            scheduler=self._generic_scheduler_status(state),
+        )
+
+    def task_context(self, task_ref: str) -> dict[str, Any]:
+        workflow, run_id, task_id = self._parse_task_ref(task_ref)
+        state = self.state(workflow)
+        if state.get("run_id") != run_id:
+            raise ValueError("task_ref belongs to a stale workflow run")
+        task = state.get("tasks", {}).get(task_id)
+        if not isinstance(task, dict):
+            raise ValueError("task_ref identifies an unknown task")
+        assignment = task.get("assignment", {})
+        source_kind = assignment.get(
+            "source_kind", "program" if task.get("role") == "program" else "repository"
+        )
+        priorities = (
+            [
+                "domain skill",
+                "specialized MCP",
+                "Context7",
+                "official documentation",
+                "dependency source",
+            ]
+            if source_kind == "python-library"
+            else [
+                "bundled version-matched documentation",
+                "official documentation",
+                "Context7",
+                "dependency source",
+            ]
+            if source_kind == "program"
+            else ["repository source", "official documentation", "Context7"]
+        )
+        reference_root = (
+            Path(__file__).resolve().parents[2] / "extensions" / "github-workflows" / "references"
+        )
+        references = {
+            "runtime_policy": str(reference_root / "github-runtime-policy.md"),
+            "issue_conventions": str(reference_root / "github-issue-conventions.md"),
+        }
+        if workflow == "gh-implement-issue":
+            references["pull_request_template"] = str(reference_root / "github-pr-template.md")
+        return {
+            "task_ref": task_ref,
+            "task_id": task_id,
+            "workflow": workflow,
+            "run_id": state.get("run_id"),
+            "audit_sha": state.get("sha"),
+            "audit_worktree": state.get("audit_worktree"),
+            "repository": state.get("repository"),
+            "task": task,
+            "assignment": assignment,
+            "inventory": state.get("inventory"),
+            "documentation": {
+                "source_priority": priorities,
+                "context7_query_budget": 12,
+                "supervisor_extension_queries": 5,
+            },
+            "references": references,
+            "control_plane": {"user_messages_always_available": True},
+        }
+
+    def history_manage(self, request: HistoryManageRequest) -> dict[str, Any]:
+        with self.lock():
+            state = self.state(request.workflow)
+            if request.workflow == "gh-audit-repo":
+                if state.get("status") != "in-progress":
+                    raise ValueError("the current audit run is not active")
+                workflow_run.require_audit_helper_integrity(state)
+            repo = state.get("repository")
+            if not isinstance(repo, str):
+                raise ValueError("current run does not contain a repository name")
+            run_id = str(state["run_id"])
+            common = {"repo": repo, "project_dir": self.project_dir, "cache_root": self.project_dir}
+            directory = github_cache.repo_dir(self.project_dir, repo)
+            work_db = directory / "staging" / f"records-{run_id}.sqlite3"
+            live_db = github_cache.live_path(directory, "records")
+
+            def cache_summary(database: Path, source: str) -> dict[str, Any]:
+                if not database.is_file():
+                    return {
+                        "cache_source": source,
+                        "cache_exists": False,
+                        "generation": 0,
+                        "record_count": 0,
+                        "full_history_complete": False,
+                        "last_sync_at": None,
+                        "default_sha": None,
+                    }
+                with github_cache.connect_readonly(database) as connection:
+                    validated = github_cache.validate(connection, repo, "records")
+                metadata = validated["metadata"]
+                return {
+                    "cache_source": source,
+                    "cache_exists": True,
+                    "generation": int(metadata.get("generation", "0")),
+                    "record_count": int(validated["count"]),
+                    "full_history_complete": metadata.get("full_history_complete") == "true",
+                    "last_sync_at": metadata.get("last_sync_at") or None,
+                    "default_sha": metadata.get("default_sha") or None,
+                }
+
+            def sync_receipt(history: dict[str, Any], status: str, **extra: Any) -> dict[str, Any]:
+                if request.workflow == "gh-audit-repo":
+                    self._event({"type": "history-sync", "status": status, "value": history})
+                    updated = self.state(request.workflow)
+                    history = updated["history"]
+                else:
+                    updated = state
+                return self._receipt(
+                    request.workflow,
+                    updated,
+                    True,
+                    history=history,
+                    **extra,
+                )
+
+            if request.action == "status":
+                database = work_db if work_db.is_file() else live_db
+                source = "staging" if work_db.is_file() else "committed"
+                history = {
+                    **state.get("history", {}),
+                    **cache_summary(database, source),
+                }
+                return self._receipt(
+                    request.workflow,
+                    state,
+                    False,
+                    history=history,
+                )
+            if request.action == "prepare":
+                result = self._invoke(
+                    lambda args: github_cache.prepare_database(args, "records"),
+                    **common,
+                    run_id=run_id,
+                    rebuild=False,
+                    no_cache=False,
+                )
+                history = {
+                    **state.get("history", {}),
+                    **cache_summary(work_db, "staging"),
+                    "sync_status": "prepared",
+                    "base_generation": int(result["base_generation"]),
+                }
+                return sync_receipt(
+                    history,
+                    "in-progress",
+                    mode=result.get("mode", "prepared"),
+                )
+            if request.action == "ingest":
+                if request.artifacts:
+                    records = self._history_artifact_records(request.artifacts, request.kind)
+                else:
+                    records = [
+                        item.model_dump(mode="json", exclude_none=True) for item in request.records
+                    ]
+                with self._json_file({"records": records}) as source:
+                    result = self._invoke(
+                        github_cache.ingest_records,
+                        **common,
+                        db=work_db,
+                        kind=request.kind,
+                        input=source,
+                        source=request.source,
+                        fetched_at=request.fetched_at,
+                    )
+                history = dict(state.get("history", {}))
+                counts = dict(history.get("ingested", {}))
+                counts[request.kind] = counts.get(request.kind, 0) + len(records)
+                history.update(cache_summary(work_db, "staging"))
+                history.update({"sync_status": "ingesting", "ingested": counts})
+                return sync_receipt(
+                    history,
+                    "in-progress",
+                    accepted=result.get("accepted", len(records)),
+                )
+            if request.action == "abort":
+                self._invoke(github_cache.abort_database, db=work_db)
+                history = {
+                    **state.get("history", {}),
+                    **cache_summary(live_db, "committed"),
+                    "sync_status": "aborted",
+                }
+                return sync_receipt(history, "pending")
+            with github_cache.connect(work_db) as connection:
+                metadata = github_cache.validate(connection, repo, "records")["metadata"]
+            result = self._invoke(
+                lambda args: github_cache.commit_database(args, "records"),
+                **common,
+                run_id=run_id,
+                db=work_db,
+                base_generation=int(metadata["generation"]),
+                synced_at=request.fetched_at or workflow_run.utc_now(),
+                default_sha=str(state.get("sha") or "unknown"),
+                full_history_complete=request.full_history_complete,
+                repo_sha=None,
+                keep_shas=5,
+                retention_days=90,
+            )
+            history = {
+                **state.get("history", {}),
+                **cache_summary(live_db, "committed"),
+                "sync_status": "committed",
+            }
+            return sync_receipt(
+                history,
+                "complete",
+                generation=result.get("generation"),
+            )
+
+    def history_query(self, request: HistoryQueryRequest) -> dict[str, Any]:
+        state = self.state(request.workflow)
+        if request.workflow == "gh-audit-repo":
+            workflow_run.require_audit_helper_integrity(state)
+        repo = state.get("repository")
+        if not isinstance(repo, str):
+            raise ValueError("current run does not contain a repository name")
+        database = github_cache.live_path(github_cache.repo_dir(self.project_dir, repo), "records")
+        if not database.is_file():
+            raise ValueError(
+                "committed GitHub history cache is missing; prepare and commit it first"
+            )
+        if not any((request.terms, request.kind, request.state, request.cutoff, request.linked)):
+            raise ValueError(
+                "history_query requires a record selector; use history_manage action status "
+                "for cache metadata"
+            )
+        linked_records = [item.model_dump(mode="json") for item in request.linked]
+        with self._json_file(linked_records) as linked:
+            return self._invoke(
+                github_cache.query_records,
+                repo=repo,
+                project_dir=self.project_dir,
+                cache_root=self.project_dir,
+                db=database,
+                cutoff=request.cutoff,
+                linked=linked if request.linked else None,
+                terms=request.terms,
+                terms_file=None,
+                kind=request.kind,
+                state=request.state,
+                limit=request.limit,
+                output=None,
+            )
+
+    def audit_inventory(self, request: InventoryRequest) -> dict[str, Any]:
+        with self.lock():
+            state, worktree, run_dir = self._audit_paths()
+            common = {
+                "project_root": self.workspace,
+                "project_dir": self.project_dir,
+                "audit_worktree": worktree,
+                "run_dir": run_dir,
+            }
+            inventory = state.get("inventory")
+            revision = inventory.get("revision") if isinstance(inventory, dict) else None
+            if request.action == "initialize":
+                return self._invoke(audit_inventory.initialize, **common)
+            if request.action == "status":
+                return self._invoke(audit_inventory.status, **common)
+            if revision is None:
+                raise ValueError("audit inventory has not been initialized")
+            if request.action == "refresh":
+                return self._invoke(audit_inventory.refresh, **common, expected_revision=revision)
+            if request.action == "program":
+                if not request.name:
+                    raise ValueError("program inspection requires a name")
+                return self._invoke(
+                    audit_inventory.inspect_program,
+                    **common,
+                    name=request.name,
+                    argument=request.arguments or None,
+                    request_id=request.request_id,
+                    expected_revision=revision,
+                )
+            with self._json_file(request.value) as source:
+                if request.action == "record_declared":
+                    return self._invoke(
+                        audit_inventory.record_facts,
+                        **common,
+                        input=source,
+                        expected_revision=revision,
+                    )
+                if not request.request_id:
+                    raise ValueError("record_context requires request_id")
+                return self._invoke(
+                    audit_inventory.record_context,
+                    **common,
+                    input=source,
+                    request_id=request.request_id,
+                    expected_revision=revision,
+                )
+
+    def audit_knowledge(self, request: KnowledgeRequest) -> dict[str, Any]:
+        with self.lock():
+            state = self.state("gh-audit-repo")
+            workflow_run.require_audit_helper_integrity(state)
+            if request.action in {"reconcile", "update"} and state.get("status") != "in-progress":
+                raise ValueError("the current audit run is not active")
+            sha = str(state.get("sha") or "unknown")
+            if request.action == "show":
+                return self._invoke(audit_knowledge.show, project_dir=self.project_dir)
+            if request.action in {"status", "reconcile"}:
+                area_values = [item.model_dump(mode="json") for item in request.areas]
+                with self._json_file({"areas": area_values}) as areas:
+                    handler = (
+                        audit_knowledge.status
+                        if request.action == "status"
+                        else audit_knowledge.reconcile
+                    )
+                    return self._invoke(
+                        handler, project_dir=self.project_dir, areas=areas, repo_sha=sha
+                    )
+            if not request.area:
+                raise ValueError("knowledge update/context requires an area")
+            if request.action == "context":
+                with self._json_file(request.versions) as versions:
+                    return self._invoke(
+                        audit_knowledge.context,
+                        project_dir=self.project_dir,
+                        area=request.area,
+                        versions=versions,
+                    )
+            root = audit_knowledge.knowledge_root(argparse.Namespace(project_dir=self.project_dir))
+            document = audit_knowledge.parse_document(
+                root / "areas" / f"{audit_knowledge.slug(request.area)}.md"
+            )
+            with self._json_file({"findings": request.findings}) as source:
+                return self._invoke(
+                    audit_knowledge.update,
+                    project_dir=self.project_dir,
+                    area=request.area,
+                    input=source,
+                    repo_sha=sha,
+                    expected_revision=document["revision"],
+                )
+
+    def audit_probe(self, request: ProbeRequest) -> dict[str, Any]:
+        with self.lock():
+            _, worktree, run_dir = self._audit_paths()
+            values = {
+                "project_root": self.workspace,
+                "project_dir": self.project_dir,
+                "audit_worktree": worktree,
+                "run_dir": run_dir,
+                "probe_id": request.probe_id,
+                "pythonpath": None,
+                "kind": request.kind,
+                "selector": getattr(request, "selectors", None),
+                "code": getattr(request, "code", None),
+            }
+            return self._invoke(audit_probe.run_probe, **values)
+
+    def audit_record(self, request: AuditRecordRequest) -> dict[str, Any]:
+        mapping = {
+            "phase": ("phase-set", None),
+            "shard": ("shard-upsert", "shard"),
+            "candidate": ("candidate-upsert", "candidate"),
+            "validation": ("validation-record", "validation"),
+            "verdict": ("verdict-record", "verdict"),
+            "limitation": ("limitation-add", None),
+            "pending": ("pending-set", None),
+            "head_drift": ("head-drift", None),
+            "metrics": ("metrics-update", None),
+            "supervisor_start": ("supervisor-start", None),
+            "supervisor_finish": ("supervisor-complete", None),
+        }
+        event_type, field = mapping[request.action]
+        raw_value = getattr(request, "value", {})
+        value = (
+            raw_value.model_dump(mode="json", exclude_none=True)
+            if hasattr(raw_value, "model_dump")
+            else dict(raw_value)
+        )
+        if request.action == "validation" and "artifact" not in value:
+            probe_id = value.get("probe_id") or value.get("id")
+            if not isinstance(probe_id, str) or not SAFE_ID.fullmatch(probe_id):
+                raise ValueError("validation requires a valid probe_id or id")
+            value["artifact"] = str(
+                (self.current("gh-audit-repo") / "validation" / probe_id / "result.json").resolve()
+            )
+        if field:
+            payload = {"type": event_type, field: value}
+        elif request.action == "phase":
+            payload = {
+                "type": event_type,
+                "phase": value.get("phase"),
+                "value": value.get("value", {}),
+            }
+        elif request.action == "limitation":
+            payload = {"type": event_type, "limitation": value.get("limitation")}
+        elif request.action == "pending":
+            payload = {"type": event_type, "pending": value.get("pending", [])}
+        elif request.action in {"head_drift", "metrics"}:
+            payload = {"type": event_type, "value": value}
+        elif request.action == "supervisor_start":
+            payload = {"type": event_type, **value}
+        else:
+            payload = {"type": event_type}
+        with self.lock():
+            result = self._event(payload)
+            state = self.state("gh-audit-repo")
+            return self._receipt("gh-audit-repo", state, True, scheduler=result.get("scheduler"))
+
+    def audit_publish(self, request: PublishRequest) -> dict[str, Any]:
+        with self.lock():
+            state = self.state("gh-audit-repo")
+            workflow_run.require_audit_helper_integrity(state)
+            if state.get("status") != "in-progress":
+                raise ValueError("the current audit run is not active")
+            history = dict(state.get("history", {}))
+            if request.action == "begin":
+                if history.get("publication_pending"):
+                    raise ValueError("another publication is already pending")
+                if request.candidate_id not in state.get("candidates", {}):
+                    raise ValueError("publication refers to an unknown candidate")
+                history.update(
+                    {
+                        "publication_pending": True,
+                        "candidate_id": request.candidate_id,
+                        "mutation": request.mutation,
+                    }
+                )
+                self._event({"type": "history-set", "value": history})
+            else:
+                if not history.get("publication_pending"):
+                    raise ValueError("no publication is pending")
+                if history.get("candidate_id") != request.candidate_id:
+                    raise ValueError("publication does not match the pending candidate")
+                if history.get("mutation") != request.mutation:
+                    raise ValueError("publication mutation does not match the pending operation")
+                if request.action == "finish" and not request.receipt:
+                    raise ValueError("finished publication requires a non-empty receipt")
+                history.update(
+                    {
+                        "publication_pending": request.action == "uncertain",
+                        "outcome": request.action,
+                        "receipt": request.receipt,
+                    }
+                )
+                if request.action == "finish":
+                    self._event(
+                        {
+                            "type": "publication-complete",
+                            "value": history,
+                            "mutation": {
+                                "candidate_id": request.candidate_id,
+                                "action": request.mutation,
+                                "receipt": request.receipt,
+                            },
+                        }
+                    )
+                else:
+                    self._event({"type": "history-set", "value": history})
+            updated = self.state("gh-audit-repo")
+            return self._receipt("gh-audit-repo", updated, True, publication=updated.get("history"))
+
+    def audit_metrics(self) -> dict[str, Any]:
+        state = self.state("gh-audit-repo")
+        workflow_run.require_audit_helper_integrity(state)
+        return audit_metrics.summarize(self.project_dir, self.current("gh-audit-repo"), state)

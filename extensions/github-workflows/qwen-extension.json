@@ -1,0 +1,16 @@
+{
+  "name": "github-workflows",
+  "version": "1.0.0",
+  "description": "Resumable GitHub audit, curation, and implementation workflows",
+  "skills": "skills",
+  "agents": "agents",
+  "mcpServers": {
+    "github_workflows": {
+      "command": "${extensionPath}${/}..${/}..${/}.venv${/}bin${/}agent-workflows",
+      "args": ["mcp", "--workspace", "${workspacePath}"],
+      "cwd": "${workspacePath}",
+      "timeout": 60000,
+      "description": "Private local state and validation tools for GitHub workflows"
+    }
+  }
+}

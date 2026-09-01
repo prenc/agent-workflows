@@ -1,0 +1,13 @@
+interface:
+  display_name: "Pick Up GitHub Work"
+  short_description: "Continue one cohesive issue work unit"
+  default_prompt: "Use $gh-pickup-work for one issue, several compatible issues, a PR, or all open issues matching a label. Always produce one branch/worktree/PR, reuse existing work by default, and start fresh only when I explicitly request it."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "github"
+      description: "GitHub issues and pull requests"
+      transport: "streamable_http"
+      url: "https://api.githubcopilot.com/mcp/"
+policy:
+  allow_implicit_invocation: true

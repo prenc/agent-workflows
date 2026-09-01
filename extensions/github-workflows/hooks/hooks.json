@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "(read_file|grep_search|glob|run_shell_command)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${extensionPath}/hooks/guard-audit-boundary.py"
+          }
+        ]
+      }
+    ]
+  }
+}
