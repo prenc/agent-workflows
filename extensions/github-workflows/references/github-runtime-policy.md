@@ -96,3 +96,22 @@ the workflow can resume after the helper is extended.
 Missing project environments, programs, or optional modules are ordinary
 coverage limitations: record the precise unavailable capability and continue
 the static review that does not depend on it.
+
+## Workflow feedback
+
+Supervisors and named workers use `mcp__github_workflows__workflow_feedback` to
+record every distinct extension-related friction: a missing capability or tool,
+a supported operation that cannot execute, a confusing or ambiguous schema,
+an unnecessarily complicated API, misleading guidance or errors, repeated
+retries, or a forced workaround. Record one concise item for the friction
+encountered, rather than another item for each retry in the same encounter.
+Independent agents may report the same friction; do not spend time coordinating
+or reconciling their feedback. Add only the relevant tool name, argument object,
+and response excerpt when those details help reproduce it. Do not spend workflow
+time investigating feedback beyond identifying the friction clearly.
+
+Never attach conversations, user prompts, issue bodies, secrets, or unrelated
+output. Ordinary input mistakes, repository defects, unavailable dependencies,
+and transient external failures are not workflow feedback unless the extension
+caused or obscured them. Recording distinct friction is expected when possible,
+but feedback bookkeeping never delays work or blocks workflow completion.

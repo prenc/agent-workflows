@@ -35,12 +35,14 @@ from .models import (
     TaskManageRequest,
     TaskPlan,
     VerdictRecordValue,
+    WorkflowFeedbackRequest,
     WorkflowName,
 )
 from .runtime import WorkflowRuntime
 
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True)
 LOCAL_WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True)
+APPEND_WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False)
 CONTROL_WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True)
 LOGGER = logging.getLogger(__name__)
 SDK_PREFIX = re.compile(r"^Error executing tool [^:]+:\s*")
@@ -245,6 +247,13 @@ def _public_input_schema(name: str, schema: dict[str, Any]) -> dict[str, Any]:
             **object_schema,
             "description": "Structured report object; do not JSON-encode it as a string.",
         }
+    if name == "workflow_feedback":
+        arguments = result.get("properties", {}).get("arguments", {})
+        object_schema = next(
+            (variant for variant in arguments.get("anyOf", []) if variant.get("type") == "object"),
+            {"type": "object", "additionalProperties": True},
+        )
+        result["properties"]["arguments"] = object_schema
     conditions = result.setdefault("allOf", [])
     contract = ACTION_REQUIREMENTS.get(name)
     if contract is not None:
@@ -354,6 +363,16 @@ def _request_call(operation: Any, model: type[Any], **values: Any) -> Any:
 def create_server(runtime: WorkflowRuntime) -> MCPServer:
     """Create a server whose tools operate on one validated workspace."""
     mcp = WorkflowMCPServer("github-workflows")
+
+    @mcp.tool(annotations=APPEND_WRITE, structured_output=True)
+    def workflow_feedback(
+        message: str,
+        tool: str | None = None,
+        arguments: dict[str, Any] | None = None,
+        response: str | None = None,
+    ) -> dict[str, Any]:
+        """Record one distinct extension friction once, with optional relevant tool context."""
+        return _request_call(runtime.workflow_feedback, WorkflowFeedbackRequest, **locals())
 
     @mcp.tool(annotations=CONTROL_WRITE, structured_output=True)
     def run_manage(

@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from . import feedback
 from .installation import add_install_arguments, install_from_args
 from .mcp_server import create_server
 from .models import (
@@ -70,6 +71,17 @@ def build_parser() -> argparse.ArgumentParser:
         choices=sorted([*REQUESTS, "run-status", "task-context", "audit-metrics"]),
     )
     workflow.add_argument("request", nargs="?", help="JSON object, JSON file, or - for stdin")
+
+    feedback_parser = subparsers.add_parser("feedback", help="inspect local agent feedback")
+    feedback_commands = feedback_parser.add_subparsers(dest="feedback_command", required=True)
+    feedback_commands.add_parser("path", help="print the feedback JSONL path")
+    feedback_list = feedback_commands.add_parser("list", help="list compact feedback records")
+    feedback_list.add_argument("--repository")
+    feedback_list.add_argument("--workflow")
+    feedback_list.add_argument("--tool")
+    feedback_list.add_argument("--limit", type=int, default=50)
+    feedback_show = feedback_commands.add_parser("show", help="show one complete feedback record")
+    feedback_show.add_argument("feedback_id")
     return parser
 
 
@@ -95,6 +107,25 @@ def run_workflow(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_feedback(args: argparse.Namespace) -> int:
+    if args.feedback_command == "path":
+        print(feedback.storage_path())
+        return 0
+    if args.feedback_command == "show":
+        result: Any = feedback.find(args.feedback_id)
+    else:
+        if args.limit < 1:
+            raise ValueError("feedback limit must be positive")
+        result = feedback.compact_records(
+            repository=args.repository,
+            workflow=args.workflow,
+            tool=args.tool,
+            limit=args.limit,
+        )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
 def main() -> int:
     try:
         args = build_parser().parse_args()
@@ -104,6 +135,8 @@ def main() -> int:
             runtime = WorkflowRuntime(args.workspace, args.project_dir)
             create_server(runtime).run()
             return 0
+        if args.command == "feedback":
+            return run_feedback(args)
         return run_workflow(args)
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
         print(f"agent-workflows: {error}", file=sys.stderr)

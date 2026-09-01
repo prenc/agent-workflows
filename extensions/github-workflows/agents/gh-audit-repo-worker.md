@@ -7,6 +7,7 @@ maxTurns: 64
 tools:
 
   - mcp__github_workflows__task_context
+  - mcp__github_workflows__workflow_feedback
   - grep_search
   - read_file
   - glob

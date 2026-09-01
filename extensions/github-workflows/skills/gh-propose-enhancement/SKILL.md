@@ -7,6 +7,7 @@ allowedTools:
 
   - run_shell_command
   - read_file
+  - mcp__github_workflows__workflow_feedback
   - mcp__github__issue_read
   - mcp__github__issue_write
   - mcp__github__label_write

@@ -16,6 +16,7 @@ allowedTools:
   - mcp__github_workflows__run_manage
   - mcp__github_workflows__run_status
   - mcp__github_workflows__task_manage
+  - mcp__github_workflows__workflow_feedback
   - mcp__github__add_issue_comment
   - mcp__github__get_me
   - mcp__github__issue_read

@@ -29,6 +29,22 @@ class ExtensibleRecord(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class WorkflowFeedbackRequest(StrictRequest):
+    """One concise observation with optional structured tool context."""
+
+    message: str = Field(min_length=1, max_length=2000)
+    tool: str | None = Field(default=None, min_length=1, max_length=200)
+    arguments: dict[str, Any] | None = None
+    response: str | None = Field(default=None, max_length=16_000)
+
+    @field_validator("message", "tool")
+    @classmethod
+    def non_blank_text(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("text must not be blank")
+        return value.strip() if value is not None else None
+
+
 class ActionRequest:
     """Expose discriminated action models as one convenient request object."""
 

@@ -52,6 +52,7 @@ class TestExtensionMcp:
                 listed = await client.list_tools()
                 tools = {tool.name: tool for tool in listed.tools}
                 assert set(tools) == {
+                    "workflow_feedback",
                     "run_manage",
                     "run_status",
                     "task_manage",
@@ -65,6 +66,11 @@ class TestExtensionMcp:
                     "audit_publish",
                     "audit_metrics",
                 }
+                feedback_properties = tools["workflow_feedback"].input_schema["properties"]
+                assert tools["workflow_feedback"].input_schema["required"] == ["message"]
+                assert feedback_properties["arguments"]["type"] == "object"
+                assert "anyOf" not in feedback_properties["arguments"]
+                assert tools["workflow_feedback"].annotations.idempotent_hint is False
                 context_properties = tools["task_context"].input_schema["properties"]
                 assert "task_ref" in context_properties
                 run_properties = tools["run_manage"].input_schema["properties"]
@@ -354,6 +360,7 @@ class TestExtensionMcp:
                     ("audit_record", {}),
                     ("audit_publish", {}),
                     ("audit_metrics", {"unexpected": True}),
+                    ("workflow_feedback", {}),
                 ]
                 internal_diagnostic = re.compile(
                     r"validation errors?|input_(?:value|type)|errors\.pydantic|Traceback"

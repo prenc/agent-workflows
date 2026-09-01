@@ -23,6 +23,7 @@ from . import (
     audit_knowledge,
     audit_metrics,
     audit_probe,
+    feedback,
     github_cache,
     workflow_run,
 )
@@ -36,6 +37,7 @@ from .models import (
     PublishRequest,
     RunManageRequest,
     TaskManageRequest,
+    WorkflowFeedbackRequest,
     WorkflowName,
 )
 
@@ -77,6 +79,58 @@ class WorkflowRuntime:
 
     def state(self, workflow: WorkflowName) -> dict[str, Any]:
         return workflow_run.load_state(self.current(workflow))
+
+    def _feedback_attribution(self) -> tuple[str | None, str | None, str | None]:
+        active: list[dict[str, Any]] = []
+        for workflow in ("gh-audit-repo", "gh-curate-issues", "gh-implement-issue"):
+            try:
+                state = self.state(workflow)
+            except (OSError, ValueError):
+                continue
+            if state.get("status") not in workflow_run.TERMINAL:
+                active.append(state)
+        workflow = str(active[0].get("workflow")) if len(active) == 1 else None
+        run_id = str(active[0].get("run_id")) if len(active) == 1 else None
+        repositories = {
+            str(state["repository"])
+            for state in active
+            if isinstance(state.get("repository"), str)
+            and re.fullmatch(r"[^/\s]+/[^/\s]+", state["repository"])
+        }
+        repository = next(iter(repositories)) if len(repositories) == 1 else None
+        if repository is None:
+            remote = subprocess.run(
+                ["git", "-C", str(self.workspace), "remote", "get-url", "origin"],
+                check=False,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            match = re.fullmatch(
+                r"(?:[A-Za-z][A-Za-z0-9+.-]*://[^/]+/|[^/]+@[^:]+:)"
+                r"([^/\s]+)/([^/\s]+?)(?:\.git)?",
+                remote,
+            )
+            if match:
+                repository = f"{match.group(1)}/{match.group(2)}"
+        return repository, workflow, run_id
+
+    def workflow_feedback(self, request: WorkflowFeedbackRequest) -> dict[str, Any]:
+        """Record one bounded agent observation outside workflow state."""
+        repository, workflow, run_id = self._feedback_attribution()
+        return feedback.append(
+            message=request.message,
+            tool=request.tool,
+            arguments=request.arguments,
+            response=request.response,
+            repository=repository,
+            workflow=workflow,
+            run_id=run_id,
+            private_paths=[
+                (self.project_dir, "<project-state>"),
+                (self.workspace, "<workspace>"),
+                (Path.home(), "<home>"),
+            ],
+        )
 
     @staticmethod
     def _invoke(

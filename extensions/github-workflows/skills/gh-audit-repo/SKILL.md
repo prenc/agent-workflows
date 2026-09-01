@@ -25,6 +25,7 @@ allowedTools:
   - mcp__github_workflows__audit_record
   - mcp__github_workflows__audit_publish
   - mcp__github_workflows__audit_metrics
+  - mcp__github_workflows__workflow_feedback
   - mcp__*
 ---
 

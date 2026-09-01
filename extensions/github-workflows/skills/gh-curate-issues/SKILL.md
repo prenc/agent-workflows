@@ -15,6 +15,7 @@ allowedTools:
   - mcp__github_workflows__task_manage
   - mcp__github_workflows__history_manage
   - mcp__github_workflows__history_query
+  - mcp__github_workflows__workflow_feedback
   - mcp__*
   - mcp__github__get_commit
   - mcp__github__issue_read
