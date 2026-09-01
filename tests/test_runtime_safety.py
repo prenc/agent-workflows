@@ -65,6 +65,45 @@ class TestRuntimeSafety:
                 input=source,
             )
 
+    def test_fresh_start_cleanup_is_limited_to_previous_run_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-fresh-start-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            state = runtime.state("gh-audit-repo")
+            managed_worktree = runtime.workspace / ".worktrees" / "gh-audit-repo-aaaaaaa"
+            state["audit_worktree"] = str(managed_worktree)
+            workflow_run.write_state(runtime.current("gh-audit-repo"), state)
+            staging = runtime.project_dir / "github" / "staging"
+            staging.mkdir(parents=True)
+            transaction = staging / f"records-{state['run_id']}.sqlite3"
+            transaction.write_text("stale", encoding="utf-8")
+            unrelated = staging / "records-other-run.sqlite3"
+            unrelated.write_text("keep", encoding="utf-8")
+            knowledge = runtime.current("gh-audit-repo").parent / "knowledge" / "areas"
+            knowledge.mkdir(parents=True)
+            retained = knowledge / "core.md"
+            retained.write_text("knowledge", encoding="utf-8")
+
+            runtime._discard_stale_run("gh-audit-repo")
+
+            assert not runtime.current("gh-audit-repo").exists()
+            assert not transaction.exists()
+            assert unrelated.is_file()
+            assert retained.is_file()
+
+    def test_fresh_start_preserves_ambiguous_publication_for_resume(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-pending-publication-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            state = runtime.state("gh-audit-repo")
+            state["history"]["publication_pending"] = True
+            workflow_run.write_state(runtime.current("gh-audit-repo"), state)
+
+            with pytest.raises(ValueError, match="pending publication requires resume"):
+                runtime._discard_stale_run("gh-audit-repo")
+
+            assert runtime.current("gh-audit-repo").is_dir()
+
     def test_every_public_request_rejects_unknown_fields(self) -> None:
         cases = [
             (

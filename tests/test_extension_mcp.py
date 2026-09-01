@@ -320,8 +320,8 @@ class TestExtensionMcp:
                     assert "\n" not in message
                     assert internal_diagnostic.search(message) is None
                 assert not (await client.call_tool("run_manage", request)).is_error
-                failed = await client.call_tool("run_manage", request)
-                assert failed.is_error
+                replaced = await client.call_tool("run_manage", request)
+                assert not replaced.is_error
                 resumed = await client.call_tool(
                     "run_manage",
                     {"action": "resume", "workflow": request["workflow"]},

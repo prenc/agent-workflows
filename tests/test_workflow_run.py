@@ -80,20 +80,19 @@ class TestWorkflowRun:
         for name in ("areas", "candidates", "validation"):
             assert (current / name).is_dir()
 
-    def test_resume_needs_no_run_id_and_unfinished_blocks_replacement(self) -> None:
-        self.initialize("gh-curate-issues")
+    def test_resume_needs_no_run_id_and_fresh_initialize_replaces_it(self) -> None:
+        first = self.initialize("gh-curate-issues")
         resumed = json.loads(self.call("resume", "gh-curate-issues").stdout)
         assert resumed["status"] == "in-progress"
-        blocked = self.call(
+        replaced = self.call(
             "initialize",
             "gh-curate-issues",
             "--input",
             str(self.project / "input.json"),
-            check=False,
         )
-        assert blocked.returncode != 0
+        assert replaced.returncode == 0
         current = self.project_dir / "workflows/gh-curate-issues/current/state.json"
-        assert json.loads(current.read_text())["run_id"] == resumed["run_id"]
+        assert json.loads(current.read_text())["run_id"] != first["run_id"]
 
     def test_terminal_current_is_replaced(self) -> None:
         first = self.initialize("gh-implement-issue")

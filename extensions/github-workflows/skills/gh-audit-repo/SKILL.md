@@ -53,6 +53,8 @@ history, audits code by exclusive shard, independently verifies candidates,
 directly updates matching open issues that carry neither `in-progress` nor
 `partial`, and creates only genuinely new issues.
 
+An invocation without `--resume` starts fresh and removes stale run-scoped state,
+transaction files, and the detached worktree from a previous unfinished run.
 An explicit invocation authorizes creation of missing canonical labels needed
 by a verified finding, direct title/body/taxonomy refinement of matching
 untouched open issues, evidence-backed closure of obsolete issues, and serial

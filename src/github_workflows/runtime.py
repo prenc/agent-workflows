@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -243,6 +244,48 @@ class WorkflowRuntime:
         if not isinstance(worktree, str):
             raise ValueError("current audit state does not contain an audit worktree")
         return state, Path(worktree).resolve(), self.current("gh-audit-repo")
+
+    def _discard_stale_run(
+        self, workflow: WorkflowName, *, retained_worktree: Path | None = None
+    ) -> None:
+        current = self.current(workflow)
+        if not current.is_dir():
+            return
+        state = workflow_run.load_state(current)
+        if state.get("status") not in workflow_run.RESUMABLE:
+            return
+        if workflow == "gh-audit-repo":
+            history = state.get("history", {})
+            if isinstance(history, dict) and history.get("publication_pending"):
+                raise ValueError("pending publication requires resume")
+            run_id = str(state.get("run_id", ""))
+            if SAFE_ID.fullmatch(run_id):
+                staging = self.project_dir / "github" / "staging"
+                (staging / f"records-{run_id}.sqlite3").unlink(missing_ok=True)
+            raw_worktree = state.get("audit_worktree")
+            if isinstance(raw_worktree, str):
+                worktree = Path(raw_worktree).resolve()
+                expected_root = (self.workspace / ".worktrees").resolve()
+                if worktree.parent != expected_root or not worktree.name.startswith(
+                    "gh-audit-repo-"
+                ):
+                    raise ValueError("stale audit worktree is outside the managed location")
+                if worktree.exists() and worktree != retained_worktree:
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(self.workspace),
+                            "worktree",
+                            "remove",
+                            "--force",
+                            str(worktree),
+                        ],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+        shutil.rmtree(current)
 
     def _source_and_worktree(self, confirmed: bool) -> dict[str, Any]:
         source = self._invoke(workflow_run.audit_source, project_root=self.workspace)
@@ -492,13 +535,27 @@ class WorkflowRuntime:
     def run_manage(self, request: RunManageRequest) -> dict[str, Any]:
         with self.lock():
             if request.action == "start":
+                if request.workflow == "gh-audit-repo" and self.current(request.workflow).is_dir():
+                    previous = workflow_run.load_state(self.current(request.workflow))
+                    history = previous.get("history", {})
+                    if (
+                        previous.get("status") in workflow_run.RESUMABLE
+                        and isinstance(history, dict)
+                        and history.get("publication_pending")
+                    ):
+                        raise ValueError("pending publication requires resume")
                 inputs = {
                     "repository": request.repository,
                     "inputs": request.invocation(),
                 }
                 if request.workflow == "gh-audit-repo":
                     inputs = {**inputs, **self._source_and_worktree(request.source_confirmed)}
+                    self._discard_stale_run(
+                        request.workflow,
+                        retained_worktree=Path(str(inputs["audit_worktree"])).resolve(),
+                    )
                 else:
+                    self._discard_stale_run(request.workflow)
                     limit = request.invocation()["n"]
                     inputs["tasks"] = {}
                     inputs["scheduler"] = {
