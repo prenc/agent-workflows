@@ -338,7 +338,9 @@ def initialize(args: argparse.Namespace) -> None:
     if current.exists():
         previous = load_state(current)
         if previous["status"] in RESUMABLE:
-            raise ValueError("an unfinished current run exists; use --resume")
+            raise ValueError(
+                "an unfinished current run exists; call run_manage with action 'resume'"
+            )
         shutil.rmtree(current)
     secure_directory(current, exist_ok=False)
     state = {

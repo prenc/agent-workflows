@@ -1009,6 +1009,9 @@ class WorkflowRuntime:
                 return sync_receipt(history, "pending")
             with github_cache.connect(work_db) as connection:
                 metadata = github_cache.validate(connection, repo, "records")["metadata"]
+            full_history_complete = request.full_history_complete
+            if full_history_complete is None:
+                full_history_complete = metadata.get("full_history_complete") == "true"
             result = self._invoke(
                 lambda args: github_cache.commit_database(args, "records"),
                 **common,
@@ -1017,7 +1020,7 @@ class WorkflowRuntime:
                 base_generation=int(metadata["generation"]),
                 synced_at=request.fetched_at or workflow_run.utc_now(),
                 default_sha=str(state.get("sha") or "unknown"),
-                full_history_complete=request.full_history_complete,
+                full_history_complete=full_history_complete,
                 repo_sha=None,
                 keep_shas=5,
                 retention_days=90,

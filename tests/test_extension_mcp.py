@@ -284,8 +284,11 @@ class TestExtensionMcp:
                 assert not (await client.call_tool("run_manage", request)).is_error
                 failed = await client.call_tool("run_manage", request)
                 assert failed.is_error
-                rendered = " ".join(item.text for item in failed.content if hasattr(item, "text"))
-                assert "unfinished current run" in rendered
+                resumed = await client.call_tool(
+                    "run_manage",
+                    {"action": "resume", "workflow": request["workflow"]},
+                )
+                assert not resumed.is_error
                 sentinel = "private-internal-detail"
                 with (
                     caplog.at_level(logging.ERROR),
@@ -832,13 +835,19 @@ class TestExtensionMcp:
                 assert reused.structured_content["mode"] == "reuse"
                 assert reused.structured_content["history"]["base_generation"] == 1
                 assert reused.structured_content["history"]["generation"] == 1
-                await client.call_tool(
+                inherited = await client.call_tool(
                     "history_manage",
                     {
-                        "action": "abort",
+                        "action": "commit",
                         "workflow": "gh-audit-repo",
                     },
                 )
+                assert inherited.structured_content["generation"] == 2
+                inherited_status = await client.call_tool(
+                    "history_manage",
+                    {"action": "status", "workflow": "gh-audit-repo"},
+                )
+                assert inherited_status.structured_content["history"]["full_history_complete"]
 
                 probe_id = "probe-mcp-1"
                 result = runtime.current("gh-audit-repo") / "validation" / probe_id / "result.json"

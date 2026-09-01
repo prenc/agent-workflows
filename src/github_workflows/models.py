@@ -281,7 +281,7 @@ class HistoryCommitRequest(StrictRequest):
     action: Literal["commit"]
     workflow: WorkflowName = "gh-audit-repo"
     fetched_at: str | None = None
-    full_history_complete: bool = False
+    full_history_complete: bool | None = None
 
 
 class HistoryAbortRequest(StrictRequest):
