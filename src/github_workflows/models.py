@@ -5,7 +5,15 @@ from __future__ import annotations
 import json
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, RootModel, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    RootModel,
+    field_validator,
+    model_validator,
+)
 
 WorkflowName = Literal["gh-audit-repo", "gh-curate-issues", "gh-implement-issue"]
 
@@ -349,13 +357,23 @@ class InventoryRequest(ActionRequest, RootModel[InventoryAction]):
     """Inspect or update inventory through an action-specific schema."""
 
 
+def _normalize_boundaries(value: Any) -> Any:
+    return [value] if isinstance(value, str) else value
+
+
+BoundaryList = Annotated[
+    list[str],
+    BeforeValidator(_normalize_boundaries, json_schema_input_type=list[str] | str),
+]
+
+
 class AreaDefinition(ExtensibleRecord):
     id: str = Field(description="Canonical area/<slug> identifier.")
     title: str
     description: str
     paths: list[str]
     entrypoints: list[str] = Field(default_factory=list)
-    boundaries: list[str] = Field(default_factory=list)
+    boundaries: BoundaryList = Field(default_factory=list)
     fingerprint: str
 
 
@@ -363,8 +381,13 @@ class KnowledgeSimpleRequest(StrictRequest):
     action: Literal["show"]
 
 
-class KnowledgeAreasRequest(StrictRequest):
-    action: Literal["status", "reconcile"]
+class KnowledgeStatusRequest(StrictRequest):
+    action: Literal["status"]
+    areas: list[AreaDefinition] = Field(default_factory=list)
+
+
+class KnowledgeReconcileRequest(StrictRequest):
+    action: Literal["reconcile"]
     areas: list[AreaDefinition]
 
 
@@ -382,7 +405,8 @@ class KnowledgeUpdateRequest(StrictRequest):
 
 KnowledgeAction = Annotated[
     KnowledgeSimpleRequest
-    | KnowledgeAreasRequest
+    | KnowledgeStatusRequest
+    | KnowledgeReconcileRequest
     | KnowledgeContextRequest
     | KnowledgeUpdateRequest,
     Field(discriminator="action"),

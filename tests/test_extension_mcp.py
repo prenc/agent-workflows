@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import pytest
 from mcp import Client
+from pydantic import ValidationError
 
-from github_workflows.mcp_server import create_server
-from github_workflows.models import RunManageRequest, TaskManageRequest
+from github_workflows.mcp_server import _validation_issues, create_server
+from github_workflows.models import KnowledgeRequest, RunManageRequest, TaskManageRequest
 from github_workflows.runtime import WorkflowRuntime
 
 ROOT = Path(__file__).parents[1]
@@ -97,6 +101,38 @@ class TestExtensionMcp:
                 assert audit_request.invocation()["instructions"] == (
                     "Prioritize public CLI behavior"
                 )
+                assert KnowledgeRequest.model_validate({"action": "status"}).areas == []
+                knowledge_request = KnowledgeRequest.model_validate(
+                    {
+                        "action": "reconcile",
+                        "areas": [
+                            {
+                                "id": "area/core",
+                                "title": "Core",
+                                "description": "Core behavior",
+                                "paths": ["src/"],
+                                "fingerprint": "abc123",
+                                "boundaries": "Owns the core runtime",
+                            }
+                        ],
+                    }
+                )
+                assert knowledge_request.areas[0].boundaries == ["Owns the core runtime"]
+                invalid_area = {
+                    "id": "area/core",
+                    "title": "Core",
+                    "description": "Core behavior",
+                    "paths": "src/",
+                    "fingerprint": "abc123",
+                }
+                with pytest.raises(ValidationError) as validation:
+                    KnowledgeRequest.model_validate(
+                        {"action": "reconcile", "areas": [invalid_area, invalid_area]}
+                    )
+                issues = _validation_issues(validation.value, {"action": "reconcile"})
+                assert [(issue.field, issue.kind) for issue in issues] == [
+                    ("areas[].paths", "list_type")
+                ]
                 assert tools["run_status"].annotations.read_only_hint
                 assert not tools["task_manage"].annotations.read_only_hint
                 assert not tools["audit_probe"].annotations.read_only_hint
@@ -191,7 +227,7 @@ class TestExtensionMcp:
                 )
                 assert not finished.is_error
 
-    async def test_expected_runtime_failure_is_actionable_tool_error(self) -> None:
+    async def test_expected_runtime_failure_is_actionable_tool_error(self, caplog: Any) -> None:
         with tempfile.TemporaryDirectory(prefix="github-workflows-errors-") as directory:
             root = Path(directory)
             workspace = root / "repo"
@@ -216,11 +252,52 @@ class TestExtensionMcp:
                     },
                 )
                 assert encoded.is_error
+                missing = await client.call_tool(
+                    "audit_knowledge",
+                    {"action": "reconcile"},
+                )
+                assert missing.is_error
+                invalid_calls = [
+                    ("run_manage", {}),
+                    ("run_status", {}),
+                    ("task_manage", {}),
+                    ("task_context", {}),
+                    ("history_manage", {"action": "unsupported"}),
+                    ("history_query", {"limit": 0}),
+                    ("audit_inventory", {}),
+                    ("audit_knowledge", {"action": "reconcile"}),
+                    ("audit_probe", {}),
+                    ("audit_record", {}),
+                    ("audit_publish", {}),
+                    ("audit_metrics", {"unexpected": True}),
+                ]
+                internal_diagnostic = re.compile(
+                    r"validation errors?|input_(?:value|type)|errors\.pydantic|Traceback"
+                )
+                for tool_name, arguments in invalid_calls:
+                    result = await client.call_tool(tool_name, arguments)
+                    assert result.is_error
+                    assert len(result.content) == 1
+                    message = result.content[0].text
+                    assert "\n" not in message
+                    assert internal_diagnostic.search(message) is None
                 assert not (await client.call_tool("run_manage", request)).is_error
                 failed = await client.call_tool("run_manage", request)
                 assert failed.is_error
                 rendered = " ".join(item.text for item in failed.content if hasattr(item, "text"))
                 assert "unfinished current run" in rendered
+                sentinel = "private-internal-detail"
+                with (
+                    caplog.at_level(logging.ERROR),
+                    mock.patch.object(runtime, "run_status", side_effect=KeyError(sentinel)),
+                ):
+                    crashed = await client.call_tool("run_status", {"workflow": "gh-curate-issues"})
+                assert crashed.is_error
+                public_crash = " ".join(
+                    item.text for item in crashed.content if hasattr(item, "text")
+                )
+                assert sentinel not in public_crash
+                assert any(record.exc_info for record in caplog.records)
 
     def test_task_references_disambiguate_workflows_and_reject_stale_runs(self) -> None:
         with tempfile.TemporaryDirectory(prefix="github-workflows-task-ref-") as directory:
