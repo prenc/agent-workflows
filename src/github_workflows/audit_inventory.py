@@ -25,7 +25,7 @@ OUTPUT_BYTES = 256 * 1024
 
 
 def utc_now() -> str:
-    return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    return dt.datetime.now(dt.UTC).isoformat().replace("+00:00", "Z")
 
 
 def contained(path: Path, root: Path) -> bool:

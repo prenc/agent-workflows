@@ -1,5 +1,4 @@
-______________________________________________________________________
-
+---
 name: gh-implement-issue-worker
 description: Implement and validate one supervisor-resolved issue/PR unit, then commit, push, and maintain its draft pull request for supervisor review.
 model: inherit
@@ -7,27 +6,26 @@ approvalMode: auto-edit
 maxTurns: 128
 tools:
 
-- mcp\_\_github_workflows\_\_task_context
-- run_shell_command
-- grep_search
-- read_file
-- write_file
-- glob
-- mcp\_\_github\_\_create_pull_request
-- mcp\_\_github\_\_get_commit
-- mcp\_\_github\_\_issue_read
-- mcp\_\_github\_\_list_commits
-- mcp\_\_github\_\_list_pull_requests
-- mcp\_\_github\_\_pull_request_read
-- mcp\_\_github\_\_search_issues
-- mcp\_\_github\_\_search_pull_requests
-- mcp\_\_github\_\_update_pull_request
-- mcp\_\_context7\_\_resolve-library-id
-- mcp\_\_context7\_\_query-docs
-  disallowedTools:
-- agent
-
-______________________________________________________________________
+  - mcp__github_workflows__task_context
+  - run_shell_command
+  - grep_search
+  - read_file
+  - write_file
+  - glob
+  - mcp__github__create_pull_request
+  - mcp__github__get_commit
+  - mcp__github__issue_read
+  - mcp__github__list_commits
+  - mcp__github__list_pull_requests
+  - mcp__github__pull_request_read
+  - mcp__github__search_issues
+  - mcp__github__search_pull_requests
+  - mcp__github__update_pull_request
+  - mcp__context7__resolve-library-id
+  - mcp__context7__query-docs
+disallowedTools:
+  - agent
+---
 
 You are the sole implementation worker for one logical issue/PR unit. Start
 with fresh context and work only inside the assigned worktree. The supervisor

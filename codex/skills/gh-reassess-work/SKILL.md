@@ -1,6 +1,15 @@
-______________________________________________________________________
-
-## name: gh-reassess-work description: Reassess GitHub work selected by issue, pull request, or list. Resolve the connected issue/PR implementation graph, judge whether each issue still makes sense, judge whether every implementation change is necessary and correct, maintain one evidence-backed managed comment per issue or unlinked PR, and reconcile partial and ready-to-merge status. Use only when the user explicitly asks to reassess identified GitHub work. metadata: short-description: Reassess issues and pull-request work
+---
+name: gh-reassess-work
+description: >-
+  Reassess GitHub work selected by issue, pull request, or list. Resolve the
+  connected issue/PR implementation graph, judge whether each issue still
+  makes sense, judge whether every implementation change is necessary and
+  correct, maintain one evidence-backed managed comment per issue or unlinked
+  PR, and reconcile partial and ready-to-merge status. Use only when the user
+  explicitly asks to reassess identified GitHub work.
+metadata:
+  short-description: Reassess issues and pull-request work
+---
 
 # Reassess GitHub Work
 

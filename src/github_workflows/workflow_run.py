@@ -88,7 +88,7 @@ AUDIT_TRANSITIONS = {
 
 
 def utc_now() -> str:
-    return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    return dt.datetime.now(dt.UTC).isoformat().replace("+00:00", "Z")
 
 
 def secure_directory(path: Path, *, exist_ok: bool = True) -> None:

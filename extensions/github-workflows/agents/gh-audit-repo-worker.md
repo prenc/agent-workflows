@@ -1,5 +1,4 @@
-______________________________________________________________________
-
+---
 name: gh-audit-repo-worker
 description: Read-only fresh-context worker that discovers or independently verifies evidence-backed findings in one exclusive repository shard.
 model: inherit
@@ -7,31 +6,30 @@ approvalMode: plan
 maxTurns: 64
 tools:
 
-- mcp\_\_github_workflows\_\_task_context
-- grep_search
-- read_file
-- glob
-- web_fetch
-- mcp\_\_github\_\_get_commit
-- mcp\_\_github\_\_issue_read
-- mcp\_\_github\_\_list_commits
-- mcp\_\_github\_\_list_issues
-- mcp\_\_github\_\_list_label
-- mcp\_\_github\_\_list_pull_requests
-- mcp\_\_github\_\_pull_request_read
-- mcp\_\_github\_\_search_issues
-- mcp\_\_github\_\_search_pull_requests
-- mcp\_\_context7\_\_resolve-library-id
-- mcp\_\_context7\_\_query-docs
-  disallowedTools:
-- agent
-- run_shell_command
-- write_file
-- edit
-- mcp\_\_github\_\_issue_write
-- mcp\_\_github\_\_add_issue_comment
-
-______________________________________________________________________
+  - mcp__github_workflows__task_context
+  - grep_search
+  - read_file
+  - glob
+  - web_fetch
+  - mcp__github__get_commit
+  - mcp__github__issue_read
+  - mcp__github__list_commits
+  - mcp__github__list_issues
+  - mcp__github__list_label
+  - mcp__github__list_pull_requests
+  - mcp__github__pull_request_read
+  - mcp__github__search_issues
+  - mcp__github__search_pull_requests
+  - mcp__context7__resolve-library-id
+  - mcp__context7__query-docs
+disallowedTools:
+  - agent
+  - run_shell_command
+  - write_file
+  - edit
+  - mcp__github__issue_write
+  - mcp__github__add_issue_comment
+---
 
 You are a read-only worker for one bounded phase of `$gh-audit-repo`. Start
 with fresh context. The spawn prompt contains only a namespaced task reference.

@@ -1,34 +1,32 @@
-______________________________________________________________________
-
+---
 name: gh-audit-repo
 description: Run a long, resumable repository audit against complete GitHub issue and pull-request history, refine matching untouched open issues, close independently verified obsolete issues, and create findings that are genuinely new. Use when asked for a broad or focused codebase audit, including overnight audits.
 priority: 20
 argument-hint: '\[-n <N>\] \[--resume | [--refresh-history] [--regression-sweep] \[area/<slug> ...\] \[--scope <path-or-symbol> ...\] \[--focus <question>\] \[--use-skill <name> ...\] [--dry-run]\]'
 allowedTools:
 
-- task
-- send_message
-- list_agents
-- run_shell_command
-- grep_search
-- read_file
-- write_file
-- glob
-- web_fetch
-- mcp\_\_github_workflows\_\_run_manage
-- mcp\_\_github_workflows\_\_run_status
-- mcp\_\_github_workflows\_\_task_manage
-- mcp\_\_github_workflows\_\_history_manage
-- mcp\_\_github_workflows\_\_history_query
-- mcp\_\_github_workflows\_\_audit_inventory
-- mcp\_\_github_workflows\_\_audit_knowledge
-- mcp\_\_github_workflows\_\_audit_probe
-- mcp\_\_github_workflows\_\_audit_record
-- mcp\_\_github_workflows\_\_audit_publish
-- mcp\_\_github_workflows\_\_audit_metrics
-- mcp\_\_\*
-
-______________________________________________________________________
+  - task
+  - send_message
+  - list_agents
+  - run_shell_command
+  - grep_search
+  - read_file
+  - write_file
+  - glob
+  - web_fetch
+  - mcp__github_workflows__run_manage
+  - mcp__github_workflows__run_status
+  - mcp__github_workflows__task_manage
+  - mcp__github_workflows__history_manage
+  - mcp__github_workflows__history_query
+  - mcp__github_workflows__audit_inventory
+  - mcp__github_workflows__audit_knowledge
+  - mcp__github_workflows__audit_probe
+  - mcp__github_workflows__audit_record
+  - mcp__github_workflows__audit_publish
+  - mcp__github_workflows__audit_metrics
+  - mcp__*
+---
 
 # Audit GitHub Repository
 

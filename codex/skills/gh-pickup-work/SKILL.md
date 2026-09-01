@@ -1,6 +1,15 @@
-______________________________________________________________________
-
-## name: gh-pickup-work description: Pick up one cohesive GitHub implementation work unit selected by issue, pull request, list, or open-issue label filter. The unit always uses one branch, one worktree, and one pull request, but may solve multiple compatible issues. Reuse and verify existing Qwen or Codex work when available, or start confirmed scratch work. Always rebase onto the latest base; merging and automatic reassessment remain outside this workflow. metadata: short-description: Continue one cohesive GitHub work unit
+---
+name: gh-pickup-work
+description: >-
+  Pick up one cohesive GitHub implementation work unit selected by issue, pull
+  request, list, or open-issue label filter. The unit always uses one branch,
+  one worktree, and one pull request, but may solve multiple compatible issues.
+  Reuse and verify existing Qwen or Codex work when available, or start
+  confirmed scratch work. Always rebase onto the latest base; merging and
+  automatic reassessment remain outside this workflow.
+metadata:
+  short-description: Continue one cohesive GitHub work unit
+---
 
 # Pick Up GitHub Work
 

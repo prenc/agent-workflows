@@ -1,36 +1,34 @@
-______________________________________________________________________
-
+---
 name: gh-curate-issues
 description: Curate selected or all current open GitHub issues by enforcing the shared issue format and taxonomy, reconciling issue/PR relationships, splitting oversized scope safely, and maintaining evidence-backed statuses without auditing or implementing code.
 priority: 20
 argument-hint: '\[-n <N>\] \[--resume | \[--history-days <N>\] [--refresh-history] [issue-number-or-URL ...] [--dry-run]\]'
 allowedTools:
 
-- task
-- run_shell_command
-- read_file
-- write_file
-- web_fetch
-- mcp\_\_github_workflows\_\_run_manage
-- mcp\_\_github_workflows\_\_run_status
-- mcp\_\_github_workflows\_\_task_manage
-- mcp\_\_github_workflows\_\_history_manage
-- mcp\_\_github_workflows\_\_history_query
-- mcp\_\_\*
-- mcp\_\_github\_\_get_commit
-- mcp\_\_github\_\_issue_read
-- mcp\_\_github\_\_issue_write
-- mcp\_\_github\_\_label_write
-- mcp\_\_github\_\_list_branches
-- mcp\_\_github\_\_list_commits
-- mcp\_\_github\_\_list_issues
-- mcp\_\_github\_\_list_label
-- mcp\_\_github\_\_list_pull_requests
-- mcp\_\_github\_\_pull_request_read
-- mcp\_\_github\_\_search_issues
-- mcp\_\_github\_\_search_pull_requests
-
-______________________________________________________________________
+  - task
+  - run_shell_command
+  - read_file
+  - write_file
+  - web_fetch
+  - mcp__github_workflows__run_manage
+  - mcp__github_workflows__run_status
+  - mcp__github_workflows__task_manage
+  - mcp__github_workflows__history_manage
+  - mcp__github_workflows__history_query
+  - mcp__*
+  - mcp__github__get_commit
+  - mcp__github__issue_read
+  - mcp__github__issue_write
+  - mcp__github__label_write
+  - mcp__github__list_branches
+  - mcp__github__list_commits
+  - mcp__github__list_issues
+  - mcp__github__list_label
+  - mcp__github__list_pull_requests
+  - mcp__github__pull_request_read
+  - mcp__github__search_issues
+  - mcp__github__search_pull_requests
+---
 
 # Curate GitHub Issues
 

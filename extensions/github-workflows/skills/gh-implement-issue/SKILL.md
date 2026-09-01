@@ -1,37 +1,35 @@
-______________________________________________________________________
-
+---
 name: gh-implement-issue
 description: Immediately resolve and lock supplied GitHub issues, then supervise them or supplied implementation PRs as automatically grouped one-PR implementation units with bounded fresh-context workers, reusable isolated worktrees, verified rebases, worker-owned draft PR publication, native issue linkage, and supervisor-owned promotion and finalization.
 priority: 20
 argument-hint: '\[-n <N>\] \[--resume | [--separate] <issue-or-PR> ...\]'
 allowedTools:
 
-- task
-- send_message
-- list_agents
-- run_shell_command
-- grep_search
-- read_file
-- write_file
-- glob
-- mcp\_\_github_workflows\_\_run_manage
-- mcp\_\_github_workflows\_\_run_status
-- mcp\_\_github_workflows\_\_task_manage
-- mcp\_\_github\_\_add_issue_comment
-- mcp\_\_github\_\_get_me
-- mcp\_\_github\_\_issue_read
-- mcp\_\_github\_\_issue_write
-- mcp\_\_github\_\_label_write
-- mcp\_\_github\_\_list_branches
-- mcp\_\_github\_\_list_commits
-- mcp\_\_github\_\_list_issues
-- mcp\_\_github\_\_list_label
-- mcp\_\_github\_\_list_pull_requests
-- mcp\_\_github\_\_pull_request_read
-- mcp\_\_github\_\_search_pull_requests
-- mcp\_\_github\_\_update_pull_request
-
-______________________________________________________________________
+  - task
+  - send_message
+  - list_agents
+  - run_shell_command
+  - grep_search
+  - read_file
+  - write_file
+  - glob
+  - mcp__github_workflows__run_manage
+  - mcp__github_workflows__run_status
+  - mcp__github_workflows__task_manage
+  - mcp__github__add_issue_comment
+  - mcp__github__get_me
+  - mcp__github__issue_read
+  - mcp__github__issue_write
+  - mcp__github__label_write
+  - mcp__github__list_branches
+  - mcp__github__list_commits
+  - mcp__github__list_issues
+  - mcp__github__list_label
+  - mcp__github__list_pull_requests
+  - mcp__github__pull_request_read
+  - mcp__github__search_pull_requests
+  - mcp__github__update_pull_request
+---
 
 # Implement GitHub Issues
 

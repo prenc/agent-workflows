@@ -168,7 +168,7 @@ class Installer:
             raise RuntimeError("uv disappeared during installation")
         python = self.root / ".venv" / "bin" / "python"
         if not python.is_file():
-            self.run(uv, "venv", "--python", ">=3.10", str(self.root / ".venv"))
+            self.run(uv, "venv", "--python", ">=3.12", str(self.root / ".venv"))
         requirement = f"{self.root}[dev]" if self.args.dev else str(self.root)
         self.run(uv, "pip", "install", "--python", str(python), "-e", requirement)
         state = {

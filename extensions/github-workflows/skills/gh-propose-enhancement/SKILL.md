@@ -1,24 +1,22 @@
-______________________________________________________________________
-
+---
 name: gh-propose-enhancement
 description: Publish one lightweight GitHub enhancement proposal from an explicit idea or the current Qwen conversation after duplicate checking and canonical issue drafting. Use when asked to turn a newly proposed capability or solution into an issue; use --dry-run to preview it without GitHub writes.
 priority: 20
 argument-hint: '\[--area area/<slug>\] [--priority high|medium|low] [--dry-run] [idea-or-conversation-reference]'
 allowedTools:
 
-- run_shell_command
-- read_file
-- mcp\_\_github\_\_issue_read
-- mcp\_\_github\_\_issue_write
-- mcp\_\_github\_\_label_write
-- mcp\_\_github\_\_list_issues
-- mcp\_\_github\_\_list_label
-- mcp\_\_github\_\_list_pull_requests
-- mcp\_\_github\_\_pull_request_read
-- mcp\_\_github\_\_search_issues
-- mcp\_\_github\_\_search_pull_requests
-
-______________________________________________________________________
+  - run_shell_command
+  - read_file
+  - mcp__github__issue_read
+  - mcp__github__issue_write
+  - mcp__github__label_write
+  - mcp__github__list_issues
+  - mcp__github__list_label
+  - mcp__github__list_pull_requests
+  - mcp__github__pull_request_read
+  - mcp__github__search_issues
+  - mcp__github__search_pull_requests
+---
 
 # Propose a GitHub Enhancement
 
