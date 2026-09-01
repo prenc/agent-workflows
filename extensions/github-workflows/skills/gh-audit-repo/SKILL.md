@@ -185,9 +185,9 @@ The server owns the run record and initializes canonical phases, shards, tasks,
 candidates, validations, verdicts, mutations, limitations, pending work,
 scheduler state, and metrics.
 Register and transition tasks through `mcp__github_workflows__task_manage`.
-Record phases, shards, candidates, validations, verdicts, limitations, pending
-work, drift, metrics, and supervisor activity through
-`mcp__github_workflows__audit_record`. Call
+Record phases, shards, candidates, verdicts, limitations, pending work, drift,
+and supervisor activity through `mcp__github_workflows__audit_record`. Probe
+validation and metrics are persisted by their respective tools. Call
 `mcp__github_workflows__run_status` before launching work and after every task
 result; its scheduler is authoritative. The server owns revisions, artifacts,
 atomic writes, and lifecycle validation.
@@ -251,11 +251,12 @@ responses locally to decide whether ingestion can be skipped. The server owns
 normalization and refresh timestamps.
 
 When a GitHub MCP response reports `<persisted-output>`, pass every reported
-tool-result path directly in the `artifacts` list of one or more
+tool-result path as a typed `{kind, path}` entry in the `artifacts` list of one or more
 `history_manage` ingest calls. Never read, copy, split, summarize, or
 re-transcribe those files for ingestion; the history server validates and
 reduces them to compact metadata without returning their contents. Use inline
-`records` only when the GitHub response itself remained inline, with at most
+`records` only when the GitHub response itself remained inline. Each record
+carries its own `kind`, so an ingest call may contain both issues and pulls, with at most
 100 records per call. `records` and `artifacts` are mutually exclusive.
 
 Commit with action `commit` after all pages are ingested. The server supplies
@@ -310,7 +311,7 @@ worktree and verify its reachable implementation path before it can survive.
 ## 3. Reconcile per-area knowledge
 
 After inferring the exclusive area map, call
-`mcp__github_workflows__audit_knowledge` with actions `status` and `reconcile`.
+`mcp__github_workflows__audit_knowledge` with actions `show` and `reconcile`.
 The tool is the sole interface to durable area knowledge; its storage is
 private.
 
@@ -415,7 +416,8 @@ trigger dependency installation.
 ## 5. Discover by shard
 
 Register each complete assignment through
-`mcp__github_workflows__task_manage`, then launch one
+`mcp__github_workflows__task_manage` with action `plan` and one typed `task`.
+Use the returned server-generated task ID and task reference, then launch one
 `gh-audit-repo-worker` per selected shard according to
 `mcp__github_workflows__run_status`, with only this prompt:
 
@@ -652,8 +654,8 @@ operations intact. Never retry an ambiguous creation.
 
 ## Final report
 
-Call `mcp__github_workflows__audit_metrics` before finalization and record its
-summary through `mcp__github_workflows__audit_record` with action `metrics`.
+Call `mcp__github_workflows__audit_metrics` before finalization. The call both
+persists and returns the summary; do not submit a second metrics record.
 Report repository/local branch/SHA, upstream divergence, excluded dirty state,
 run ID and resumable run path, retained worktree,
 areas, shards, and coverage, requested/effective concurrency, logical worker

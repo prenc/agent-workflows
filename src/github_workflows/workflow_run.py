@@ -519,7 +519,25 @@ def audit_event(args: argparse.Namespace) -> None:
     scheduler = state["scheduler"]
     detail: dict[str, Any] = {}
 
-    if event_type == "task-register":
+    if event_type == "task-plan-update":
+        task = payload.get("task")
+        if not isinstance(task, dict):
+            raise ValueError("task-plan-update requires a task object")
+        logical_id = require_string(task.get("logical_id"), "task logical_id")
+        matches = [item for item in tasks.values() if item.get("logical_id") == logical_id]
+        if len(matches) != 1 or matches[0].get("status") != "queued":
+            raise ValueError("only one queued logical task can be revised")
+        existing = matches[0]
+        for name in ("role", "unit", "assignment", "required"):
+            if name in task:
+                existing[name] = task[name]
+        existing["updated_at"] = utc_now()
+        detail = {
+            "task_id": existing["id"],
+            "logical_id": logical_id,
+            "status": existing["status"],
+        }
+    elif event_type == "task-register":
         task = payload.get("task")
         if not isinstance(task, dict):
             raise ValueError("task-register requires a task object")

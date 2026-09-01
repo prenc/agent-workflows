@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -88,6 +89,18 @@ class WorkflowRuntime:
         if isinstance(result, int) and result not in {0, payload.get("returncode")}:
             raise RuntimeError(f"workflow operation failed with exit code {result}")
         return payload
+
+    @staticmethod
+    def _probe_validation_status(result: dict[str, Any]) -> str:
+        probe_status = result.get("probe_status")
+        if probe_status in {"succeeded", "failed", "timed-out", "unavailable"}:
+            return probe_status
+        if result.get("timed_out") is True:
+            return "timed-out"
+        returncode = result.get("returncode")
+        if isinstance(returncode, int) and not isinstance(returncode, bool):
+            return "succeeded" if returncode == 0 else "failed"
+        return "unavailable"
 
     @staticmethod
     @contextmanager
@@ -305,6 +318,38 @@ class WorkflowRuntime:
         if not isinstance(run_id, str) or not SAFE_ID.fullmatch(run_id):
             raise ValueError("current run has an invalid run_id")
         return f"{workflow}:{run_id}:{task_id}"
+
+    @staticmethod
+    def _task_actions(task: dict[str, Any], scheduler: dict[str, Any]) -> list[str]:
+        status = task.get("status")
+        if status == "queued":
+            return ["plan", "mark_running", "abandon"]
+        if status == "running":
+            return ["checkpoint", "complete", "fail", "abandon"]
+        if status == "checkpointed":
+            return ["mark_running", "complete", "fail", "abandon"]
+        if status in {"completed", "failed", "abandoned"}:
+            actions = ["retry"]
+            if not task.get("integrated") and scheduler.get("next_action") == "integrate-result":
+                actions.insert(0, "integration_begin")
+            return actions
+        return []
+
+    @classmethod
+    def _task_receipt_fields(
+        cls, workflow: WorkflowName, state: dict[str, Any], task_id: str
+    ) -> dict[str, Any]:
+        task = state.get("tasks", {}).get(task_id)
+        if not isinstance(task, dict):
+            raise ValueError("managed task is missing from workflow state")
+        scheduler = cls._scheduler_status(state)
+        return {
+            "task_id": task_id,
+            "task_ref": cls._task_ref(workflow, state, task_id),
+            "task": task,
+            "allowed_actions": cls._task_actions(task, scheduler),
+            "scheduler": scheduler,
+        }
 
     @staticmethod
     def _parse_task_ref(task_ref: str) -> tuple[WorkflowName, str, str]:
@@ -612,13 +657,14 @@ class WorkflowRuntime:
         return summary
 
     def task_manage(self, request: TaskManageRequest) -> dict[str, Any]:
-        if not SAFE_ID.fullmatch(request.task_id):
+        request_task_id = getattr(request, "task_id", None)
+        if request_task_id is not None and not SAFE_ID.fullmatch(request_task_id):
             raise ValueError("task_id contains unsupported characters")
         with self.lock():
             state = self.state(request.workflow)
             if request.workflow != "gh-audit-repo":
                 return self._generic_task_manage(request, state)
-            managed_task_id = request.task_id
+            managed_task_id = request_task_id
             if request.action in {"plan", "retry"}:
                 attempt = 1
                 if request.action == "retry":
@@ -635,11 +681,44 @@ class WorkflowRuntime:
                         + 1
                     )
                     task_id = f"{logical_id}-{attempt}"
-                    prior = previous
+                    plan = request.task
+                    role = plan.role if plan else previous.get("role") or "discover"
+                    unit = plan.unit if plan else previous.get("unit") or logical_id
+                    assignment = plan.assignment if plan else previous.get("assignment", {})
+                    required = plan.required if plan else bool(previous.get("required", True))
                 else:
-                    logical_id = request.logical_id or request.task_id
-                    task_id = request.task_id
-                    prior = {}
+                    plan = request.task
+                    logical_id = plan.logical_id
+                    queued = [
+                        item
+                        for item in state.get("tasks", {}).values()
+                        if item.get("logical_id") == logical_id and item.get("status") == "queued"
+                    ]
+                    if queued:
+                        self._event(
+                            {
+                                "type": "task-plan-update",
+                                "task": plan.model_dump(mode="json", exclude_none=True),
+                            }
+                        )
+                        managed_task_id = str(queued[0]["id"])
+                        updated = self.state("gh-audit-repo")
+                        return self._receipt(
+                            "gh-audit-repo",
+                            updated,
+                            True,
+                            **self._task_receipt_fields("gh-audit-repo", updated, managed_task_id),
+                        )
+                    if any(
+                        item.get("logical_id") == logical_id
+                        for item in state.get("tasks", {}).values()
+                    ):
+                        raise ValueError("logical task already has an attempt; use retry")
+                    task_id = f"{logical_id}-1"
+                    role = plan.role
+                    unit = plan.unit or logical_id
+                    assignment = plan.assignment
+                    required = plan.required
                 if not SAFE_ID.fullmatch(logical_id):
                     raise ValueError("logical_id contains unsupported characters")
                 if not SAFE_ID.fullmatch(task_id):
@@ -649,28 +728,28 @@ class WorkflowRuntime:
                 task = {
                     "id": task_id,
                     "logical_id": logical_id,
-                    "agent_id": request.agent_id or task_id,
-                    "role": request.role or prior.get("role") or "discover",
-                    "unit": request.unit or prior.get("unit") or task_id,
+                    "agent_id": task_id,
+                    "role": role,
+                    "unit": unit,
                     "attempt": attempt,
                     "status": "queued",
-                    "required": request.required,
-                    "assignment": request.assignment or prior.get("assignment", {}),
+                    "required": required,
+                    "assignment": assignment,
                 }
-                result = self._event({"type": "task-register", "task": task})
+                self._event({"type": "task-register", "task": task})
                 managed_task_id = task_id
-            elif request.action in {"integrate_start", "integrate_finish"}:
+            elif request.action in {"integration_begin", "integration_end"}:
                 event = (
                     "integration-start"
-                    if request.action == "integrate_start"
+                    if request.action == "integration_begin"
                     else "integration-complete"
                 )
-                result = self._event({"type": event, "task_id": request.task_id})
+                self._event({"type": event, "task_id": request.task_id})
             else:
                 status = {
-                    "dispatch": "running",
+                    "mark_running": "running",
                     "checkpoint": "checkpointed",
-                    "report": "completed",
+                    "complete": "completed",
                     "fail": "failed",
                     "abandon": "abandoned",
                 }[request.action]
@@ -679,7 +758,7 @@ class WorkflowRuntime:
                     "task_id": request.task_id,
                     "status": status,
                 }
-                if request.action == "report":
+                if request.action == "complete":
                     if request.report is None:
                         raise ValueError("report action requires a report object")
                     task = state.get("tasks", {}).get(request.task_id)
@@ -705,9 +784,9 @@ class WorkflowRuntime:
                 if request.note:
                     payload["note"] = request.note
                 try:
-                    result = self._event(payload)
+                    self._event(payload)
                 except Exception:
-                    if request.action == "report":
+                    if request.action == "complete":
                         result_path.unlink(missing_ok=True)
                     raise
             updated = self.state("gh-audit-repo")
@@ -715,9 +794,7 @@ class WorkflowRuntime:
                 "gh-audit-repo",
                 updated,
                 True,
-                task_id=managed_task_id,
-                task_ref=self._task_ref("gh-audit-repo", updated, managed_task_id),
-                scheduler=result.get("scheduler"),
+                **self._task_receipt_fields("gh-audit-repo", updated, managed_task_id),
             )
 
     def _generic_task_manage(
@@ -728,7 +805,7 @@ class WorkflowRuntime:
         tasks = state.setdefault("tasks", {})
         scheduler = state.setdefault("scheduler", {"limit": 3, "integration_queue": []})
         queue = scheduler.setdefault("integration_queue", [])
-        managed_task_id = request.task_id
+        managed_task_id = getattr(request, "task_id", None)
         if request.action in {"plan", "retry"}:
             if request.action == "retry":
                 previous = tasks.get(request.task_id)
@@ -748,13 +825,54 @@ class WorkflowRuntime:
                     + 1
                 )
                 task_id = f"{logical_id}-{attempt}"
+                plan = request.task
+                role = plan.role if plan else previous.get("role") or "worker"
+                unit = plan.unit if plan else previous.get("unit") or logical_id
+                assignment = plan.assignment if plan else previous.get("assignment", {})
+                required = plan.required if plan else bool(previous.get("required", True))
             else:
-                if request.task_id in tasks:
-                    raise ValueError("task already exists")
-                previous = {}
-                logical_id = request.logical_id or request.task_id
+                plan = request.task
+                logical_id = plan.logical_id
+                queued = [
+                    item
+                    for item in tasks.values()
+                    if item.get("logical_id") == logical_id and item.get("status") == "queued"
+                ]
+                if queued:
+                    task = queued[0]
+                    task.update(
+                        {
+                            "role": plan.role,
+                            "unit": plan.unit or logical_id,
+                            "assignment": plan.assignment,
+                            "required": plan.required,
+                        }
+                    )
+                    managed_task_id = str(task["id"])
+                    state["revision"] += 1
+                    state["updated_at"] = workflow_run.utc_now()
+                    workflow_run.write_state(self.current(request.workflow), state)
+                    workflow_run.append_journal(
+                        self.current(request.workflow),
+                        "task_managed",
+                        revision=state["revision"],
+                        task_id=managed_task_id,
+                        action=request.action,
+                    )
+                    return self._receipt(
+                        request.workflow,
+                        state,
+                        True,
+                        **self._task_receipt_fields(request.workflow, state, managed_task_id),
+                    )
+                if any(item.get("logical_id") == logical_id for item in tasks.values()):
+                    raise ValueError("logical task already has an attempt; use retry")
                 attempt = 1
-                task_id = request.task_id
+                task_id = f"{logical_id}-1"
+                role = plan.role
+                unit = plan.unit or logical_id
+                assignment = plan.assignment
+                required = plan.required
             if not SAFE_ID.fullmatch(logical_id):
                 raise ValueError("logical_id contains unsupported characters")
             if not SAFE_ID.fullmatch(task_id):
@@ -765,20 +883,20 @@ class WorkflowRuntime:
             tasks[task_id] = {
                 "id": task_id,
                 "logical_id": logical_id,
-                "agent_id": request.agent_id or task_id,
-                "role": request.role or previous.get("role") or "worker",
-                "unit": request.unit or previous.get("unit") or task_id,
+                "agent_id": task_id,
+                "role": role,
+                "unit": unit,
                 "attempt": attempt,
                 "status": "queued",
-                "required": request.required,
-                "assignment": request.assignment or previous.get("assignment", {}),
+                "required": required,
+                "assignment": assignment,
                 "integrated": False,
             }
-        elif request.action in {"integrate_start", "integrate_finish"}:
+        elif request.action in {"integration_begin", "integration_end"}:
             task = tasks.get(request.task_id)
             if not isinstance(task, dict):
                 raise ValueError("unknown task_id")
-            if request.action == "integrate_start":
+            if request.action == "integration_begin":
                 if not queue or queue[0] != request.task_id:
                     raise ValueError("integration must process the oldest result first")
                 if scheduler.get("supervisor_activity") is not None:
@@ -806,9 +924,9 @@ class WorkflowRuntime:
             if not isinstance(task, dict):
                 raise ValueError("unknown task_id")
             status = {
-                "dispatch": "running",
+                "mark_running": "running",
                 "checkpoint": "checkpointed",
-                "report": "completed",
+                "complete": "completed",
                 "fail": "failed",
                 "abandon": "abandoned",
             }[request.action]
@@ -820,12 +938,12 @@ class WorkflowRuntime:
             if status not in allowed.get(str(task.get("status")), set()):
                 raise ValueError(f"invalid task transition: {task.get('status')} -> {status}")
             if (
-                request.action == "dispatch"
+                request.action == "mark_running"
                 and self._generic_scheduler_status(state)["worker_slots"] < 1
             ):
                 raise ValueError("generic workflow concurrency is saturated")
             task["status"] = status
-            if request.action == "report":
+            if request.action == "complete":
                 if request.report is None:
                     raise ValueError("report action requires a report object")
                 result_dir = self.current(request.workflow) / "results"
@@ -857,9 +975,7 @@ class WorkflowRuntime:
             request.workflow,
             state,
             True,
-            task_id=managed_task_id,
-            task_ref=self._task_ref(request.workflow, state, managed_task_id),
-            scheduler=self._generic_scheduler_status(state),
+            **self._task_receipt_fields(request.workflow, state, managed_task_id),
         )
 
     def task_context(self, task_ref: str) -> dict[str, Any]:
@@ -1009,32 +1125,42 @@ class WorkflowRuntime:
                     mode=result.get("mode", "prepared"),
                 )
             if request.action == "ingest":
+                grouped: dict[str, list[dict[str, Any]]] = {"issue": [], "pull": []}
                 if request.artifacts:
-                    records = self._history_artifact_records(request.artifacts, request.kind)
+                    for kind in grouped:
+                        paths = [item.path for item in request.artifacts if item.kind == kind]
+                        if paths:
+                            grouped[kind].extend(self._history_artifact_records(paths, kind))
                 else:
-                    records = [
-                        item.model_dump(mode="json", exclude_none=True) for item in request.records
-                    ]
-                records = self._compact_history_records(records)
-                with self._json_file({"records": records}) as source:
-                    result = self._invoke(
-                        github_cache.ingest_records,
-                        **common,
-                        db=work_db,
-                        kind=request.kind,
-                        input=source,
-                        source=request.source,
-                        fetched_at=request.fetched_at,
-                    )
+                    for item in request.records:
+                        grouped[item.kind].append(
+                            item.model_dump(mode="json", exclude_none=True, exclude={"kind"})
+                        )
+                accepted = 0
                 history = dict(state.get("history", {}))
                 counts = dict(history.get("ingested", {}))
-                counts[request.kind] = counts.get(request.kind, 0) + len(records)
+                for kind, raw_records in grouped.items():
+                    if not raw_records:
+                        continue
+                    records = self._compact_history_records(raw_records)
+                    with self._json_file({"records": records}) as source:
+                        result = self._invoke(
+                            github_cache.ingest_records,
+                            **common,
+                            db=work_db,
+                            kind=kind,
+                            input=source,
+                            source=request.source,
+                            fetched_at=request.fetched_at,
+                        )
+                    accepted += result.get("accepted", len(records))
+                    counts[kind] = counts.get(kind, 0) + len(records)
                 history.update(cache_summary(work_db, "staging"))
                 history.update({"sync_status": "ingesting", "ingested": counts})
                 return sync_receipt(
                     history,
                     "in-progress",
-                    accepted=result.get("accepted", len(records)),
+                    accepted=accepted,
                 )
             if request.action == "abort":
                 self._invoke(github_cache.abort_database, db=work_db)
@@ -1136,7 +1262,12 @@ class WorkflowRuntime:
                         input=source,
                         expected_revision=revision,
                     )
-            with self._json_file(request.value) as source:
+            payload = (
+                request.facts
+                if request.action == "record_declared"
+                else request.fact.model_dump(mode="json", exclude_none=True)
+            )
+            with self._json_file(payload) as source:
                 if request.action == "record_declared":
                     return self._invoke(
                         audit_inventory.record_facts,
@@ -1144,13 +1275,15 @@ class WorkflowRuntime:
                         input=source,
                         expected_revision=revision,
                     )
-                if not request.request_id:
-                    raise ValueError("record_context requires request_id")
+                request_id = (
+                    request.request_id
+                    or hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+                )
                 return self._invoke(
                     audit_inventory.record_context,
                     **common,
                     input=source,
-                    request_id=request.request_id,
+                    request_id=request_id,
                     expected_revision=revision,
                 )
 
@@ -1161,7 +1294,7 @@ class WorkflowRuntime:
             if request.action in {"reconcile", "update"} and state.get("status") != "in-progress":
                 raise ValueError("the current audit run is not active")
             sha = str(state.get("sha") or "unknown")
-            if request.action in {"show", "status"}:
+            if request.action == "show":
                 return self._invoke(
                     audit_knowledge.show,
                     project_dir=self.project_dir,
@@ -1192,7 +1325,8 @@ class WorkflowRuntime:
             document = audit_knowledge.parse_document(
                 root / "areas" / f"{audit_knowledge.slug(request.area)}.md"
             )
-            with self._json_file({"findings": request.findings}) as source:
+            findings = [item.model_dump(mode="json") for item in request.findings]
+            with self._json_file({"findings": findings}) as source:
                 return self._invoke(
                     audit_knowledge.update,
                     project_dir=self.project_dir,
@@ -1216,52 +1350,74 @@ class WorkflowRuntime:
                 "selector": getattr(request, "selectors", None),
                 "code": getattr(request, "code", None),
             }
-            return self._invoke(audit_probe.run_probe, **values)
+            result = self._invoke(audit_probe.run_probe, **values)
+            if request.candidate_id:
+                self._event(
+                    {
+                        "type": "candidate-upsert",
+                        "candidate": {
+                            "id": request.candidate_id,
+                            "status": "validation-pending",
+                        },
+                    }
+                )
+                artifact = str(
+                    (
+                        self.current("gh-audit-repo")
+                        / "validation"
+                        / request.probe_id
+                        / "result.json"
+                    ).resolve()
+                )
+                self._event(
+                    {
+                        "type": "validation-record",
+                        "validation": {
+                            "id": request.probe_id,
+                            "probe_id": request.probe_id,
+                            "candidate_id": request.candidate_id,
+                            "status": self._probe_validation_status(result),
+                            "artifact": artifact,
+                        },
+                    }
+                )
+            return result
 
     def audit_record(self, request: AuditRecordRequest) -> dict[str, Any]:
         mapping = {
             "phase": ("phase-set", None),
             "shard": ("shard-upsert", "shard"),
             "candidate": ("candidate-upsert", "candidate"),
-            "validation": ("validation-record", "validation"),
             "verdict": ("verdict-record", "verdict"),
             "limitation": ("limitation-add", None),
             "pending": ("pending-set", None),
             "head_drift": ("head-drift", None),
-            "metrics": ("metrics-update", None),
             "supervisor_start": ("supervisor-start", None),
             "supervisor_finish": ("supervisor-complete", None),
         }
         event_type, field = mapping[request.action]
-        raw_value = getattr(request, "value", {})
-        value = (
-            raw_value.model_dump(mode="json", exclude_none=True)
-            if hasattr(raw_value, "model_dump")
-            else dict(raw_value)
-        )
-        if request.action == "validation" and "artifact" not in value:
-            probe_id = value.get("probe_id") or value.get("id")
-            if not isinstance(probe_id, str) or not SAFE_ID.fullmatch(probe_id):
-                raise ValueError("validation requires a valid probe_id or id")
-            value["artifact"] = str(
-                (self.current("gh-audit-repo") / "validation" / probe_id / "result.json").resolve()
-            )
         if field:
+            raw_value = getattr(request, field)
+            value = raw_value.model_dump(mode="json", exclude_none=True)
             payload = {"type": event_type, field: value}
         elif request.action == "phase":
+            phase = request.phase
             payload = {
                 "type": event_type,
-                "phase": value.get("phase"),
-                "value": value.get("value", {}),
+                "phase": phase.name,
+                "value": {"status": phase.status, **phase.summary},
             }
         elif request.action == "limitation":
-            payload = {"type": event_type, "limitation": value.get("limitation")}
+            payload = {"type": event_type, "limitation": request.limitation}
         elif request.action == "pending":
-            payload = {"type": event_type, "pending": value.get("pending", [])}
-        elif request.action in {"head_drift", "metrics"}:
-            payload = {"type": event_type, "value": value}
+            payload = {"type": event_type, "pending": request.pending}
+        elif request.action == "head_drift":
+            payload = {"type": event_type, "value": request.head_drift}
         elif request.action == "supervisor_start":
-            payload = {"type": event_type, **value}
+            payload = {
+                "type": event_type,
+                **request.activity.model_dump(mode="json", exclude_none=True),
+            }
         else:
             payload = {"type": event_type}
         with self.lock():
@@ -1323,6 +1479,11 @@ class WorkflowRuntime:
             return self._receipt("gh-audit-repo", updated, True, publication=updated.get("history"))
 
     def audit_metrics(self) -> dict[str, Any]:
-        state = self.state("gh-audit-repo")
-        workflow_run.require_audit_helper_integrity(state)
-        return audit_metrics.summarize(self.project_dir, self.current("gh-audit-repo"), state)
+        with self.lock():
+            state = self.state("gh-audit-repo")
+            workflow_run.require_audit_helper_integrity(state)
+            summary = audit_metrics.summarize(
+                self.project_dir, self.current("gh-audit-repo"), state
+            )
+            self._event({"type": "metrics-update", "value": summary})
+            return summary

@@ -13,15 +13,27 @@ from mcp.types import ToolAnnotations
 from pydantic import ValidationError
 
 from .models import (
+    AreaDefinition,
     AuditRecordRequest,
+    CandidateRecordValue,
+    HistoryArtifact,
     HistoryManageRequest,
     HistoryQueryRequest,
+    HistoryRecord,
+    InventoryContextFact,
     InventoryRequest,
+    KnowledgeFinding,
     KnowledgeRequest,
+    PhaseRecord,
     ProbeRequest,
+    ProgramProbe,
     PublishRequest,
     RunManageRequest,
+    ShardRecordValue,
+    SupervisorActivityValue,
     TaskManageRequest,
+    TaskPlan,
+    VerdictRecordValue,
     WorkflowName,
 )
 from .runtime import WorkflowRuntime
@@ -228,27 +240,22 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
     def task_manage(
         action: Literal[
             "plan",
-            "dispatch",
+            "mark_running",
             "checkpoint",
-            "report",
+            "complete",
             "fail",
             "abandon",
             "retry",
-            "integrate_start",
-            "integrate_finish",
+            "integration_begin",
+            "integration_end",
         ],
-        task_id: str,
         workflow: WorkflowName = "gh-audit-repo",
-        logical_id: str | None = None,
-        agent_id: str | None = None,
-        role: str | None = None,
-        unit: str | None = None,
-        assignment: dict[str, Any] | None = None,
+        task_id: str | None = None,
+        task: TaskPlan | None = None,
         report: dict[str, Any] | None = None,
         note: str | None = None,
-        required: bool | None = None,
     ) -> dict[str, Any]:
-        """Register or transition one supervised task without a request wrapper."""
+        """Plan a logical task or transition its server-generated attempt ID."""
         return _request_call(runtime.task_manage, TaskManageRequest, **locals())
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
@@ -260,9 +267,8 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
     def history_manage(
         action: Literal["status", "prepare", "ingest", "commit", "abort"],
         workflow: WorkflowName = "gh-audit-repo",
-        kind: Literal["issue", "pull"] | None = None,
-        records: list[dict[str, Any]] | None = None,
-        artifacts: list[str] | None = None,
+        records: list[HistoryRecord] | None = None,
+        artifacts: list[HistoryArtifact] | None = None,
         source: str | None = None,
         fetched_at: str | None = None,
         full_history_complete: bool | None = None,
@@ -288,19 +294,20 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
         action: Literal[
             "initialize", "refresh", "status", "program", "record_declared", "record_context"
         ],
-        programs: list[dict[str, Any]] | None = None,
+        programs: list[ProgramProbe] | None = None,
         request_id: str | None = None,
-        value: dict[str, Any] | None = None,
+        facts: dict[str, Any] | None = None,
+        fact: InventoryContextFact | None = None,
     ) -> dict[str, Any]:
         """Manage audit inventory; pass program probes together in `programs`."""
         return _request_call(runtime.audit_inventory, InventoryRequest, **locals())
 
     @mcp.tool(annotations=LOCAL_WRITE, structured_output=True)
     def audit_knowledge(
-        action: Literal["status", "reconcile", "update", "context", "show"],
+        action: Literal["reconcile", "update", "context", "show"],
         area: str | None = None,
-        areas: list[dict[str, Any]] | None = None,
-        findings: list[dict[str, Any]] | None = None,
+        areas: list[AreaDefinition] | None = None,
+        findings: list[KnowledgeFinding] | None = None,
         versions: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Manage area knowledge with server-derived identities and fingerprints."""
@@ -310,6 +317,7 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
     def audit_probe(
         kind: Literal["pytest", "python"],
         probe_id: str,
+        candidate_id: str | None = None,
         selectors: list[str] | None = None,
         code: str | None = None,
     ) -> dict[str, Any]:
@@ -322,16 +330,21 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
             "phase",
             "shard",
             "candidate",
-            "validation",
             "verdict",
             "limitation",
             "pending",
             "head_drift",
-            "metrics",
             "supervisor_start",
             "supervisor_finish",
         ],
-        value: dict[str, Any] | None = None,
+        phase: PhaseRecord | None = None,
+        shard: ShardRecordValue | None = None,
+        candidate: CandidateRecordValue | None = None,
+        verdict: VerdictRecordValue | None = None,
+        limitation: str | None = None,
+        pending: list[str] | None = None,
+        head_drift: dict[str, Any] | None = None,
+        activity: SupervisorActivityValue | None = None,
     ) -> dict[str, Any]:
         """Record one typed audit fact or supervisor activity."""
         return _request_call(runtime.audit_record, AuditRecordRequest, **locals())
@@ -346,9 +359,9 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
         """Persist publication intent and record its GitHub receipt."""
         return _request_call(runtime.audit_publish, PublishRequest, **locals())
 
-    @mcp.tool(annotations=READ_ONLY, structured_output=True)
+    @mcp.tool(annotations=LOCAL_WRITE, structured_output=True)
     def audit_metrics() -> dict[str, Any]:
-        """Summarize task, timing, documentation, validation, and mutation telemetry."""
+        """Summarize and persist task, timing, validation, and mutation telemetry."""
         return _public_call(runtime.audit_metrics)
 
     return mcp

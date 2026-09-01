@@ -15,7 +15,12 @@ from mcp import Client
 from pydantic import ValidationError
 
 from github_workflows.mcp_server import _validation_issues, create_server
-from github_workflows.models import KnowledgeRequest, RunManageRequest, TaskManageRequest
+from github_workflows.models import (
+    AuditRecordRequest,
+    KnowledgeRequest,
+    RunManageRequest,
+    TaskManageRequest,
+)
 from github_workflows.runtime import WorkflowRuntime
 
 ROOT = Path(__file__).parents[1]
@@ -83,6 +88,17 @@ class TestExtensionMcp:
                     properties = tools[name].input_schema["properties"]
                     assert ("action" if name != "audit_probe" else "kind") in properties
                     assert "request" not in properties
+                assert "task" in tools["task_manage"].input_schema["properties"]
+                history_properties = tools["history_manage"].input_schema["properties"]
+                assert "records" in history_properties
+                assert "artifacts" in history_properties
+                inventory_properties = tools["audit_inventory"].input_schema["properties"]
+                assert "facts" in inventory_properties
+                assert "fact" in inventory_properties
+                audit_record_properties = tools["audit_record"].input_schema["properties"]
+                assert "candidate" in audit_record_properties
+                assert "phase" in audit_record_properties
+                assert "value" not in audit_record_properties
                 with pytest.raises(ValueError, match="Extra inputs are not permitted"):
                     RunManageRequest.model_validate(
                         {
@@ -101,7 +117,7 @@ class TestExtensionMcp:
                 assert audit_request.invocation()["instructions"] == (
                     "Prioritize public CLI behavior"
                 )
-                KnowledgeRequest.model_validate({"action": "status"})
+                KnowledgeRequest.model_validate({"action": "show"})
                 knowledge_request = KnowledgeRequest.model_validate(
                     {
                         "action": "reconcile",
@@ -118,20 +134,6 @@ class TestExtensionMcp:
                 assert knowledge_request.areas[0].boundaries == ["Owns the core runtime"]
                 assert knowledge_request.areas[0].area == "area/core"
                 assert knowledge_request.areas[0].title == "Core"
-                legacy_area = KnowledgeRequest.model_validate(
-                    {
-                        "action": "reconcile",
-                        "areas": [
-                            {
-                                "id": "area/legacy",
-                                "description": "Legacy input",
-                                "paths": [],
-                                "fingerprint": "ignored",
-                            }
-                        ],
-                    }
-                )
-                assert legacy_area.areas[0].area == "area/legacy"
                 invalid_area = {
                     "area": "area/core",
                     "description": "Core behavior",
@@ -166,26 +168,50 @@ class TestExtensionMcp:
                     {
                         "action": "plan",
                         "workflow": "gh-curate-issues",
-                        "task_id": "issue-12-1",
-                        "logical_id": "issue-12",
-                        "role": "curate",
-                        "unit": "issue/12",
-                        "assignment": {
-                            "issue": 12,
-                            "source_kind": "python-library",
-                            "accepted_scope": "Normalize the public API issue",
+                        "task": {
+                            "logical_id": "issue-12",
+                            "role": "curate",
+                            "unit": "issue/12",
+                            "assignment": {
+                                "issue": 12,
+                                "source_kind": "python-library",
+                                "accepted_scope": "Normalize the public API issue",
+                            },
                         },
                     },
                 )
                 assert not planned.is_error
+                task_id = planned.structured_content["task_id"]
                 task_ref = planned.structured_content["task_ref"]
                 assert task_ref.startswith("gh-curate-issues:")
+                revised = await client.call_tool(
+                    "task_manage",
+                    {
+                        "action": "plan",
+                        "workflow": "gh-curate-issues",
+                        "task": {
+                            "logical_id": "issue-12",
+                            "role": "curate",
+                            "unit": "issue/12",
+                            "assignment": {
+                                "issue": 12,
+                                "source_kind": "python-library",
+                                "accepted_scope": "Revised scope",
+                            },
+                        },
+                    },
+                )
+                assert revised.structured_content["task_id"] == task_id
+                revised_context = await client.call_tool("task_context", {"task_ref": task_ref})
+                assert revised_context.structured_content["assignment"]["accepted_scope"] == (
+                    "Revised scope"
+                )
                 await client.call_tool(
                     "task_manage",
                     {
-                        "action": "dispatch",
+                        "action": "mark_running",
                         "workflow": "gh-curate-issues",
-                        "task_id": "issue-12-1",
+                        "task_id": task_id,
                     },
                 )
                 context = await client.call_tool("task_context", {"task_ref": task_ref})
@@ -205,31 +231,31 @@ class TestExtensionMcp:
                 await client.call_tool(
                     "task_manage",
                     {
-                        "action": "report",
+                        "action": "complete",
                         "workflow": "gh-curate-issues",
-                        "task_id": "issue-12-1",
+                        "task_id": task_id,
                         "report": {"disposition": "no-change"},
                     },
                 )
                 await client.call_tool(
                     "task_manage",
                     {
-                        "action": "integrate_start",
+                        "action": "integration_begin",
                         "workflow": "gh-curate-issues",
-                        "task_id": "issue-12-1",
+                        "task_id": task_id,
                     },
                 )
                 await client.call_tool(
                     "task_manage",
                     {
-                        "action": "integrate_finish",
+                        "action": "integration_end",
                         "workflow": "gh-curate-issues",
-                        "task_id": "issue-12-1",
+                        "task_id": task_id,
                     },
                 )
                 status = await client.call_tool("run_status", {"workflow": "gh-curate-issues"})
-                assert status.structured_content["tasks"]["issue-12-1"]["integrated"]
-                assert status.structured_content["tasks"]["issue-12-1"]["task_ref"] == task_ref
+                assert status.structured_content["tasks"][task_id]["integrated"]
+                assert status.structured_content["tasks"][task_id]["task_ref"] == task_ref
                 finished = await client.call_tool(
                     "run_manage",
                     {
@@ -334,9 +360,7 @@ class TestExtensionMcp:
                     TaskManageRequest(
                         action="plan",
                         workflow=workflow,
-                        task_id="issue-12-1",
-                        logical_id="issue-12",
-                        assignment={"issue": 12},
+                        task={"logical_id": "issue-12", "assignment": {"issue": 12}},
                     )
                 )
                 references[workflow] = receipt["task_ref"]
@@ -380,9 +404,10 @@ class TestExtensionMcp:
                     TaskManageRequest(
                         action="plan",
                         workflow=workflow,
-                        task_id=task_id,
-                        logical_id=task_id.rsplit("-", 1)[0],
-                        assignment={"issue": task_id},
+                        task={
+                            "logical_id": task_id.rsplit("-", 1)[0],
+                            "assignment": {"issue": task_id},
+                        },
                     )
                 )
 
@@ -393,7 +418,7 @@ class TestExtensionMcp:
             assert runtime.state(workflow)["status"] == "in-progress"
             runtime.task_manage(
                 TaskManageRequest(
-                    action="dispatch",
+                    action="mark_running",
                     workflow=workflow,
                     task_id="issue-1-1",
                 )
@@ -402,7 +427,7 @@ class TestExtensionMcp:
             with pytest.raises(ValueError, match="concurrency is saturated"):
                 runtime.task_manage(
                     TaskManageRequest(
-                        action="dispatch",
+                        action="mark_running",
                         workflow=workflow,
                         task_id="issue-2-1",
                     )
@@ -411,7 +436,7 @@ class TestExtensionMcp:
 
             runtime.task_manage(
                 TaskManageRequest(
-                    action="report",
+                    action="complete",
                     workflow=workflow,
                     task_id="issue-1-1",
                     report={"disposition": "complete"},
@@ -420,7 +445,7 @@ class TestExtensionMcp:
             with pytest.raises(ValueError, match="concurrency is saturated"):
                 runtime.task_manage(
                     TaskManageRequest(
-                        action="dispatch",
+                        action="mark_running",
                         workflow=workflow,
                         task_id="issue-2-1",
                     )
@@ -430,7 +455,7 @@ class TestExtensionMcp:
 
             runtime.task_manage(
                 TaskManageRequest(
-                    action="integrate_start",
+                    action="integration_begin",
                     workflow=workflow,
                     task_id="issue-1-1",
                 )
@@ -441,7 +466,7 @@ class TestExtensionMcp:
             with pytest.raises(ValueError, match="concurrency is saturated"):
                 runtime.task_manage(
                     TaskManageRequest(
-                        action="dispatch",
+                        action="mark_running",
                         workflow=workflow,
                         task_id="issue-2-1",
                     )
@@ -451,14 +476,14 @@ class TestExtensionMcp:
 
             runtime.task_manage(
                 TaskManageRequest(
-                    action="integrate_finish",
+                    action="integration_end",
                     workflow=workflow,
                     task_id="issue-1-1",
                 )
             )
             dispatched = runtime.task_manage(
                 TaskManageRequest(
-                    action="dispatch",
+                    action="mark_running",
                     workflow=workflow,
                     task_id="issue-2-1",
                 )
@@ -475,14 +500,14 @@ class TestExtensionMcp:
                 runtime.run_manage(RunManageRequest(action="finish", workflow=workflow))
             runtime.task_manage(
                 TaskManageRequest(
-                    action="dispatch",
+                    action="mark_running",
                     workflow=workflow,
                     task_id="issue-2-1",
                 )
             )
             runtime.task_manage(
                 TaskManageRequest(
-                    action="report",
+                    action="complete",
                     workflow=workflow,
                     task_id="issue-2-1",
                     report={"disposition": "complete"},
@@ -490,14 +515,14 @@ class TestExtensionMcp:
             )
             runtime.task_manage(
                 TaskManageRequest(
-                    action="integrate_start",
+                    action="integration_begin",
                     workflow=workflow,
                     task_id="issue-2-1",
                 )
             )
             runtime.task_manage(
                 TaskManageRequest(
-                    action="integrate_finish",
+                    action="integration_end",
                     workflow=workflow,
                     task_id="issue-2-1",
                 )
@@ -524,21 +549,20 @@ class TestExtensionMcp:
                 TaskManageRequest(
                     action="plan",
                     workflow=workflow,
-                    task_id="unit-1-1",
-                    logical_id="unit-1",
+                    task={"logical_id": "unit-1"},
                 )
             )
             runtime.task_manage(
-                TaskManageRequest(action="dispatch", workflow=workflow, task_id="unit-1-1")
+                TaskManageRequest(action="mark_running", workflow=workflow, task_id="unit-1-1")
             )
             runtime.task_manage(
                 TaskManageRequest(action="fail", workflow=workflow, task_id="unit-1-1")
             )
             runtime.task_manage(
-                TaskManageRequest(action="integrate_start", workflow=workflow, task_id="unit-1-1")
+                TaskManageRequest(action="integration_begin", workflow=workflow, task_id="unit-1-1")
             )
             runtime.task_manage(
-                TaskManageRequest(action="integrate_finish", workflow=workflow, task_id="unit-1-1")
+                TaskManageRequest(action="integration_end", workflow=workflow, task_id="unit-1-1")
             )
             assert runtime.run_status(workflow)["scheduler"]["next_action"] == "retry-required-task"
             with pytest.raises(ValueError, match="required logical tasks"):
@@ -553,21 +577,21 @@ class TestExtensionMcp:
             )
             assert retry["task_id"] == "unit-1-2"
             runtime.task_manage(
-                TaskManageRequest(action="dispatch", workflow=workflow, task_id="unit-1-2")
+                TaskManageRequest(action="mark_running", workflow=workflow, task_id="unit-1-2")
             )
             runtime.task_manage(
                 TaskManageRequest(
-                    action="report",
+                    action="complete",
                     workflow=workflow,
                     task_id="unit-1-2",
                     report={"status": "complete"},
                 )
             )
             runtime.task_manage(
-                TaskManageRequest(action="integrate_start", workflow=workflow, task_id="unit-1-2")
+                TaskManageRequest(action="integration_begin", workflow=workflow, task_id="unit-1-2")
             )
             runtime.task_manage(
-                TaskManageRequest(action="integrate_finish", workflow=workflow, task_id="unit-1-2")
+                TaskManageRequest(action="integration_end", workflow=workflow, task_id="unit-1-2")
             )
             assert (
                 runtime.run_manage(RunManageRequest(action="finish", workflow=workflow))["status"]
@@ -578,7 +602,7 @@ class TestExtensionMcp:
                     TaskManageRequest(
                         action="plan",
                         workflow=workflow,
-                        task_id="late-task",
+                        task={"logical_id": "late-task"},
                     )
                 )
 
@@ -594,24 +618,22 @@ class TestExtensionMcp:
                 TaskManageRequest(
                     action="plan",
                     workflow=workflow,
-                    task_id="optional-1",
-                    logical_id="optional",
-                    required=False,
+                    task={"logical_id": "optional", "required": False},
                 )
             )
             runtime.task_manage(
-                TaskManageRequest(action="dispatch", workflow=workflow, task_id="optional-1")
+                TaskManageRequest(action="mark_running", workflow=workflow, task_id="optional-1")
             )
             runtime.task_manage(
                 TaskManageRequest(action="fail", workflow=workflow, task_id="optional-1")
             )
             runtime.task_manage(
-                TaskManageRequest(action="integrate_start", workflow=workflow, task_id="optional-1")
+                TaskManageRequest(
+                    action="integration_begin", workflow=workflow, task_id="optional-1"
+                )
             )
             runtime.task_manage(
-                TaskManageRequest(
-                    action="integrate_finish", workflow=workflow, task_id="optional-1"
-                )
+                TaskManageRequest(action="integration_end", workflow=workflow, task_id="optional-1")
             )
             assert (
                 runtime.run_manage(RunManageRequest(action="finish", workflow=workflow))["status"]
@@ -750,19 +772,26 @@ class TestExtensionMcp:
                     {
                         "action": "ingest",
                         "workflow": "gh-audit-repo",
-                        "kind": "issue",
                         "records": [
                             {
+                                "kind": "issue",
                                 "number": 1,
                                 "state": "open",
                                 "title": "Cached issue",
                                 "body": "Body",
                                 "updated_at": "2026-08-31T00:00:00Z",
-                            }
+                            },
+                            {
+                                "kind": "pull",
+                                "number": 3,
+                                "state": "merged",
+                                "title": "Cached pull request",
+                            },
                         ],
                     },
                 )
-                assert ingested.structured_content["history"]["record_count"] == 1
+                assert ingested.structured_content["accepted"] == 2
+                assert ingested.structured_content["history"]["record_count"] == 2
                 qwen_home = root / "qwen-home"
                 artifact_dir = qwen_home / "tmp" / "session-1" / "tool-results"
                 artifact_dir.mkdir(parents=True)
@@ -790,12 +819,11 @@ class TestExtensionMcp:
                         {
                             "action": "ingest",
                             "workflow": "gh-audit-repo",
-                            "kind": "issue",
-                            "artifacts": [str(artifact)],
+                            "artifacts": [{"kind": "issue", "path": str(artifact)}],
                         },
                     )
                 assert artifact_ingested.structured_content["accepted"] == 1
-                assert artifact_ingested.structured_content["history"]["record_count"] == 2
+                assert artifact_ingested.structured_content["history"]["record_count"] == 3
                 assert "Large body" not in json.dumps(artifact_ingested.structured_content)
                 assert "Large body" not in json.dumps(runtime.state("gh-audit-repo"))
                 journal = runtime.current("gh-audit-repo") / "journal.jsonl"
@@ -837,7 +865,7 @@ class TestExtensionMcp:
                 summary = history_status.structured_content["history"]
                 assert summary["cache_source"] == "committed"
                 assert summary["generation"] == 1
-                assert summary["record_count"] == 2
+                assert summary["record_count"] == 3
                 assert summary["full_history_complete"]
                 assert summary["last_sync_at"]
                 assert summary["default_sha"] == state["sha"]
@@ -866,20 +894,26 @@ class TestExtensionMcp:
                 )
                 assert inherited_status.structured_content["history"]["full_history_complete"]
 
-                probe_id = "probe-mcp-1"
-                result = runtime.current("gh-audit-repo") / "validation" / probe_id / "result.json"
-                result.parent.mkdir()
-                result.write_text('{"probe_status":"succeeded"}\n', encoding="utf-8")
-                recorded = await client.call_tool(
-                    "audit_record",
+                candidate_id = "candidate-mcp-1"
+                runtime.audit_record(
+                    AuditRecordRequest(
+                        action="candidate",
+                        candidate={"id": candidate_id, "status": "discovered"},
+                    )
+                )
+                probed = await client.call_tool(
+                    "audit_probe",
                     {
-                        "action": "validation",
-                        "value": {"id": probe_id, "probe_id": probe_id, "status": "succeeded"},
+                        "kind": "python",
+                        "probe_id": "probe-mcp-1",
+                        "candidate_id": candidate_id,
+                        "code": "print('ok')",
                     },
                 )
-                assert not recorded.is_error
-                validation = runtime.state("gh-audit-repo")["validations"][probe_id]
-                assert Path(validation["artifact"]) == result.resolve()
+                assert not probed.is_error
+                validation = runtime.state("gh-audit-repo")["validations"]["probe-mcp-1"]
+                assert validation["candidate_id"] == candidate_id
+                assert validation["status"] == "succeeded"
 
     def test_manifest_and_launcher_are_contained(self) -> None:
         manifest = json.loads((EXTENSION / "qwen-extension.json").read_text(encoding="utf-8"))

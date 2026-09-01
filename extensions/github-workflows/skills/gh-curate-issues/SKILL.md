@@ -151,9 +151,10 @@ refresh once, and retry. A second conflict blocks GitHub mutation and is
 reported. Treat abandoned staging files as non-locking artifacts.
 
 When a GitHub MCP response reports `<persisted-output>`, pass every reported
-tool-result path directly in the `artifacts` list of a `history_manage` ingest
+tool-result path as a typed `{kind, path}` entry in the `artifacts` list of a `history_manage` ingest
 call. Never read, copy, split, summarize, or re-transcribe those files for
-ingestion. Use inline `records` only for results that remained inline, with at most
+ingestion. Use inline `records` only for results that remained inline; each
+record carries its own `kind`, with at most
 100 compact records per call; never provide `records` and `artifacts` together.
 Keep explicit-link sets as compact inline data. On first use or automatic
 recovery, import a valid legacy
@@ -205,7 +206,8 @@ decision requiring current-code proof to `/gh-audit-repo` or
 ## Stage 2: run one complete report per issue
 
 Register one complete assignment per issue with
-`mcp__github_workflows__task_manage`, then queue exactly one fresh-context
+`mcp__github_workflows__task_manage` using action `plan` and a typed `task`.
+Use its returned server-generated task ID and task reference, then queue exactly one fresh-context
 `gh-curate-issues-worker` for every selected issue. Each worker receives only:
 
 ```text

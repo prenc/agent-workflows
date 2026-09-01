@@ -258,7 +258,8 @@ an existing PR, remove `ready-to-merge`, apply PR `in-progress`, and preserve
 ## Stage 4: run bounded implementation rounds
 
 Register the complete round assignment with
-`mcp__github_workflows__task_manage`, then launch
+`mcp__github_workflows__task_manage` using action `plan` and a typed `task`.
+Use its returned server-generated task ID and task reference, then launch
 `gh-implement-issue-worker` with fresh context and:
 
 ```text

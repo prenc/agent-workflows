@@ -161,38 +161,39 @@ class RunManageRequest(StrictRequest):
         return values
 
 
-class TaskPlanRequest(StrictRequest):
-    action: Literal["plan"]
-    workflow: WorkflowName = "gh-audit-repo"
-    task_id: str
-    logical_id: str | None = None
-    agent_id: str | None = None
-    role: str | None = None
+class TaskPlan(StrictRequest):
+    """One logical worker assignment; attempt identity is server-owned."""
+
+    logical_id: str
+    role: str = "worker"
     unit: str | None = None
     assignment: dict[str, Any] = Field(default_factory=dict)
     required: bool = True
+
+
+class TaskPlanRequest(StrictRequest):
+    action: Literal["plan"]
+    workflow: WorkflowName = "gh-audit-repo"
+    task: TaskPlan
 
 
 class TaskRetryRequest(StrictRequest):
     action: Literal["retry"]
     workflow: WorkflowName = "gh-audit-repo"
     task_id: str
-    agent_id: str | None = None
-    role: str | None = None
-    unit: str | None = None
-    assignment: dict[str, Any] = Field(default_factory=dict)
-    required: bool = True
+    task: TaskPlan | None = None
+    note: str | None = None
 
 
 class TaskTransitionRequest(StrictRequest):
-    action: Literal["dispatch", "checkpoint", "fail", "abandon"]
+    action: Literal["mark_running", "checkpoint", "fail", "abandon"]
     workflow: WorkflowName = "gh-audit-repo"
     task_id: str
     note: str | None = None
 
 
 class TaskReportRequest(StrictRequest):
-    action: Literal["report"]
+    action: Literal["complete"]
     workflow: WorkflowName = "gh-audit-repo"
     task_id: str
     report: dict[str, Any] = Field(
@@ -202,9 +203,10 @@ class TaskReportRequest(StrictRequest):
 
 
 class TaskIntegrationRequest(StrictRequest):
-    action: Literal["integrate_start", "integrate_finish"]
+    action: Literal["integration_begin", "integration_end"]
     workflow: WorkflowName = "gh-audit-repo"
     task_id: str
+    note: str | None = None
 
 
 TaskAction = Annotated[
@@ -224,6 +226,7 @@ class TaskManageRequest(ActionRequest, RootModel[TaskAction]):
 class HistoryRecord(ExtensibleRecord):
     """Compact issue or pull-request metadata returned by the GitHub MCP server."""
 
+    kind: Literal["issue", "pull"]
     number: int
     state: str = "unknown"
     title: str = ""
@@ -239,6 +242,11 @@ class HistoryRecord(ExtensibleRecord):
     head_sha: str | None = None
 
 
+class HistoryArtifact(StrictRequest):
+    kind: Literal["issue", "pull"]
+    path: str
+
+
 class HistoryPrepareRequest(StrictRequest):
     action: Literal["prepare"]
     workflow: WorkflowName = "gh-audit-repo"
@@ -252,9 +260,8 @@ class HistoryStatusRequest(StrictRequest):
 class HistoryIngestRequest(StrictRequest):
     action: Literal["ingest"]
     workflow: WorkflowName = "gh-audit-repo"
-    kind: Literal["issue", "pull"]
     records: list[HistoryRecord] = Field(default_factory=list, max_length=100)
-    artifacts: list[str] = Field(default_factory=list, max_length=100)
+    artifacts: list[HistoryArtifact] = Field(default_factory=list, max_length=100)
     source: str = "github-mcp"
     fetched_at: str | None = None
 
@@ -325,15 +332,23 @@ class InventoryProgramRequest(StrictRequest):
 
 class InventoryDeclaredRequest(StrictRequest):
     action: Literal["record_declared"]
-    value: dict[str, Any] = Field(
+    facts: dict[str, Any] = Field(
         description="Declared versions, constraints, and configuration facts."
     )
 
 
+class InventoryContextFact(ExtensibleRecord):
+    kind: str
+    name: str
+    detail: str
+    observed: str | None = None
+    disposition: Literal["confirmed", "disproved", "unavailable"] | None = None
+
+
 class InventoryContextRequest(StrictRequest):
     action: Literal["record_context"]
-    request_id: str
-    value: dict[str, Any] = Field(description="Resolved documentation or capability fact.")
+    request_id: str | None = None
+    fact: InventoryContextFact
 
 
 InventoryAction = Annotated[
@@ -359,7 +374,7 @@ BoundaryList = Annotated[
 ]
 
 
-class AreaDefinition(ExtensibleRecord):
+class AreaDefinition(StrictRequest):
     area: str = Field(description="Canonical area/<slug> identifier.")
     title: str | None = None
     description: str
@@ -367,31 +382,13 @@ class AreaDefinition(ExtensibleRecord):
     entrypoints: list[str] = Field(default_factory=list)
     boundaries: BoundaryList = Field(default_factory=list)
 
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_identity(cls, value: Any) -> Any:
-        if not isinstance(value, dict):
-            return value
-        normalized = dict(value)
-        area = normalized.get("area")
-        legacy_id = normalized.pop("id", None)
-        normalized.pop("fingerprint", None)
-        if area and legacy_id and area != legacy_id:
-            raise ValueError("area and legacy id must match")
-        inferred = area or legacy_id
-        title = normalized.get("title")
-        if inferred is None and isinstance(title, str) and title.startswith("area/"):
-            inferred = title
-            title = None
-        if inferred is None:
-            return normalized
-        normalized["area"] = inferred
-        if title == inferred:
-            title = None
-        if not title:
-            title = inferred.removeprefix("area/").replace("-", " ").replace("_", " ").capitalize()
-        normalized["title"] = title
-        return normalized
+    @model_validator(mode="after")
+    def derive_title(self) -> AreaDefinition:
+        if not self.title:
+            self.title = (
+                self.area.removeprefix("area/").replace("-", " ").replace("_", " ").capitalize()
+            )
+        return self
 
 
 class KnowledgeShowRequest(StrictRequest):
@@ -399,13 +396,21 @@ class KnowledgeShowRequest(StrictRequest):
     area: str | None = None
 
 
-class KnowledgeStatusRequest(StrictRequest):
-    action: Literal["status"]
-
-
 class KnowledgeReconcileRequest(StrictRequest):
     action: Literal["reconcile"]
     areas: list[AreaDefinition]
+
+
+class KnowledgeFinding(StrictRequest):
+    title: str
+    question: str
+    kind: str
+    method: str
+    observed_result: str
+    conclusion: str
+    disposition: Literal["confirmed", "disproved"]
+    evidence_paths: list[str] = Field(default_factory=list)
+    dependencies: dict[str, str] = Field(default_factory=dict)
 
 
 class KnowledgeContextRequest(StrictRequest):
@@ -417,12 +422,11 @@ class KnowledgeContextRequest(StrictRequest):
 class KnowledgeUpdateRequest(StrictRequest):
     action: Literal["update"]
     area: str
-    findings: list[dict[str, Any]]
+    findings: list[KnowledgeFinding]
 
 
 KnowledgeAction = Annotated[
     KnowledgeShowRequest
-    | KnowledgeStatusRequest
     | KnowledgeReconcileRequest
     | KnowledgeContextRequest
     | KnowledgeUpdateRequest,
@@ -437,12 +441,14 @@ class KnowledgeRequest(ActionRequest, RootModel[KnowledgeAction]):
 class PytestProbeRequest(StrictRequest):
     kind: Literal["pytest"]
     probe_id: str
+    candidate_id: str | None = None
     selectors: list[str] = Field(min_length=1)
 
 
 class PythonProbeRequest(StrictRequest):
     kind: Literal["python"]
     probe_id: str
+    candidate_id: str | None = None
     code: str = Field(min_length=1)
 
 
@@ -453,9 +459,30 @@ class ProbeRequest(ActionRequest, RootModel[ProbeAction]):
     """Run one bounded probe with kind-specific required inputs."""
 
 
-class PhaseRecordValue(StrictRequest):
-    phase: Literal["source", "history", "structure", "discovery", "verification", "publication"]
-    value: dict[str, Any] = Field(description="Phase details including required lifecycle status.")
+PhaseName = Literal["source", "history", "structure", "discovery", "verification", "publication"]
+PhaseStatus = Literal["pending", "in-progress", "complete", "skipped", "partial", "failed"]
+ShardStatus = Literal["pending", "running", "partial", "complete", "skipped", "failed"]
+CandidateStatus = Literal[
+    "discovered",
+    "consolidated",
+    "validation-pending",
+    "verification-pending",
+    "verified",
+    "published",
+    "updated",
+    "no-op",
+    "closed",
+    "protected",
+    "duplicate",
+    "rejected",
+    "dry-run",
+]
+
+
+class PhaseRecord(StrictRequest):
+    name: PhaseName
+    status: PhaseStatus
+    summary: dict[str, Any] = Field(default_factory=dict)
 
 
 class IdentifiedAuditValue(ExtensibleRecord):
@@ -464,18 +491,12 @@ class IdentifiedAuditValue(ExtensibleRecord):
 
 class ShardRecordValue(IdentifiedAuditValue):
     area: str
-    status: Literal["pending", "running", "partial", "complete", "skipped", "failed"]
+    status: ShardStatus
+    paths: list[str] = Field(default_factory=list)
 
 
 class CandidateRecordValue(IdentifiedAuditValue):
-    status: str
-
-
-class ValidationRecordValue(IdentifiedAuditValue):
-    status: str
-    probe_id: str | None = None
-    candidate_id: str | None = None
-    artifact: str | None = None
+    status: CandidateStatus
 
 
 class VerdictRecordValue(IdentifiedAuditValue):
@@ -484,50 +505,37 @@ class VerdictRecordValue(IdentifiedAuditValue):
 
 class AuditPhaseRequest(StrictRequest):
     action: Literal["phase"]
-    value: PhaseRecordValue
+    phase: PhaseRecord
 
 
 class AuditShardRequest(StrictRequest):
     action: Literal["shard"]
-    value: ShardRecordValue
+    shard: ShardRecordValue
 
 
 class AuditCandidateRequest(StrictRequest):
     action: Literal["candidate"]
-    value: CandidateRecordValue
-
-
-class AuditValidationRequest(StrictRequest):
-    action: Literal["validation"]
-    value: ValidationRecordValue
+    candidate: CandidateRecordValue
 
 
 class AuditVerdictRequest(StrictRequest):
     action: Literal["verdict"]
-    value: VerdictRecordValue
-
-
-class LimitationValue(StrictRequest):
-    limitation: str = Field(min_length=1)
+    verdict: VerdictRecordValue
 
 
 class AuditLimitationRequest(StrictRequest):
     action: Literal["limitation"]
-    value: LimitationValue
-
-
-class PendingValue(StrictRequest):
-    pending: list[str]
+    limitation: str = Field(min_length=1)
 
 
 class AuditPendingRequest(StrictRequest):
     action: Literal["pending"]
-    value: PendingValue
+    pending: list[str]
 
 
 class AuditObjectRequest(StrictRequest):
-    action: Literal["head_drift", "metrics"]
-    value: dict[str, Any]
+    action: Literal["head_drift"]
+    head_drift: dict[str, Any]
 
 
 class SupervisorActivityValue(StrictRequest):
@@ -537,19 +545,17 @@ class SupervisorActivityValue(StrictRequest):
 
 class AuditSupervisorStartRequest(StrictRequest):
     action: Literal["supervisor_start"]
-    value: SupervisorActivityValue
+    activity: SupervisorActivityValue
 
 
 class AuditSupervisorFinishRequest(StrictRequest):
     action: Literal["supervisor_finish"]
-    value: dict[str, Any] = Field(default_factory=dict, max_length=0)
 
 
 AuditRecordAction = Annotated[
     AuditPhaseRequest
     | AuditShardRequest
     | AuditCandidateRequest
-    | AuditValidationRequest
     | AuditVerdictRequest
     | AuditLimitationRequest
     | AuditPendingRequest

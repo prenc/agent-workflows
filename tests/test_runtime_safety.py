@@ -27,6 +27,20 @@ EXTENSION = ROOT / "extensions/github-workflows"
 
 
 class TestRuntimeSafety:
+    @pytest.mark.parametrize(
+        ("result", "expected"),
+        [
+            ({"probe_status": "unavailable"}, "unavailable"),
+            ({"returncode": 0, "timed_out": False}, "succeeded"),
+            ({"returncode": 7, "timed_out": False}, "failed"),
+            ({"returncode": -15, "timed_out": True}, "timed-out"),
+        ],
+    )
+    def test_probe_validation_status_reflects_execution(
+        self, result: dict[str, object], expected: str
+    ) -> None:
+        assert WorkflowRuntime._probe_validation_status(result) == expected
+
     def make_runtime(self, root: Path) -> WorkflowRuntime:
         workspace = root / "repo"
         workspace.mkdir()
@@ -57,13 +71,16 @@ class TestRuntimeSafety:
                 RunManageRequest,
                 {"action": "start", "workflow": "gh-curate-issues", "repository": "x/y"},
             ),
-            (TaskManageRequest, {"action": "plan", "task_id": "task-1"}),
+            (TaskManageRequest, {"action": "plan", "task": {"logical_id": "task"}}),
             (HistoryManageRequest, {"action": "prepare"}),
             (HistoryQueryRequest, {}),
             (InventoryRequest, {"action": "status"}),
             (KnowledgeRequest, {"action": "show"}),
-            (ProbeRequest, {"kind": "python", "probe_id": "probe-1"}),
-            (AuditRecordRequest, {"action": "metrics"}),
+            (ProbeRequest, {"kind": "python", "probe_id": "probe-1", "code": "pass"}),
+            (
+                AuditRecordRequest,
+                {"action": "phase", "phase": {"name": "structure", "status": "complete"}},
+            ),
             (PublishRequest, {"action": "begin", "candidate_id": "C-1", "mutation": "create"}),
         ]
         for model, payload in cases:
@@ -100,19 +117,17 @@ class TestRuntimeSafety:
 
     def test_history_ingest_requires_one_bounded_input(self) -> None:
         with pytest.raises(ValidationError, match="exactly one"):
-            HistoryManageRequest(action="ingest", kind="issue")
+            HistoryManageRequest(action="ingest")
         with pytest.raises(ValidationError, match="exactly one"):
             HistoryManageRequest(
                 action="ingest",
-                kind="issue",
-                records=[{"number": 1}],
-                artifacts=["artifact.json"],
+                records=[{"kind": "issue", "number": 1}],
+                artifacts=[{"kind": "issue", "path": "artifact.json"}],
             )
         with pytest.raises(ValidationError):
             HistoryManageRequest(
                 action="ingest",
-                kind="issue",
-                records=[{"number": number} for number in range(101)],
+                records=[{"kind": "issue", "number": number} for number in range(101)],
             )
 
     def test_history_artifacts_are_bounded_qwen_tool_results(self) -> None:
@@ -172,21 +187,13 @@ class TestRuntimeSafety:
             runtime.audit_record(
                 AuditRecordRequest(
                     action="supervisor_start",
-                    value={"kind": "history-sync"},
+                    activity={"kind": "history-sync"},
                 )
             )
-            runtime.audit_record(
-                AuditRecordRequest(
-                    action="supervisor_finish",
-                    value={},
-                )
-            )
+            runtime.audit_record(AuditRecordRequest(action="supervisor_finish"))
             assert runtime.state("gh-audit-repo")["scheduler"]["supervisor_activity"] is None
             with pytest.raises(ValidationError):
-                AuditRecordRequest(
-                    action="supervisor_finish",
-                    value={"unexpected": True},
-                )
+                AuditRecordRequest(action="supervisor_finish", unexpected=True)
 
     def test_run_lifecycle_cannot_be_bypassed_by_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-lifecycle-") as directory:
@@ -228,29 +235,27 @@ class TestRuntimeSafety:
                 TaskManageRequest(
                     action="plan",
                     workflow=workflow,
-                    task_id="foo-1",
-                    logical_id="foo",
+                    task={"logical_id": "foo"},
                 )
             )
             runtime.task_manage(
                 TaskManageRequest(
                     action="plan",
                     workflow=workflow,
-                    task_id="foo-2",
-                    logical_id="unrelated",
+                    task={"logical_id": "unrelated"},
                 )
             )
             runtime.task_manage(
-                TaskManageRequest(action="dispatch", workflow=workflow, task_id="foo-1")
+                TaskManageRequest(action="mark_running", workflow=workflow, task_id="foo-1")
             )
             runtime.task_manage(
                 TaskManageRequest(action="fail", workflow=workflow, task_id="foo-1")
             )
-            with pytest.raises(ValueError, match="task already exists"):
-                runtime.task_manage(
-                    TaskManageRequest(action="retry", workflow=workflow, task_id="foo-1")
-                )
-            assert runtime.state(workflow)["tasks"]["foo-2"]["logical_id"] == "unrelated"
+            retry = runtime.task_manage(
+                TaskManageRequest(action="retry", workflow=workflow, task_id="foo-1")
+            )
+            assert retry["task_id"] == "foo-2"
+            assert runtime.state(workflow)["tasks"]["unrelated-1"]["logical_id"] == "unrelated"
 
             second = WorkflowRuntime(runtime.workspace, Path(directory) / "qwen-concurrency")
             second.run_manage(
@@ -266,12 +271,12 @@ class TestRuntimeSafety:
                     TaskManageRequest(
                         action="plan",
                         workflow=workflow,
-                        task_id=task_id,
+                        task={"logical_id": task_id.rsplit("-", 1)[0]},
                     )
                 )
             second.task_manage(
                 TaskManageRequest(
-                    action="dispatch",
+                    action="mark_running",
                     workflow=workflow,
                     task_id="running-1",
                 )
@@ -286,7 +291,7 @@ class TestRuntimeSafety:
             with pytest.raises(ValueError, match="exceed material-work concurrency"):
                 second.task_manage(
                     TaskManageRequest(
-                        action="integrate_start",
+                        action="integration_begin",
                         workflow=workflow,
                         task_id="queued-1",
                     )
@@ -304,19 +309,19 @@ class TestRuntimeSafety:
                     n=2,
                 )
             )
-            for task_id in ("task-1", "task-2"):
-                runtime.task_manage(
+            for logical_id in ("task-one", "task-two"):
+                planned = runtime.task_manage(
                     TaskManageRequest(
                         action="plan",
                         workflow=workflow,
-                        task_id=task_id,
+                        task={"logical_id": logical_id},
                     )
                 )
                 runtime.task_manage(
                     TaskManageRequest(
-                        action="dispatch",
+                        action="mark_running",
                         workflow=workflow,
-                        task_id=task_id,
+                        task_id=planned["task_id"],
                     )
                 )
             runtime.run_manage(RunManageRequest(action="pause", workflow=workflow))
@@ -341,16 +346,13 @@ class TestRuntimeSafety:
             runtime.task_manage(
                 TaskManageRequest(
                     action="plan",
-                    task_id="task-1",
-                    logical_id="task",
-                    role="structure",
-                    unit="repo",
+                    task={"logical_id": "task", "role": "structure", "unit": "repo"},
                 )
             )
-            runtime.task_manage(TaskManageRequest(action="dispatch", task_id="task-1"))
+            runtime.task_manage(TaskManageRequest(action="mark_running", task_id="task-1"))
             runtime.task_manage(
                 TaskManageRequest(
-                    action="report",
+                    action="complete",
                     task_id="task-1",
                     report={"value": 1},
                 )
@@ -360,7 +362,7 @@ class TestRuntimeSafety:
             with pytest.raises(ValueError, match="running or checkpointed"):
                 runtime.task_manage(
                     TaskManageRequest(
-                        action="report",
+                        action="complete",
                         task_id="task-1",
                         report={"value": 2},
                     )
@@ -399,7 +401,7 @@ class TestRuntimeSafety:
             ):
                 assert field in status
             with pytest.raises(ValueError, match="helpers changed"):
-                runtime.audit_record(AuditRecordRequest(action="metrics", value={"x": 1}))
+                runtime.audit_metrics()
 
     def test_publication_finish_is_atomic_and_validated(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-publish-safety-") as directory:
@@ -418,7 +420,7 @@ class TestRuntimeSafety:
             runtime.audit_record(
                 AuditRecordRequest(
                     action="candidate",
-                    value={"id": "C-1", "status": "verified"},
+                    candidate={"id": "C-1", "status": "verified"},
                 )
             )
             runtime.audit_publish(
