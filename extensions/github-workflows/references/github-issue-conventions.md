@@ -312,3 +312,10 @@ excerpts outside issue bodies. Implementation progress belongs in PR Issue
 coverage checkboxes, with each checkbox mapped to one issue `Required outcome`.
 Routine expectations such as passing relevant tests belong in workflow
 validation rather than issue requirements.
+
+Published issue titles, bodies, and comments must never expose absolute filesystem paths
+from an audit host, worktree, home directory, temporary directory, or workflow state. Cite
+source locations only as repository-relative paths, optionally with a symbol or line, such
+as `src/package/module.py:42` or `Package.method`. Convert absolute evidence paths to that
+form before publication; if a path cannot be expressed relative to the audited repository,
+omit it from public text.

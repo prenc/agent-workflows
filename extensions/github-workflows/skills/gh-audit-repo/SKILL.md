@@ -617,7 +617,9 @@ After an area's discovery and every candidate verification finish:
 8. For `new`, create the issue serially with exactly one area, type, and
    priority supplied in that order; no status label or assignee. New and revised
    audit bodies follow the shared issue convention, including its affirmative
-   Scope boundaries and public-text rules, and begin with:
+   Scope boundaries and public-text rules. Convert every evidence location to a
+   repository-relative path; never publish audit-host, worktree, home, temporary, or
+   workflow-state absolute paths. Bodies begin with:
 
    ```html
    <!-- qwen:managed-issue:v1 -->

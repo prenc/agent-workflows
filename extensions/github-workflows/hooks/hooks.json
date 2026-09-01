@@ -2,7 +2,7 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "(read_file|grep_search|glob|run_shell_command)",
+        "matcher": "(read_file|grep_search|glob|run_shell_command|mcp__github__issue_write|mcp__github__add_issue_comment)",
         "hooks": [
           {
             "type": "command",

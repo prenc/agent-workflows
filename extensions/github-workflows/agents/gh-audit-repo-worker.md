@@ -156,7 +156,8 @@ boundaries. Apply focus as a question, not an assumed defect. Return:
 - rejected leads with reasons;
 - for each new or update-existing candidate: disposition and matching issue
   number/current labels when applicable, concise title, area/type/priority, confidence,
-  root cause and impact, exact evidence paths/symbols, required outcomes,
+  root cause and impact, exact repository-relative evidence paths/symbols (never absolute
+  host, worktree, home, temporary, or workflow-state paths), required outcomes,
   duplicate records examined,
   optional concise affirmative implementation-surface prose for Scope boundaries,
   guidance used, and MCP queries used or `none`.

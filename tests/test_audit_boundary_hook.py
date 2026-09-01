@@ -96,3 +96,31 @@ class TestAuditBoundaryHook:
             },
         )
         assert result["permissionDecision"] == "deny"
+
+    def test_audit_publication_rejects_absolute_paths(self) -> None:
+        for path in ("/home/user/project/src/tool.py:12", r"C:\\work\\repo\\src\\tool.py"):
+            result = self.invoke(
+                "mcp__github__issue_write",
+                {"method": "create", "title": "Concrete failure", "body": f"Evidence: `{path}`"},
+            )
+            assert result["permissionDecision"] == "deny"
+            assert "repository-relative" in result["permissionDecisionReason"]
+
+    def test_audit_publication_allows_repository_paths_and_urls(self) -> None:
+        result = self.invoke(
+            "mcp__github__issue_write",
+            {
+                "method": "create",
+                "title": "Concrete failure",
+                "body": "Evidence: `src/tool.py:12`; see https://example.com/docs/path.",
+            },
+        )
+        assert result["permissionDecision"] == "allow"
+
+    def test_absolute_path_guard_is_limited_to_audit_publication(self) -> None:
+        unrelated = self.invoke(
+            "mcp__github__issue_write",
+            {"body": "Evidence: `/home/user/project/src/tool.py`"},
+            audit=False,
+        )
+        assert unrelated["permissionDecision"] == "allow"

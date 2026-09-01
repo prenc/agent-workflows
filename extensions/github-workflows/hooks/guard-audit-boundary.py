@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,13 @@ DENIAL = (
     "Use run_status for lifecycle guidance and the action-specific tool schema for inputs. "
     "Only an assigned gh-audit-repo-worker may inspect implementation in its immutable shard."
 )
+PUBLIC_PATH_DENIAL = (
+    "Published GitHub text must not contain absolute host paths; use repository-relative "
+    "paths such as src/package/module.py."
+)
+UNIX_ABSOLUTE_PATH = re.compile(r"(?<![:</\w])/(?!/)(?:[A-Za-z0-9._+-]+/)*[A-Za-z0-9._+-]+")
+WINDOWS_ABSOLUTE_PATH = re.compile(r"(?i)(?<![A-Za-z0-9_])[A-Z]:[\\/](?:[^\s`'\"<>]+)")
+PUBLIC_TEXT_FIELDS = {"title", "body", "comment"}
 
 
 def decision(value: str, reason: str | None = None) -> dict[str, Any]:
@@ -80,6 +88,24 @@ def targets_private_boundary(payload: dict[str, Any]) -> bool:
     )
 
 
+def public_text_has_absolute_path(payload: dict[str, Any]) -> bool:
+    tool_name = str(payload.get("tool_name", ""))
+    if "github" not in tool_name or not any(
+        operation in tool_name for operation in ("issue_write", "add_issue_comment")
+    ):
+        return False
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return False
+    for field in PUBLIC_TEXT_FIELDS:
+        value = tool_input.get(field)
+        if isinstance(value, str) and (
+            UNIX_ABSOLUTE_PATH.search(value) or WINDOWS_ABSOLUTE_PATH.search(value)
+        ):
+            return True
+    return False
+
+
 def main() -> int:
     try:
         payload = json.load(sys.stdin)
@@ -90,9 +116,13 @@ def main() -> int:
         if payload.get("agent_type") == "gh-audit-repo-worker":
             print(json.dumps(decision("allow")))
             return 0
-        if audit_session(payload) and targets_private_boundary(payload):
-            print(json.dumps(decision("deny", DENIAL)))
-            return 0
+        if audit_session(payload):
+            if public_text_has_absolute_path(payload):
+                print(json.dumps(decision("deny", PUBLIC_PATH_DENIAL)))
+                return 0
+            if targets_private_boundary(payload):
+                print(json.dumps(decision("deny", DENIAL)))
+                return 0
         print(json.dumps(decision("allow")))
     except Exception:
         # A local policy helper must not disrupt unrelated or malformed sessions.
