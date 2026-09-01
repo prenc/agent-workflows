@@ -40,6 +40,10 @@ reverse-engineering it. The only exception is an assigned
 implementation: that worker may inspect the assigned source like any other
 repository code, but must still use `task_context` rather than private run
 state.
+Do not create durable Qwen memories for workflow tool mechanics, schemas,
+temporary paths, run-specific failures, or recovery workarounds. Correct the
+workflow implementation or bundled guidance instead; live schemas and current
+skill instructions remain authoritative.
 
 Audit the local `HEAD` checked out in the repository's primary worktree through
 an immutable detached snapshot. Read
@@ -193,6 +197,9 @@ validation and metrics are persisted by their respective tools. Call
 `mcp__github_workflows__run_status` before launching work and after every task
 result; its scheduler is authoritative. The server owns revisions, artifacts,
 atomic writes, and lifecycle validation.
+Before finalization, follow `run_status.finish_blockers` and its structured
+allowed actions. Call `finish` only when `finish_ready` is true; do not memorize
+or reconstruct finish-gate invariants.
 
 The supervisor records every completed, failed, or abandoned attempt before
 interpreting its result, starts the corresponding integration event, validates
@@ -200,11 +207,8 @@ and synthesizes available output, runs any material probe, and completes
 integration before launching more work.
 `mcp__github_workflows__run_manage` with action `finish` enforces that tasks and candidates
 are terminal, completed reports are integrated, validation files exactly match
-registered artifacts, pending work is empty, helper hashes match, publication
+registered artifacts, pending work is empty, publication
 history is committed, and HEAD drift is reconciled.
-If `run_status.helper_integrity.valid` is false, do not launch or mutate audit
-work. Report the changed helper paths, abort the incompatible run, and start a
-new audit run; a process restart cannot make old helper fingerprints compatible.
 
 On `--resume`, load repository, branch, SHA, confirmation, instructions, and
 dry-run state from `mcp__github_workflows__run_status`. Reconcile every recorded issue
@@ -222,8 +226,10 @@ running after replacement.
 User messages preempt the scheduler even when all material lanes are occupied.
 For a status question, reply immediately without changing lane accounting. For
 pause or suspension, stop launching, cancel the fallback wakeup, ask active
-workers for a compact checkpoint, record received and unrecoverable attempts,
-and set the run to `suspended`. For a directive change, record it before more
+workers for a compact checkpoint, and set the run to `suspended`. Record late
+checkpoint, completion, failure, or abandonment reports from workers that were
+already active; every operation that could start or integrate work remains
+blocked until resume. For a directive change, record it before more
 material work; changes to concurrency apply after current tasks are reconciled,
 and scope/focus changes invalidate only affected unintegrated shards. Control
 messages never wait for a worker slot.
@@ -297,8 +303,10 @@ issue for `update-existing`, `protected-existing`, or `duplicate-existing`. Reco
 unrelated stale/fixed/duplicate observations for closure reconciliation or the
 final report.
 
-Generate a compact history view for each audit shard containing relevant open
-records and only the resolved records selected by the targeted gate. Without
+The server supplies each audit worker with a bounded compact history view through
+`task_context`. Include issue leads and optional typed issue/PR history links in
+the assignment so that view contains relevant open records and only the resolved
+records selected by the targeted gate. Without
 `--regression-sweep`, select a resolved record only when its affected paths
 changed after resolution, a current lead matches its root cause, or it is needed
 for duplicate or closure reasoning. Do not assign every historical fix as a
@@ -419,6 +427,12 @@ trigger dependency installation.
 
 Register each complete assignment through
 `mcp__github_workflows__task_manage` with action `plan` and one typed `task`.
+Set `assignment.mode` to `discover` or `verify`; do not send a redundant task
+role. A discovery assignment's `shard_id`, `area`, and `paths` register the
+linked shard atomically. Task transitions then maintain the shard lifecycle, so
+do not repeat running, partial, complete, or failed states through
+`audit_record`. Use an explicit shard record only for skipped or supervisor-owned
+work without a task.
 Use the returned server-generated task ID and task reference, then launch one
 `gh-audit-repo-worker` per selected shard according to
 `mcp__github_workflows__run_status`, with only this prompt:
@@ -510,8 +524,9 @@ The supervisor owns every execution decision and constructs the probe; never
 execute worker text as a command. Direct logical proof remains acceptable when
 runtime execution is unsafe, heavy, nondeterministic, or unnecessary.
 
-Use `mcp__github_workflows__audit_probe`. It accepts only focused pytest node
-selectors or bounded visible inline Python. Never write probe code to a file.
+Use `mcp__github_workflows__audit_probe` with the candidate ID. Candidate
+linkage is mandatory. The tool accepts only focused pytest node selectors or
+bounded visible inline Python. Never write probe code to a file.
 The tool prefers the linked project `.venv` and otherwise uses its
 system Python. Set `--pythonpath src` only when the repository establishes that
 import layout. The runner supplies a sanitized
@@ -522,8 +537,9 @@ pytest cache suppression. Never weaken these controls or retry with larger
 limits.
 
 Use a unique probe ID for every execution; the helper refuses to overwrite an
-existing attempt. Register every successful, failed, unavailable, or timed-out
-`result.json` in state before interpreting it. Limit one hypothesis to three
+existing attempt. The tool returns bounded stdout/stderr excerpts and records
+every successful, failed, unavailable, or timed-out result automatically. Do
+not read its private artifact storage. Limit one hypothesis to three
 executions, including harness mistakes. After that, record it as inconclusive
 unless the failure is a reviewed-helper defect fixed and tested outside the
 audit in a separate workflow. Never edit the probe or inventory helper during
@@ -669,7 +685,7 @@ generation/watermark and record counts, imported/refreshed compact records,
 knowledge areas, revisions, reused version-matched conclusions, rechecked code
 findings and bootstrap leads, inventory revision and context requests, runtime validation proposals,
 executed probes and dispositions, environment fingerprints, inconclusive or
-skipped probes, helper integrity, scheduler active/idle time, task failures and
+skipped probes, scheduler active/idle time, task failures and
 recoveries, candidate-to-issue grouping, telemetry/token/tool totals, other validation, partial failures,
 and exact resume command (`/gh-audit-repo --resume`). Never claim
 complete coverage when any page, area, scope, verification, or publication is

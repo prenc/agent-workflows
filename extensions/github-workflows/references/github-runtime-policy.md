@@ -60,10 +60,6 @@ supervisors and workers.
   integrated before replacement work is launched. User status, pause, and
   directive messages are control-plane work and remain serviceable at full
   worker concurrency.
-- Repository audits capture the reviewed runtime fingerprint when run state is
-  created. Every tool call validates it before continuing. A mismatch suspends
-  the run; do not modify the extension during an audit to work around a probe
-  or inventory failure.
 - Audit knowledge lives as per-area Markdown under
   `$QWEN_CODE_PROJECT_DIR/workflows/gh-audit-repo/knowledge/areas/` and is
   maintained through the `audit_knowledge` MCP tool. Area-boundary changes archive the

@@ -63,6 +63,7 @@ class TestAuditInventory:
         python = inventory["sources"]["python_environment"]
         assert python["available"]
         assert python["source"] == "system"
+        assert python["executable"] == "python"
         assert inventory["schema_version"] == 1
         assert inventory["revision"] == 1
         event = json.loads((self.run_dir / "journal.jsonl").read_text().splitlines()[0])
@@ -96,8 +97,22 @@ class TestAuditInventory:
         python = inventory["sources"]["python_environment"]
         assert python["available"]
         assert python["source"] == "project-venv"
+        assert python["executable"] == "python"
         assert python["python"]
         assert python["packages"]["audit-fixture"] == "1.2.3"
+
+    def test_program_probe_prefers_project_venv_executable(self) -> None:
+        venv.EnvBuilder(with_pip=False).create(self.project / ".venv")
+        self.call("initialize")
+        source = self.program_input([{"name": "python", "arguments": ["--version"]}])
+
+        result = self.call("program", "--input", str(source), "--expected-revision", "1")
+
+        fact = json.loads(result.stdout)["facts"]["python"]
+        assert fact["available"]
+        assert fact["probe_status"] == "succeeded"
+        assert fact["executable_source"] == "project-venv"
+        assert fact["executable"] == "python"
 
     def test_revision_conflict_does_not_replace_inventory(self) -> None:
         self.call("initialize")

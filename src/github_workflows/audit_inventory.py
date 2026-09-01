@@ -120,7 +120,7 @@ def package_inventory(project: Path) -> dict[str, Any]:
     python, source = selected_python(project)
     code = (
         "import importlib.metadata as m,json,platform,sys;"
-        "print(json.dumps({'python':platform.python_version(),'executable':sys.executable,"
+        "print(json.dumps({'python':platform.python_version(),"
         "'packages':dict(sorted((d.metadata.get('Name',d.name),d.version) for d in m.distributions()))}))"
     )
     try:
@@ -133,9 +133,15 @@ def package_inventory(project: Path) -> dict[str, Any]:
             env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1"},
         )
         payload = json.loads(result.stdout)
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
-        return {"available": False, "source": source, "reason": str(error), "packages": {}}
-    return {"available": True, "source": source, **payload}
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return {
+            "available": False,
+            "source": source,
+            "executable": "python",
+            "reason": "Python package inventory failed",
+            "packages": {},
+        }
+    return {"available": True, "source": source, "executable": "python", **payload}
 
 
 def manifest_inventory(worktree: Path) -> dict[str, Any]:
@@ -233,11 +239,17 @@ def limits() -> None:
     os.nice(10)
 
 
-def sandbox_command(worktree: Path, command: list[str]) -> list[str]:
+def sandbox_command(
+    worktree: Path, command: list[str], readonly_root: Path | None = None
+) -> list[str]:
     script = (
-        'set -eu\nworktree="$1"\nshift\n'
+        'set -eu\nworktree="$1"\nreadonly_root="$2"\nshift 2\n'
         '/usr/bin/mount --bind "$worktree" "$worktree"\n'
         '/usr/bin/mount -o remount,bind,ro "$worktree"\n'
+        'if [ -n "$readonly_root" ]; then\n'
+        '  /usr/bin/mount --bind "$readonly_root" "$readonly_root"\n'
+        '  /usr/bin/mount -o remount,bind,ro "$readonly_root"\n'
+        "fi\n"
         'cd "$worktree"\nexec "$@"\n'
     )
     return [
@@ -251,6 +263,7 @@ def sandbox_command(worktree: Path, command: list[str]) -> list[str]:
         script,
         "audit-inventory",
         str(worktree),
+        str(readonly_root) if readonly_root is not None else "",
         *command,
     ]
 
@@ -289,7 +302,16 @@ def probe_program(
     arguments = arguments or PROGRAM_ARGUMENTS.get(name, ["--version"])
     if not arguments or any(argument not in ALLOWED_ARGUMENTS for argument in arguments):
         raise ValueError("program probes accept only version/help arguments")
-    executable_name = shutil.which(name)
+    project_venv = project / ".venv"
+    venv_candidate = project_venv / "bin" / name
+    if venv_candidate.is_file() and os.access(venv_candidate, os.X_OK):
+        executable_name = str(venv_candidate)
+        executable_source = "project-venv"
+        readonly_root: Path | None = project_venv
+    else:
+        executable_name = shutil.which(name)
+        executable_source = "system-path"
+        readonly_root = None
     now = utc_now()
     fact: dict[str, Any]
     if executable_name is None:
@@ -302,15 +324,18 @@ def probe_program(
             "source": "current-audit-host",
         }
     else:
-        executable = Path(executable_name).resolve()
-        forbidden = (project, worktree, run_dir)
-        if any(contained(executable, root) for root in forbidden):
+        executable = Path(executable_name).absolute()
+        resolved_executable = executable.resolve()
+        forbidden = (worktree, run_dir)
+        if any(contained(resolved_executable, root) for root in forbidden):
             raise ValueError("program executable must resolve outside project and run directories")
+        if executable_source != "project-venv" and contained(resolved_executable, project):
+            raise ValueError("project executables must be installed in the project .venv")
         with tempfile.TemporaryDirectory(prefix="qwen-audit-inventory-") as temporary:
             environment = sanitized_environment(Path(temporary), executable)
             try:
                 result = subprocess.run(
-                    sandbox_command(worktree, [str(executable), *arguments]),
+                    sandbox_command(worktree, [str(executable), *arguments], readonly_root),
                     capture_output=True,
                     timeout=WALL_SECONDS,
                     env=environment,
@@ -321,7 +346,8 @@ def probe_program(
                 fact = {
                     "available": True,
                     "probe_status": "succeeded" if result.returncode == 0 else "failed",
-                    "executable": str(executable),
+                    "executable": name,
+                    "executable_source": executable_source,
                     "arguments": arguments,
                     "returncode": result.returncode,
                     "stdout": stdout,
@@ -335,7 +361,8 @@ def probe_program(
                 fact = {
                     "available": True,
                     "probe_status": "timed-out",
-                    "executable": str(executable),
+                    "executable": name,
+                    "executable_source": executable_source,
                     "arguments": arguments,
                     "reason": "probe timed out",
                     "collected_at": now,
@@ -345,7 +372,8 @@ def probe_program(
                 fact = {
                     "available": True,
                     "probe_status": "failed",
-                    "executable": str(executable),
+                    "executable": name,
+                    "executable_source": executable_source,
                     "arguments": arguments,
                     "reason": str(error),
                     "collected_at": now,

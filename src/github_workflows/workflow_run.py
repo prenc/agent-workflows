@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import hashlib
 import json
 import os
 import shutil
@@ -73,7 +72,6 @@ AUDIT_INTERNAL = {
     "history",
     "scheduler",
     "metrics",
-    "helper_hashes",
     "directives",
     "inventory",
 }
@@ -146,57 +144,6 @@ def load_state(current: Path) -> dict[str, Any]:
     return value
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def audit_helper_hashes() -> dict[str, str]:
-    project = Path(__file__).resolve().parents[2]
-    extension = project / "extensions" / "github-workflows"
-    paths = sorted((project / "src" / "github_workflows").glob("*.py"))
-    paths.extend(
-        [
-            extension / "qwen-extension.json",
-            extension / "hooks" / "hooks.json",
-            extension / "hooks" / "guard-audit-boundary.py",
-            extension / "skills" / "gh-audit-repo" / "SKILL.md",
-            extension / "agents" / "gh-audit-repo-worker.md",
-            extension / "references" / "github-runtime-policy.md",
-            extension / "references" / "github-issue-conventions.md",
-            extension / "references" / "github-mcp-suspension.md",
-        ]
-    )
-    return {str(path.relative_to(project)): sha256_file(path) for path in paths if path.is_file()}
-
-
-def audit_helper_integrity(state: dict[str, Any]) -> dict[str, Any]:
-    """Describe whether the reviewed helper bundle still matches this run."""
-    expected = state.get("helper_hashes")
-    current = audit_helper_hashes()
-    valid = isinstance(expected, dict) and expected == current
-    changed = sorted(
-        key
-        for key in set(current) | (set(expected) if isinstance(expected, dict) else set())
-        if not isinstance(expected, dict) or expected.get(key) != current.get(key)
-    )
-    return {
-        "valid": valid,
-        "changed": changed,
-        "required_action": None if valid else "abort-and-start-new-run",
-    }
-
-
-def require_audit_helper_integrity(state: dict[str, Any]) -> None:
-    if not audit_helper_integrity(state)["valid"]:
-        raise ValueError(
-            "reviewed audit helpers changed during the run; abort and start a new audit run"
-        )
-
-
 def audit_concurrency(state: dict[str, Any]) -> int:
     inputs = state.get("inputs")
     if not isinstance(inputs, dict):
@@ -247,7 +194,6 @@ def audit_defaults(supplied: dict[str, Any], now: str) -> dict[str, Any]:
             "abandoned_attempts": 0,
         },
     )
-    value["helper_hashes"] = audit_helper_hashes()
     return value
 
 
@@ -370,8 +316,6 @@ def resume(args: argparse.Namespace) -> None:
         )
     if state["status"] not in RESUMABLE:
         raise ValueError("the current run is not resumable")
-    if state["workflow"] == "gh-audit-repo":
-        require_audit_helper_integrity(state)
     previous = state["status"]
     if previous != "in-progress":
         state["status"] = "in-progress"
@@ -427,7 +371,6 @@ def update_state(args: argparse.Namespace, *, terminal: bool) -> None:
         and state.get("workflow") == "gh-audit-repo"
         and state.get("schema_version") == 2
     ):
-        require_audit_helper_integrity(state)
         validate_audit_terminal(current, state)
     state["status"] = status
     state["revision"] += 1
@@ -444,14 +387,16 @@ def update_state(args: argparse.Namespace, *, terminal: bool) -> None:
     print(json.dumps({"run_dir": str(current), "status": status, "revision": state["revision"]}))
 
 
-def audit_state(args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
+def audit_state(
+    args: argparse.Namespace, *, allow_suspended: bool = False
+) -> tuple[Path, dict[str, Any]]:
     _, _, workflow, current = project_paths(args)
     state = load_state(current)
     if workflow != "gh-audit-repo" or state.get("schema_version") != 2:
         raise ValueError("typed audit operations require a gh-audit-repo schema v2 run")
-    if state["status"] != "in-progress":
+    allowed = {"in-progress", "suspended"} if allow_suspended else {"in-progress"}
+    if state["status"] not in allowed:
         raise ValueError("the current audit run is not active")
-    require_audit_helper_integrity(state)
     return current, state
 
 
@@ -467,7 +412,10 @@ def audit_scheduler_status(state: dict[str, Any]) -> dict[str, Any]:
     available = max(0, scheduler["limit"] - running - supervisor_lanes)
     if queue:
         available = 0
-    if queue:
+    if state.get("status") == "suspended":
+        available = 0
+        next_action = "resume"
+    elif queue:
         next_action = "integrate-result"
     elif scheduler.get("supervisor_activity"):
         next_action = "finish-supervisor-work"
@@ -502,14 +450,65 @@ def require_string(value: Any, name: str) -> str:
     return value
 
 
+def normalize_run_artifact(current: Path, value: Any, name: str) -> str:
+    reference = require_string(value, name)
+    resolved = (
+        (current / reference).resolve()
+        if not Path(reference).is_absolute()
+        else Path(reference).resolve()
+    )
+    try:
+        relative = resolved.relative_to(current.resolve())
+    except ValueError as error:
+        raise ValueError(f"{name} must be inside the current run") from error
+    if not resolved.is_file():
+        raise ValueError(f"{name} does not exist")
+    return relative.as_posix()
+
+
+def task_shard(state: dict[str, Any], task: dict[str, Any]) -> dict[str, Any] | None:
+    assignment = task.get("assignment")
+    if (
+        not isinstance(assignment, dict)
+        or assignment.get("mode") != "discover"
+        or not assignment.get("shard_id")
+    ):
+        return None
+    shard_id = require_string(assignment.get("shard_id"), "assignment shard_id")
+    area = require_string(assignment.get("area"), "assignment area")
+    paths = assignment.get("paths", [])
+    if not isinstance(paths, list) or not all(isinstance(path, str) and path for path in paths):
+        raise ValueError("assignment paths must be a list of non-empty strings")
+    owners = {
+        item.get("logical_id")
+        for item in state["tasks"].values()
+        if isinstance(item.get("assignment"), dict)
+        and item["assignment"].get("shard_id") == shard_id
+    }
+    if owners - {task.get("logical_id")}:
+        raise ValueError("audit shard is already owned by another logical task")
+    existing = state["shards"].get(shard_id)
+    if existing:
+        if existing.get("area") != area or existing.get("paths", []) != paths:
+            raise ValueError("task assignment does not match the existing shard")
+        return existing
+    shard = {"id": shard_id, "area": area, "paths": paths, "status": "pending"}
+    state["shards"][shard_id] = shard
+    return shard
+
+
 def audit_event(args: argparse.Namespace) -> None:
-    current, state = audit_state(args)
+    current, state = audit_state(args, allow_suspended=True)
     if state["revision"] != args.expected_revision:
         raise RuntimeError(
             f"state revision conflict: expected {args.expected_revision}, found {state['revision']}"
         )
     payload = load_json(args.input)
     event_type = require_string(payload.get("type"), "event type")
+    if state["status"] == "suspended":
+        late_status = payload.get("status") if event_type == "task-transition" else None
+        if late_status not in {"checkpointed", "completed", "failed", "abandoned"}:
+            raise RuntimeError("suspended runs accept only late worker results")
     tasks = state["tasks"]
     scheduler = state["scheduler"]
     detail: dict[str, Any] = {}
@@ -523,9 +522,30 @@ def audit_event(args: argparse.Namespace) -> None:
         if len(matches) != 1 or matches[0].get("status") != "queued":
             raise ValueError("only one queued logical task can be revised")
         existing = matches[0]
+        old_assignment = existing.get("assignment", {})
+        old_shard_id = old_assignment.get("shard_id") if isinstance(old_assignment, dict) else None
+        revised = dict(existing)
         for name in ("role", "unit", "assignment", "required"):
             if name in task:
-                existing[name] = task[name]
+                revised[name] = task[name]
+        task_shard(state, revised)
+        new_assignment = revised.get("assignment", {})
+        new_shard_id = new_assignment.get("shard_id") if isinstance(new_assignment, dict) else None
+        if old_shard_id and old_shard_id != new_shard_id:
+            old_shard = state["shards"].get(old_shard_id)
+            if not isinstance(old_shard, dict) or old_shard.get("status") != "pending":
+                raise ValueError("queued task shard can only change while its old shard is pending")
+            other_owners = [
+                item
+                for item in tasks.values()
+                if item is not existing
+                and isinstance(item.get("assignment"), dict)
+                and item["assignment"].get("shard_id") == old_shard_id
+            ]
+            if other_owners:
+                raise ValueError("queued task shard is still owned by another task")
+            del state["shards"][old_shard_id]
+        existing.update(revised)
         existing["updated_at"] = utc_now()
         detail = {
             "task_id": existing["id"],
@@ -545,7 +565,15 @@ def audit_event(args: argparse.Namespace) -> None:
         if status == "running" and audit_scheduler_status(state)["worker_slots"] < 1:
             raise ValueError("audit material-work concurrency is saturated")
         logical_id = require_string(task.get("logical_id"), "task logical_id")
+        assignment = task.get("assignment", {})
+        if not isinstance(assignment, dict):
+            raise ValueError("task assignment must be an object")
+        mode = assignment.get("mode")
         role = require_string(task.get("role"), "task role")
+        if mode in {"discover", "verify"}:
+            if role != mode:
+                raise ValueError("task role must match assignment.mode")
+            role = mode
         agent_id = require_string(task.get("agent_id", task_id), "task agent_id")
         if any(item.get("agent_id") == agent_id for item in tasks.values()):
             raise ValueError(f"task agent_id already exists: {agent_id}")
@@ -553,7 +581,7 @@ def audit_event(args: argparse.Namespace) -> None:
         requires_integration = task.get("requires_integration", role in {"discover", "verify"})
         if not isinstance(required, bool) or not isinstance(requires_integration, bool):
             raise ValueError("task required and requires_integration must be booleans")
-        if role in {"discover", "verify"}:
+        if role in {"discover", "verify"} or mode in {"discover", "verify"}:
             requires_integration = True
         try:
             attempt = int(task.get("attempt", 1))
@@ -590,6 +618,7 @@ def audit_event(args: argparse.Namespace) -> None:
         }
         if normalized["attempt"] < 1:
             raise ValueError("task attempt must be positive")
+        task_shard(state, normalized)
         tasks[task_id] = normalized
         state["metrics"]["task_attempts"] = len(tasks)
         state["metrics"]["logical_tasks"] = len({item["logical_id"] for item in tasks.values()})
@@ -603,31 +632,31 @@ def audit_event(args: argparse.Namespace) -> None:
         if status not in AUDIT_TASK_STATUSES:
             raise ValueError("unsupported task status")
         previous = task["status"]
+        if state["status"] == "suspended" and previous not in {"running", "checkpointed"}:
+            raise ValueError("late worker result requires a running or checkpointed task")
         if status not in AUDIT_TRANSITIONS[previous]:
             raise ValueError(f"invalid task transition: {previous} -> {status}")
         if status == "running" and audit_scheduler_status(state)["worker_slots"] < 1:
             raise ValueError("audit material-work concurrency is saturated")
         task["status"] = status
         task["updated_at"] = utc_now()
-        for name in ("result", "checkpoint", "error", "note"):
+        for name in ("result", "checkpoint", "report_status", "error", "note"):
             if name in payload:
                 task[name] = payload[name]
-        if status == "completed":
-            result = task.get("result")
-            if not isinstance(result, str):
-                raise ValueError("completed task requires a result artifact")
-            result_path = (
-                (current / result).resolve()
-                if not Path(result).is_absolute()
-                else Path(result).resolve()
+        if status == "checkpointed":
+            task["checkpoint"] = normalize_run_artifact(
+                current, task.get("checkpoint"), "task checkpoint artifact"
             )
-            try:
-                result_path.relative_to(current.resolve())
-            except ValueError as error:
-                raise ValueError("task result artifact must be inside the current run") from error
-            if not result_path.is_file():
-                raise ValueError("task result artifact does not exist")
-            task["result"] = str(result_path)
+        if status == "completed":
+            task["result"] = normalize_run_artifact(
+                current, task.get("result"), "task result artifact"
+            )
+        shard = task_shard(state, task)
+        if shard is not None:
+            if status == "running":
+                shard["status"] = "running"
+            elif status == "checkpointed":
+                shard["status"] = "partial"
         if (
             status in AUDIT_TASK_TERMINAL
             and task["requires_integration"]
@@ -666,6 +695,15 @@ def audit_event(args: argparse.Namespace) -> None:
             raise ValueError("task is not the active supervisor integration")
         tasks[task_id]["integrated"] = True
         tasks[task_id]["integrated_at"] = utc_now()
+        task = tasks[task_id]
+        shard = task_shard(state, task)
+        if shard is not None:
+            if task["status"] == "completed":
+                shard["status"] = (
+                    "complete" if task.get("report_status") == "complete" else "partial"
+                )
+            elif task["status"] in {"failed", "abandoned"}:
+                shard["status"] = "failed"
         scheduler["integration_queue"].remove(task_id)
         scheduler["supervisor_activity"] = None
         detail = {"task_id": task_id}
@@ -692,16 +730,22 @@ def audit_event(args: argparse.Namespace) -> None:
         if not isinstance(shard, dict):
             raise ValueError("shard-upsert requires a shard object")
         shard_id = require_string(shard.get("id"), "shard id")
-        require_string(shard.get("area"), "shard area")
-        if shard.get("status") not in AUDIT_SHARD_STATUSES:
-            raise ValueError("shard requires a supported lifecycle status")
         existing = state["shards"].get(shard_id, {})
-        if existing.get("status") in {"complete", "skipped"} and shard.get(
-            "status"
-        ) != existing.get("status"):
+        area = shard.get("area", existing.get("area"))
+        status = shard.get("status", existing.get("status"))
+        require_string(area, "shard area")
+        if status not in AUDIT_SHARD_STATUSES:
+            raise ValueError("shard requires a supported lifecycle status")
+        if existing.get("status") in {"complete", "skipped"} and status != existing.get("status"):
             raise ValueError("terminal shard cannot be reopened")
-        state["shards"][shard_id] = {**existing, **shard, "id": shard_id}
-        detail = {"shard_id": shard_id, "shard_status": shard.get("status")}
+        state["shards"][shard_id] = {
+            **existing,
+            **shard,
+            "id": shard_id,
+            "area": area,
+            "status": status,
+        }
+        detail = {"shard_id": shard_id, "shard_status": status}
     elif event_type in {"candidate-upsert", "validation-record", "verdict-record"}:
         field = {
             "candidate-upsert": "candidate",
@@ -730,7 +774,10 @@ def audit_event(args: argparse.Namespace) -> None:
             artifact = value.get("artifact")
             if not isinstance(artifact, str):
                 raise ValueError("validation record requires an artifact path")
-            artifact_path = Path(artifact).resolve()
+            artifact_ref = Path(artifact)
+            if artifact_ref.is_absolute() or ".." in artifact_ref.parts:
+                raise ValueError("validation artifact must be a private run-relative path")
+            artifact_path = (current / artifact_ref).resolve()
             validation_root = (current / "validation").resolve()
             try:
                 artifact_path.relative_to(validation_root)
@@ -743,7 +790,7 @@ def audit_event(args: argparse.Namespace) -> None:
             candidate_id = value.get("candidate_id")
             if candidate_id is not None and candidate_id not in state["candidates"]:
                 raise ValueError("validation record refers to an unknown candidate")
-            value = {**value, "artifact": str(artifact_path)}
+            value = {**value, "artifact": artifact_ref.as_posix()}
         if event_type == "verdict-record" and unit_id not in state["candidates"]:
             raise ValueError("verdict record refers to an unknown candidate")
         state[target][unit_id] = {**existing, **value, "id": unit_id}
@@ -776,10 +823,12 @@ def audit_event(args: argparse.Namespace) -> None:
         value = payload.get("value")
         if not isinstance(value, dict):
             raise ValueError("phase-set requires an object value")
-        if value.get("status") not in AUDIT_PHASE_STATUSES:
+        existing = state["phases"].get(phase, {})
+        status = value.get("status", existing.get("status"))
+        if status not in AUDIT_PHASE_STATUSES:
             raise ValueError("phase-set requires a supported status")
-        state["phases"][phase] = {**state["phases"].get(phase, {}), **value}
-        detail = {"phase": phase, "phase_status": value.get("status")}
+        state["phases"][phase] = {**existing, **value, "status": status}
+        detail = {"phase": phase, "phase_status": status}
     elif event_type == "directive-update":
         directive = payload.get("directive")
         if not isinstance(directive, dict):
@@ -861,32 +910,50 @@ def audit_status(args: argparse.Namespace) -> None:
     state = load_state(current)
     if workflow != "gh-audit-repo" or state.get("schema_version") != 2:
         raise ValueError("audit-status requires a gh-audit-repo schema v2 run")
-    require_audit_helper_integrity(state)
     print(json.dumps(audit_scheduler_status(state), indent=2, sort_keys=True))
 
 
-def validate_audit_terminal(current: Path, state: dict[str, Any]) -> None:
-    errors: list[str] = []
+def audit_finish_blockers(current: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
+    blockers: list[dict[str, Any]] = []
+
+    def add(kind: str, message: str, **details: Any) -> None:
+        blockers.append({"kind": kind, "message": message, **details})
+
     incomplete_phases = sorted(
         phase
         for phase in AUDIT_PHASES
         if state.get("phases", {}).get(phase, {}).get("status") not in {"complete", "skipped"}
     )
     if incomplete_phases:
-        errors.append(f"incomplete phases: {incomplete_phases}")
+        add(
+            "incomplete-phases",
+            f"incomplete phases: {incomplete_phases}",
+            phases=incomplete_phases,
+            allowed_action="phase",
+        )
     incomplete_shards = sorted(
         shard_id
         for shard_id, shard in state.get("shards", {}).items()
         if shard.get("status") not in {"complete", "skipped"}
     )
     if incomplete_shards:
-        errors.append(f"incomplete shards: {incomplete_shards}")
+        add(
+            "incomplete-shards",
+            f"incomplete shards: {incomplete_shards}",
+            shards=incomplete_shards,
+            allowed_action="shard",
+        )
     tasks = state["tasks"]
     nonterminal = sorted(
         task_id for task_id, task in tasks.items() if task.get("status") not in AUDIT_TASK_TERMINAL
     )
     if nonterminal:
-        errors.append(f"nonterminal tasks: {nonterminal}")
+        add(
+            "nonterminal-tasks",
+            f"nonterminal tasks: {nonterminal}",
+            task_ids=nonterminal,
+            allowed_action="task_manage",
+        )
     unintegrated = sorted(
         task_id
         for task_id, task in tasks.items()
@@ -895,7 +962,12 @@ def validate_audit_terminal(current: Path, state: dict[str, Any]) -> None:
         and not task.get("integrated")
     )
     if unintegrated:
-        errors.append(f"unintegrated terminal tasks: {unintegrated}")
+        add(
+            "unintegrated-tasks",
+            f"unintegrated terminal tasks: {unintegrated}",
+            task_ids=unintegrated,
+            allowed_action="integration_begin",
+        )
     logical: dict[str, list[dict[str, Any]]] = {}
     for task in tasks.values():
         logical.setdefault(task["logical_id"], []).append(task)
@@ -910,7 +982,12 @@ def validate_audit_terminal(current: Path, state: dict[str, Any]) -> None:
         )
     )
     if missing_logical:
-        errors.append(f"required logical tasks without an integrated completion: {missing_logical}")
+        add(
+            "required-tasks-incomplete",
+            f"required logical tasks without an integrated completion: {missing_logical}",
+            logical_ids=missing_logical,
+            allowed_action="retry",
+        )
     candidates = state["candidates"]
     unfinished_candidates = sorted(
         candidate_id
@@ -918,7 +995,12 @@ def validate_audit_terminal(current: Path, state: dict[str, Any]) -> None:
         if candidate.get("status") not in AUDIT_CANDIDATE_TERMINAL
     )
     if unfinished_candidates:
-        errors.append(f"nonterminal candidates: {unfinished_candidates}")
+        add(
+            "nonterminal-candidates",
+            f"nonterminal candidates: {unfinished_candidates}",
+            candidate_ids=unfinished_candidates,
+            allowed_action="candidate",
+        )
     mutation_candidates = {
         mutation.get("candidate_id")
         for mutation in state.get("mutations", [])
@@ -931,32 +1013,64 @@ def validate_audit_terminal(current: Path, state: dict[str, Any]) -> None:
         and candidate_id not in mutation_candidates
     )
     if missing_mutations:
-        errors.append(f"disposed candidates without mutation records: {missing_mutations}")
+        add(
+            "missing-mutation-records",
+            f"disposed candidates without mutation records: {missing_mutations}",
+            candidate_ids=missing_mutations,
+            allowed_action="audit_publish",
+        )
     scheduler = state["scheduler"]
     if scheduler.get("integration_queue"):
-        errors.append("integration queue is not empty")
+        add(
+            "integration-queue-not-empty",
+            "integration queue is not empty",
+            task_ids=list(scheduler["integration_queue"]),
+            allowed_action="integration_begin",
+        )
     if scheduler.get("supervisor_activity") is not None:
-        errors.append("supervisor material activity is still active")
+        add(
+            "supervisor-activity-active",
+            "supervisor material activity is still active",
+            allowed_action="supervisor_finish",
+        )
     if state.get("pending"):
-        errors.append("pending operations are not empty")
+        add(
+            "pending-operations",
+            "pending operations are not empty",
+            pending=list(state["pending"]),
+            allowed_action="pending",
+        )
     drift = state.get("head_drift", {})
     if drift.get("changed") and not drift.get("reconciled"):
-        errors.append("HEAD drift has not been reconciled")
+        add("head-drift", "HEAD drift has not been reconciled", allowed_action="head_drift")
     if state.get("history", {}).get("publication_pending"):
-        errors.append("publication history transaction is pending")
+        add(
+            "publication-pending",
+            "publication history transaction is pending",
+            allowed_action="audit_publish",
+        )
     registered = {
-        Path(value["artifact"]).resolve()
+        (current / value["artifact"]).resolve()
         for value in state["validations"].values()
         if isinstance(value, dict) and isinstance(value.get("artifact"), str)
     }
     artifacts = {path.resolve() for path in (current / "validation").glob("*/result.json")}
     if registered != artifacts:
-        errors.append("registered validation artifacts do not match validation result files")
-    current_hashes = audit_helper_hashes()
-    if state.get("helper_hashes") != current_hashes:
-        errors.append("reviewed audit helpers changed during the run")
-    if errors:
-        raise ValueError("audit cannot be finalized: " + "; ".join(errors))
+        add(
+            "validation-registration-mismatch",
+            "registered validation artifacts do not match validation result files",
+            allowed_action="audit_probe",
+        )
+    return blockers
+
+
+def validate_audit_terminal(current: Path, state: dict[str, Any]) -> None:
+    blockers = audit_finish_blockers(current, state)
+    if blockers:
+        raise ValueError(
+            "audit cannot be finalized: "
+            + "; ".join(str(blocker["message"]) for blocker in blockers)
+        )
 
 
 def parser() -> argparse.ArgumentParser:

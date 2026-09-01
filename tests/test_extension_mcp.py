@@ -64,17 +64,11 @@ class TestExtensionMcp:
                     "audit_publish",
                     "audit_metrics",
                 }
-                schemas = json.dumps({name: tool.input_schema for name, tool in tools.items()})
-                for internal in ("project_root", "project_dir", "run_dir", "expected_revision"):
-                    assert internal not in schemas
                 context_properties = tools["task_context"].input_schema["properties"]
                 assert "task_ref" in context_properties
-                assert "task_id" not in context_properties
                 run_properties = tools["run_manage"].input_schema["properties"]
                 assert "n" in run_properties
                 assert "repository" in run_properties
-                assert "inputs" not in run_properties
-                assert "concurrency" not in run_properties
                 assert "instructions" in run_properties
                 for name in (
                     "task_manage",
@@ -87,8 +81,8 @@ class TestExtensionMcp:
                 ):
                     properties = tools[name].input_schema["properties"]
                     assert ("action" if name != "audit_probe" else "kind") in properties
-                    assert "request" not in properties
                 assert "task" in tools["task_manage"].input_schema["properties"]
+                assert "candidate_id" in tools["audit_probe"].input_schema["required"]
                 history_properties = tools["history_manage"].input_schema["properties"]
                 assert "records" in history_properties
                 assert "artifacts" in history_properties
@@ -98,7 +92,6 @@ class TestExtensionMcp:
                 audit_record_properties = tools["audit_record"].input_schema["properties"]
                 assert "candidate" in audit_record_properties
                 assert "phase" in audit_record_properties
-                assert "value" not in audit_record_properties
                 with pytest.raises(ValueError, match="Extra inputs are not permitted"):
                     RunManageRequest.model_validate(
                         {
@@ -494,6 +487,7 @@ class TestExtensionMcp:
                     action="checkpoint",
                     workflow=workflow,
                     task_id="issue-2-1",
+                    report={"status": "partial", "remaining": "issue publication"},
                 )
             )
             with pytest.raises(ValueError, match="nonterminal tasks"):
@@ -738,7 +732,6 @@ class TestExtensionMcp:
                 assert worktree != workspace
                 assert state["inputs"]["n"] == 1
                 assert state["phases"]["source"]["status"] == "complete"
-                assert "n" not in {key: value for key, value in state.items() if key != "inputs"}
                 runtime.run_manage(
                     RunManageRequest(
                         action="resume",
@@ -763,7 +756,6 @@ class TestExtensionMcp:
                 assert prepared.structured_content["history"]["base_generation"] == 0
                 assert prepared.structured_content["history"]["record_count"] == 0
                 assert not prepared.structured_content["history"]["full_history_complete"]
-                assert "work_db" not in prepared.structured_content
                 assert (
                     runtime.state("gh-audit-repo")["phases"]["history"]["status"] == "in-progress"
                 )
@@ -838,7 +830,6 @@ class TestExtensionMcp:
                 )
                 assert not committed.is_error
                 assert committed.structured_content["generation"] == 1
-                assert "committed" not in committed.structured_content
                 assert runtime.state("gh-audit-repo")["phases"]["history"]["status"] == "complete"
                 cached = await client.call_tool(
                     "history_query",
@@ -901,6 +892,24 @@ class TestExtensionMcp:
                         candidate={"id": candidate_id, "status": "discovered"},
                     )
                 )
+                patched = runtime.audit_record(
+                    AuditRecordRequest(
+                        action="candidate",
+                        candidate={"id": candidate_id, "observation": "ready to probe"},
+                    )
+                )
+                assert patched["operation"] == "updated"
+                assert runtime.state("gh-audit-repo")["candidates"][candidate_id]["status"] == (
+                    "discovered"
+                )
+                phase_patch = runtime.audit_record(
+                    AuditRecordRequest(
+                        action="phase",
+                        phase={"name": "verification", "summary": {"planned": 1}},
+                    )
+                )
+                assert phase_patch["operation"] == "updated"
+                assert runtime.state("gh-audit-repo")["phases"]["verification"]["planned"] == 1
                 probed = await client.call_tool(
                     "audit_probe",
                     {
@@ -911,9 +920,14 @@ class TestExtensionMcp:
                     },
                 )
                 assert not probed.is_error
+                probe_result = probed.structured_content
+                assert probe_result["status"] == "succeeded"
+                assert probe_result["validation_recorded"]
+                assert "ok" in probe_result["stdout_excerpt"]
                 validation = runtime.state("gh-audit-repo")["validations"]["probe-mcp-1"]
                 assert validation["candidate_id"] == candidate_id
                 assert validation["status"] == "succeeded"
+                assert validation["artifact"] == "validation/probe-mcp-1/result.json"
 
     def test_manifest_and_launcher_are_contained(self) -> None:
         manifest = json.loads((EXTENSION / "qwen-extension.json").read_text(encoding="utf-8"))

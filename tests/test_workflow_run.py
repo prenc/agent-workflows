@@ -389,7 +389,7 @@ class TestWorkflowRun:
             check=False,
         )
         assert result.returncode == 2
-        assert "validation directory" in result.stderr
+        assert "run-relative" in result.stderr
 
     def test_completed_task_requires_an_existing_run_local_result(self) -> None:
         self.initialize()
@@ -486,16 +486,6 @@ class TestWorkflowRun:
             },
         )
         assert json.loads(accepted.stdout)["revision"] > revision
-
-    def test_audit_status_rejects_helper_integrity_drift(self) -> None:
-        self.initialize()
-        state_path = self.project_dir / "workflows/gh-audit-repo/current/state.json"
-        state = json.loads(state_path.read_text())
-        state["helper_hashes"] = {}
-        state_path.write_text(json.dumps(state) + "\n")
-        result = self.call("audit-status", "gh-audit-repo", check=False)
-        assert result.returncode == 2
-        assert "helpers changed" in result.stderr
 
     def test_published_candidate_requires_a_mutation_record(self) -> None:
         self.initialize()

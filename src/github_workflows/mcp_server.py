@@ -255,7 +255,7 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
         report: dict[str, Any] | None = None,
         note: str | None = None,
     ) -> dict[str, Any]:
-        """Plan a logical task or transition its server-generated attempt ID."""
+        """Plan a task or transition it; checkpoint and complete accept structured reports."""
         return _request_call(runtime.task_manage, TaskManageRequest, **locals())
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
@@ -317,11 +317,11 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
     def audit_probe(
         kind: Literal["pytest", "python"],
         probe_id: str,
-        candidate_id: str | None = None,
+        candidate_id: str,
         selectors: list[str] | None = None,
         code: str | None = None,
     ) -> dict[str, Any]:
-        """Run one bounded probe with a read-only worktree and disabled network."""
+        """Run and record one candidate probe, returning bounded output directly."""
         return _request_call(runtime.audit_probe, ProbeRequest, **locals())
 
     @mcp.tool(annotations=LOCAL_WRITE, structured_output=True)

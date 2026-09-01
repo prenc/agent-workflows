@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -27,6 +28,69 @@ EXTENSION = ROOT / "extensions/github-workflows"
 
 
 class TestRuntimeSafety:
+    def test_probe_timeout_payload_is_available_for_registration(self) -> None:
+        def timed_out(_: Any) -> int:
+            print(json.dumps({"returncode": -15, "timed_out": True}))
+            return 124
+
+        payload = WorkflowRuntime._invoke(timed_out, allow_timeout=True)
+
+        assert payload["timed_out"] is True
+        assert payload["returncode"] == -15
+
+    def test_non_timeout_exit_mismatch_remains_an_error(self) -> None:
+        def mismatched(_: Any) -> int:
+            print(json.dumps({"returncode": -15, "timed_out": False}))
+            return 124
+
+        with pytest.raises(RuntimeError):
+            WorkflowRuntime._invoke(mismatched, allow_timeout=True)
+
+    def test_timed_out_probe_is_returned_and_registered(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-probe-timeout-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.audit_record(
+                AuditRecordRequest(
+                    action="candidate",
+                    candidate={"id": "candidate-timeout", "status": "discovered"},
+                )
+            )
+
+            def timed_out(args: Any) -> int:
+                artifact_dir = args.run_dir / "validation" / args.probe_id
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                artifact = {
+                    "probe_id": args.probe_id,
+                    "probe_status": "timed-out",
+                    "returncode": -15,
+                    "timed_out": True,
+                    "worktree_unchanged": True,
+                    "stdout_excerpt": "partial output",
+                    "stderr_excerpt": "",
+                }
+                (artifact_dir / "result.json").write_text(json.dumps(artifact))
+                print(json.dumps({"returncode": -15, "timed_out": True}))
+                return 124
+
+            with mock.patch(
+                "github_workflows.runtime.audit_probe.run_probe", side_effect=timed_out
+            ):
+                result = runtime.audit_probe(
+                    ProbeRequest(
+                        kind="python",
+                        probe_id="probe-timeout",
+                        candidate_id="candidate-timeout",
+                        code="pass",
+                    )
+                )
+
+            assert result["status"] == "timed-out"
+            assert result["stdout_excerpt"] == "partial output"
+            validation = runtime.state("gh-audit-repo")["validations"]["probe-timeout"]
+            assert validation["status"] == "timed-out"
+            assert validation["candidate_id"] == "candidate-timeout"
+
     @pytest.mark.parametrize(
         ("result", "expected"),
         [
@@ -115,7 +179,15 @@ class TestRuntimeSafety:
             (HistoryQueryRequest, {}),
             (InventoryRequest, {"action": "status"}),
             (KnowledgeRequest, {"action": "show"}),
-            (ProbeRequest, {"kind": "python", "probe_id": "probe-1", "code": "pass"}),
+            (
+                ProbeRequest,
+                {
+                    "kind": "python",
+                    "probe_id": "probe-1",
+                    "candidate_id": "candidate-1",
+                    "code": "pass",
+                },
+            ),
             (
                 AuditRecordRequest,
                 {"action": "phase", "phase": {"name": "structure", "status": "complete"}},
@@ -409,38 +481,17 @@ class TestRuntimeSafety:
             assert json.loads(artifact.read_text()) == {"value": 1}
             assert runtime.state("gh-audit-repo")["revision"] == revision
 
-    def test_helper_drift_stops_work_and_status_exposes_complete_state(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="runtime-helper-drift-") as directory:
+    def test_run_status_exposes_structured_finish_blockers(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-finish-readiness-") as directory:
             runtime = self.make_runtime(Path(directory))
             self.initialize_audit(runtime)
-            state_path = runtime.current("gh-audit-repo") / "state.json"
-            state = json.loads(state_path.read_text())
-            state["helper_hashes"] = {}
-            workflow_run.write_state(runtime.current("gh-audit-repo"), state)
 
             status = runtime.run_status("gh-audit-repo")
-            assert not status["helper_integrity"]["valid"]
-            assert status["scheduler"]["next_action"] == "abort-and-start-new-run"
-            assert status["helper_integrity"]["required_action"] == "abort-and-start-new-run"
-            assert status["scheduler"]["worker_slots"] == 0
-            for field in (
-                "repository",
-                "sha",
-                "branch",
-                "audit_worktree",
-                "source_confirmed",
-                "head_drift",
-                "history",
-                "inventory",
-                "shards",
-                "verdicts",
-                "validations",
-                "mutations",
-                "metrics",
-            ):
-                assert field in status
-            with pytest.raises(ValueError, match="helpers changed"):
-                runtime.audit_metrics()
+
+            assert status["finish_ready"] is False
+            blockers = {blocker["kind"]: blocker for blocker in status["finish_blockers"]}
+            assert blockers["incomplete-phases"]["allowed_action"] == "phase"
+            assert "phase" in status["allowed_actions"]
 
     def test_publication_finish_is_atomic_and_validated(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-publish-safety-") as directory:
@@ -505,3 +556,240 @@ class TestRuntimeSafety:
             with pytest.raises(ValueError, match="cache is missing"):
                 runtime.history_query(HistoryQueryRequest(workflow=workflow))
             assert not database.exists()
+
+    def test_audit_mode_owns_integration_and_shard_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-audit-shard-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            planned = runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    task={
+                        "logical_id": "discover-core",
+                        "assignment": {
+                            "mode": "discover",
+                            "shard_id": "shard-core",
+                            "area": "area/shared-core",
+                            "paths": ["src/core.py"],
+                        },
+                    },
+                )
+            )
+            assert planned["task"]["role"] == "discover"
+            assert planned["task"]["requires_integration"] is True
+            assert runtime.state("gh-audit-repo")["shards"]["shard-core"]["status"] == "pending"
+
+            runtime.task_manage(TaskManageRequest(action="mark_running", task_id="discover-core-1"))
+            assert runtime.state("gh-audit-repo")["shards"]["shard-core"]["status"] == "running"
+            completed = runtime.task_manage(
+                TaskManageRequest(
+                    action="complete",
+                    task_id="discover-core-1",
+                    report={"status": "partial", "remaining": "one module"},
+                )
+            )
+            assert completed["task"]["result"] == "areas/discover-core-1.json"
+            runtime.task_manage(
+                TaskManageRequest(action="integration_begin", task_id="discover-core-1")
+            )
+            runtime.task_manage(
+                TaskManageRequest(action="integration_end", task_id="discover-core-1")
+            )
+            assert runtime.state("gh-audit-repo")["shards"]["shard-core"]["status"] == "partial"
+
+    def test_suspended_audit_accepts_only_late_worker_results(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-audit-suspend-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.history_manage(HistoryManageRequest(action="prepare"))
+            runtime.history_manage(
+                HistoryManageRequest(action="commit", full_history_complete=True)
+            )
+            runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    task={
+                        "logical_id": "discover-core",
+                        "assignment": {
+                            "mode": "discover",
+                            "shard_id": "shard-core",
+                            "area": "area/shared-core",
+                            "paths": ["src/core.py"],
+                        },
+                    },
+                )
+            )
+            runtime.task_manage(TaskManageRequest(action="mark_running", task_id="discover-core-1"))
+            paused = runtime.run_manage(RunManageRequest(action="pause", workflow="gh-audit-repo"))
+            assert paused["status"] == "suspended"
+
+            checkpointed = runtime.task_manage(
+                TaskManageRequest(
+                    action="checkpoint",
+                    task_id="discover-core-1",
+                    report={"status": "partial", "remaining": "tests"},
+                )
+            )
+            assert checkpointed["task"]["status"] == "checkpointed"
+            assert checkpointed["task"]["checkpoint"] == ("areas/discover-core-1.checkpoint.1.json")
+            assert checkpointed["scheduler"]["next_action"] == "resume"
+            context = runtime.task_context(checkpointed["task_ref"])
+            assert context["continuation"] == {
+                "attempt": 1,
+                "report": {"status": "partial", "remaining": "tests"},
+            }
+            with pytest.raises(RuntimeError):
+                runtime.task_manage(
+                    TaskManageRequest(
+                        action="plan",
+                        task={
+                            "logical_id": "discover-late",
+                            "assignment": {"mode": "discover"},
+                        },
+                    )
+                )
+
+    def test_audit_checkpoint_can_be_refreshed_after_resuming_task(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-audit-checkpoint-refresh-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.history_manage(HistoryManageRequest(action="prepare"))
+            runtime.history_manage(
+                HistoryManageRequest(action="commit", full_history_complete=True)
+            )
+            runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    task={
+                        "logical_id": "discover-core",
+                        "assignment": {
+                            "mode": "discover",
+                            "shard_id": "shard-core",
+                            "area": "area/shared-core",
+                            "paths": ["src/core.py"],
+                        },
+                    },
+                )
+            )
+            runtime.task_manage(TaskManageRequest(action="mark_running", task_id="discover-core-1"))
+            first = runtime.task_manage(
+                TaskManageRequest(
+                    action="checkpoint",
+                    task_id="discover-core-1",
+                    report={"status": "partial", "remaining": "tests"},
+                )
+            )
+            runtime.task_manage(TaskManageRequest(action="mark_running", task_id="discover-core-1"))
+            second = runtime.task_manage(
+                TaskManageRequest(
+                    action="checkpoint",
+                    task_id="discover-core-1",
+                    report={"status": "partial", "remaining": "documentation"},
+                )
+            )
+
+            assert first["task"]["checkpoint"] == "areas/discover-core-1.checkpoint.1.json"
+            assert second["task"]["checkpoint"] == "areas/discover-core-1.checkpoint.2.json"
+            assert runtime.task_context(second["task_ref"])["continuation"]["report"] == {
+                "status": "partial",
+                "remaining": "documentation",
+            }
+
+    def test_revising_queued_audit_task_transfers_pending_shard(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-audit-revise-shard-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    task={
+                        "logical_id": "discover-core",
+                        "assignment": {
+                            "mode": "discover",
+                            "shard_id": "shard-old",
+                            "area": "area/shared-core",
+                            "paths": ["src/old.py"],
+                        },
+                    },
+                )
+            )
+            revised = runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    task={
+                        "logical_id": "discover-core",
+                        "assignment": {
+                            "mode": "discover",
+                            "shard_id": "shard-new",
+                            "area": "area/shared-core",
+                            "paths": ["src/new.py"],
+                        },
+                    },
+                )
+            )
+
+            state = runtime.state("gh-audit-repo")
+            assert set(state["shards"]) == {"shard-new"}
+            assert revised["task"]["assignment"]["shard_id"] == "shard-new"
+            assert state["shards"]["shard-new"]["status"] == "pending"
+
+    def test_audit_task_context_supplies_bounded_compact_history(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-audit-context-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.history_manage(HistoryManageRequest(action="prepare"))
+            runtime.history_manage(
+                HistoryManageRequest(
+                    action="ingest",
+                    records=[
+                        {
+                            "kind": "issue",
+                            "number": 1,
+                            "state": "open",
+                            "title": "Shared core cache grows",
+                            "labels": ["area/shared-core"],
+                        },
+                        {
+                            "kind": "issue",
+                            "number": 2,
+                            "state": "closed",
+                            "title": "Earlier parser defect",
+                        },
+                        {
+                            "kind": "pull",
+                            "number": 3,
+                            "state": "open",
+                            "title": "Unrelated documentation",
+                        },
+                    ],
+                )
+            )
+            runtime.history_manage(
+                HistoryManageRequest(action="commit", full_history_complete=True)
+            )
+            planned = runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    task={
+                        "logical_id": "discover-core",
+                        "assignment": {
+                            "mode": "discover",
+                            "area": "area/shared-core",
+                            "focus": "cache behavior",
+                            "leads": [2],
+                        },
+                    },
+                )
+            )
+
+            context = runtime.task_context(planned["task_ref"])
+
+            assert context["history"]["full_history_complete"] is True
+            assert context["history"]["record_count"] == 3
+            assert [
+                (record["kind"], record["number"], record["title"])
+                for record in context["history"]["records"]
+            ] == [
+                ("issue", 2, "Earlier parser defect"),
+                ("issue", 1, "Shared core cache grows"),
+            ]

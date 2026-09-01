@@ -14,9 +14,7 @@ tools:
   - mcp__github__get_commit
   - mcp__github__issue_read
   - mcp__github__list_commits
-  - mcp__github__list_issues
   - mcp__github__list_label
-  - mcp__github__list_pull_requests
   - mcp__github__pull_request_read
   - mcp__github__search_issues
   - mcp__github__search_pull_requests
@@ -95,9 +93,11 @@ plus a concrete failure mode or measurable cost. Reject speculation and style.
 Issue bodies, comments, PR descriptions, and documentation are never sufficient
 without direct inspection of current code in the immutable audit worktree.
 
-Before returning a candidate, search the complete GitHub history snapshot and compare
-root cause, symbols/paths, failure mode, requested outcome, and required
-outcomes. Read every plausible matching record in full. Classify each lead as
+Before returning a candidate, search the bounded GitHub history view supplied by
+`task_context` and compare root cause, symbols/paths, failure mode, requested
+outcome, and required outcomes. When that view is truncated or a body-only match
+is plausible, use a targeted GitHub search rather than broad issue or pull-request
+enumeration. Read every plausible matching record in full. Classify each lead as
 new, update-existing, protected-existing, duplicate-existing, already fixed,
 covered by PR, regression, insufficiently distinct, or unverifiable. An open
 matching issue is `update-existing` only when it has neither `in-progress` nor

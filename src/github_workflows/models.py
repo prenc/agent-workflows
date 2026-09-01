@@ -165,7 +165,7 @@ class TaskPlan(StrictRequest):
     """One logical worker assignment; attempt identity is server-owned."""
 
     logical_id: str
-    role: str = "worker"
+    role: str | None = None
     unit: str | None = None
     assignment: dict[str, Any] = Field(default_factory=dict)
     required: bool = True
@@ -186,9 +186,17 @@ class TaskRetryRequest(StrictRequest):
 
 
 class TaskTransitionRequest(StrictRequest):
-    action: Literal["mark_running", "checkpoint", "fail", "abandon"]
+    action: Literal["mark_running", "fail", "abandon"]
     workflow: WorkflowName = "gh-audit-repo"
     task_id: str
+    note: str | None = None
+
+
+class TaskCheckpointRequest(StrictRequest):
+    action: Literal["checkpoint"]
+    workflow: WorkflowName = "gh-audit-repo"
+    task_id: str
+    report: dict[str, Any] = Field(description="Compact continuation report to retain atomically.")
     note: str | None = None
 
 
@@ -213,6 +221,7 @@ TaskAction = Annotated[
     TaskPlanRequest
     | TaskRetryRequest
     | TaskTransitionRequest
+    | TaskCheckpointRequest
     | TaskReportRequest
     | TaskIntegrationRequest,
     Field(discriminator="action"),
@@ -441,14 +450,14 @@ class KnowledgeRequest(ActionRequest, RootModel[KnowledgeAction]):
 class PytestProbeRequest(StrictRequest):
     kind: Literal["pytest"]
     probe_id: str
-    candidate_id: str | None = None
+    candidate_id: str
     selectors: list[str] = Field(min_length=1)
 
 
 class PythonProbeRequest(StrictRequest):
     kind: Literal["python"]
     probe_id: str
-    candidate_id: str | None = None
+    candidate_id: str
     code: str = Field(min_length=1)
 
 
@@ -481,7 +490,7 @@ CandidateStatus = Literal[
 
 class PhaseRecord(StrictRequest):
     name: PhaseName
-    status: PhaseStatus
+    status: PhaseStatus | None = None
     summary: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -490,13 +499,13 @@ class IdentifiedAuditValue(ExtensibleRecord):
 
 
 class ShardRecordValue(IdentifiedAuditValue):
-    area: str
-    status: ShardStatus
+    area: str | None = None
+    status: ShardStatus | None = None
     paths: list[str] = Field(default_factory=list)
 
 
 class CandidateRecordValue(IdentifiedAuditValue):
-    status: CandidateStatus
+    status: CandidateStatus | None = None
 
 
 class VerdictRecordValue(IdentifiedAuditValue):
