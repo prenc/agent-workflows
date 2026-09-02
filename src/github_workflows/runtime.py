@@ -151,19 +151,7 @@ class WorkflowRuntime:
         }
         repository = next(iter(repositories)) if len(repositories) == 1 else None
         if repository is None:
-            remote = subprocess.run(
-                ["git", "-C", str(self.workspace), "remote", "get-url", "origin"],
-                check=False,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
-            match = re.fullmatch(
-                r"(?:[A-Za-z][A-Za-z0-9+.-]*://[^/]+/|[^/]+@[^:]+:)"
-                r"([^/\s]+)/([^/\s]+?)(?:\.git)?",
-                remote,
-            )
-            if match:
-                repository = f"{match.group(1)}/{match.group(2)}"
+            repository = feedback.repository_from_workspace(self.workspace)
         return repository, workflow, run_id, task
 
     def workflow_feedback(

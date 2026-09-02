@@ -88,6 +88,10 @@ SECRET_KEY = re.compile(
     re.IGNORECASE,
 )
 FALLBACK_EDT = dt.timezone(dt.timedelta(hours=-4), name="EDT")
+REMOTE_REPOSITORY = re.compile(
+    r"(?:[A-Za-z][A-Za-z0-9+.-]*://[^/]+/|[^/]+@[^:]+:)"
+    r"([^/\s]+)/([^/\s]+?)(?:\.git)?"
+)
 
 
 def storage_path() -> Path:
@@ -97,6 +101,21 @@ def storage_path() -> Path:
     if not cache.is_absolute():
         raise ValueError("XDG_CACHE_HOME must be an absolute path")
     return cache / "agent-workflows" / "feedback.jsonl"
+
+
+def repository_from_workspace(workspace: Path) -> str | None:
+    """Return an owner/repository identity from a non-local origin URL."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(workspace), "remote", "get-url", "origin"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    match = REMOTE_REPOSITORY.fullmatch(result.stdout.strip()) if result.returncode == 0 else None
+    return f"{match.group(1)}/{match.group(2)}" if match else None
 
 
 def _private_directory(path: Path) -> None:
@@ -399,6 +418,25 @@ def append(
         finally:
             os.close(descriptor)
     return {"recorded": True, "feedback_id": record["feedback_id"]}
+
+
+def append_manual(*, message: str, tool: str | None, workspace: Path) -> dict[str, Any]:
+    """Record one CLI observation with mechanically derived local context."""
+    resolved_workspace = workspace.resolve()
+    return append(
+        message=message,
+        tool=tool,
+        origin={"failure_kind": "manual"},
+        repository=repository_from_workspace(resolved_workspace),
+        workflow=None,
+        run_id=None,
+        provenance={"client": {"name": "agent-workflows-cli"}},
+        private_paths=[
+            (resolved_workspace, "<workspace>"),
+            (storage_path().parent, "<feedback-cache>"),
+            (Path.home(), "<home>"),
+        ],
+    )
 
 
 def compact_records(

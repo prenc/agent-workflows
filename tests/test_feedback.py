@@ -234,8 +234,9 @@ def test_feedback_ignores_local_path_git_remote(cache: Path, tmp_path: Path) -> 
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(
-            "github_workflows.runtime.subprocess.run",
-            lambda *args, **kwargs: type("Result", (), {"stdout": "/srv/repos/repo.git\n"})(),
+            feedback.subprocess,
+            "run",
+            lambda *args, **kwargs: mock.Mock(returncode=0, stdout="/srv/repos/repo.git\n"),
         )
         result = runtime.workflow_feedback(
             WorkflowFeedbackRequest(message="The tool selection was unclear")
@@ -466,6 +467,75 @@ def test_feedback_cli_lists_compact_records_and_shows_context(
     assert run_feedback(remove_args) == 0
     assert capsys.readouterr().out == "Removed 1 feedback record.\n"
     assert feedback.read_records() == []
+
+
+def test_feedback_cli_add_derives_and_sanitizes_context(
+    cache: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(
+        feedback,
+        "repository_from_workspace",
+        lambda _workspace: "example/project",
+    )
+    message = f"The command exposed {workspace} and {feedback.storage_path().parent}"
+    args = build_parser().parse_args(["feedback", "add", message, "--tool", "run_shell_command"])
+
+    assert run_feedback(args) == 0
+
+    output = capsys.readouterr().out
+    feedback_id = re.search(r"fb-[0-9a-f]{12}", output)
+    assert feedback_id is not None
+    record = feedback.find(feedback_id.group())
+    assert record["repository"] == "example/project"
+    assert record["workflow"] is None
+    assert record["run_id"] is None
+    assert record["tool"] == "run_shell_command"
+    assert record["message"] == "The command exposed <workspace> and <feedback-cache>"
+    assert record["origin"] == {"failure_kind": "manual"}
+    assert record["provenance"] == {"client": {"name": "agent-workflows-cli"}}
+
+
+@pytest.mark.parametrize(
+    ("remote", "expected"),
+    [
+        ("https://github.com/example/project.git", "example/project"),
+        ("git@github.com:example/project.git", "example/project"),
+        ("/srv/repos/project.git", None),
+        ("", None),
+    ],
+)
+def test_feedback_repository_attribution_accepts_only_remote_urls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    remote: str,
+    expected: str | None,
+) -> None:
+    monkeypatch.setattr(
+        feedback.subprocess,
+        "run",
+        lambda *args, **kwargs: mock.Mock(returncode=0, stdout=remote),
+    )
+
+    assert feedback.repository_from_workspace(tmp_path) == expected
+
+
+@pytest.mark.parametrize("message", ["", " " * 3, "x" * 2001])
+def test_feedback_cli_add_validates_the_message(cache: Path, message: str) -> None:
+    args = build_parser().parse_args(["feedback", "add", message])
+
+    with pytest.raises(
+        ValueError,
+        match=r"at least 1 character|text must not be blank|at most 2000 characters",
+    ):
+        run_feedback(args)
+
+    assert not feedback.storage_path().exists()
 
 
 def test_feedback_cli_closes_filters_and_reopens_records(

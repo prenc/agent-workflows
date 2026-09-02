@@ -22,6 +22,7 @@ from .models import (
     PublishRequest,
     RunManageRequest,
     TaskManageRequest,
+    WorkflowFeedbackRequest,
 )
 from .runtime import WorkflowRuntime
 
@@ -73,8 +74,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     workflow.add_argument("request", nargs="?", help="JSON object, JSON file, or - for stdin")
 
-    feedback_parser = subparsers.add_parser("feedback", help="inspect local agent feedback")
+    feedback_parser = subparsers.add_parser(
+        "feedback", help="record or inspect local agent feedback"
+    )
     feedback_commands = feedback_parser.add_subparsers(dest="feedback_command", required=True)
+    feedback_add = feedback_commands.add_parser("add", help="record one concise observation")
+    feedback_add.add_argument("message", help="PHI-free workflow friction and its consequence")
+    feedback_add.add_argument("--tool", help="related native or external tool name")
     feedback_commands.add_parser("path", help="print the feedback JSONL path")
     feedback_stats = feedback_commands.add_parser(
         "stats", help="summarize feedback retention and record sizes"
@@ -168,6 +174,15 @@ def run_workflow(args: argparse.Namespace) -> int:
 
 
 def run_feedback(args: argparse.Namespace) -> int:
+    if args.feedback_command == "add":
+        request = WorkflowFeedbackRequest(message=args.message, tool=args.tool)
+        result = feedback.append_manual(
+            message=request.message,
+            tool=request.tool,
+            workspace=Path.cwd(),
+        )
+        print(f"Recorded feedback {result['feedback_id']}.")
+        return 0
     if args.feedback_command == "path":
         print(feedback.storage_path())
         return 0

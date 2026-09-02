@@ -1434,3 +1434,32 @@ class TestExtensionMcp:
             if line.startswith("  - ")
         }
         assert "web_fetch" in configured
+
+    def test_feedback_skill_contract_is_consistent_across_clients(self) -> None:
+        codex = (ROOT / "codex/skills/workflow-feedback/SKILL.md").read_text(encoding="utf-8")
+        qwen = (EXTENSION / "skills/workflow-feedback/SKILL.md").read_text(encoding="utf-8")
+
+        assert codex.startswith("---\nname: workflow-feedback\n")
+        assert qwen.startswith("---\nname: workflow-feedback\n")
+        for document in (codex, qwen):
+            assert all(
+                contract in document
+                for contract in (
+                    "default and is read-only",
+                    "Record and analyze feedback from the active",
+                    "Only implementation work",
+                    "requires a writable `agent-workflows` checkout",
+                    "exactly one coherent root-cause group",
+                    "Ask the user before calling `feedback trace`",
+                    "never use `feedback remove`",
+                    "commits, pushes, installation",
+                    "MCP restart",
+                    "`addressed`",
+                    "`duplicate`",
+                    "`external`",
+                    "`not-actionable`",
+                )
+            )
+
+        assert "agent-workflows feedback add" in codex
+        assert "mcp__github_workflows__workflow_feedback" in qwen

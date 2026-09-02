@@ -51,6 +51,10 @@ subcommand declared in `qwen-extension.json`.
 Material skill, MCP, workflow, or active-instruction friction reported by
 supervisors and named workers is kept locally in
 `${XDG_CACHE_HOME:-~/.cache}/agent-workflows/feedback.jsonl`.
+Qwen records feedback through the extension's `workflow_feedback` tool. Codex
+and other local callers can record the same concise observation with
+`agent-workflows feedback add "<message>" [--tool <name>]`; repository identity,
+time, storage, and CLI provenance are derived automatically.
 Review it with `agent-workflows feedback list` and inspect one complete record
 with `agent-workflows feedback show <feedback-id>`. The list prints compact
 metadata followed by each complete wrapped summary; use
@@ -67,3 +71,10 @@ records with `feedback close <feedback-id> [<feedback-id> ...]`, optionally
 selecting a disposition and a short PHI-free note; default lists
 show only open feedback, while `feedback ls --closed` and `feedback sources --closed` inspect the retained closed set. Use `feedback reopen` to restore a
 closed record. `feedback remove` remains the explicit permanent-deletion command.
+
+The `workflow-feedback` skill is available to both Codex and Qwen. With no
+explicit action it performs read-only inventory, investigation, classification,
+and grouping. An explicit fix request authorizes one coherent feedback group;
+validated records are closed with an evidence-based disposition rather than
+deleted. Raw Qwen transcript tracing, commits, pushes, installation, reloads,
+and MCP restarts remain separately authorized actions.
