@@ -189,6 +189,10 @@ reports it ignored; otherwise the server uses a project-namespaced directory
 under `${XDG_CACHE_HOME:-~/.cache}/agent-workflows/worktrees`. On `--resume`, call the same tool with
 action `resume` and pass `n`
 only when the user supplied it; the tool applies that change atomically.
+The immutable audit worktree may link the primary project `.venv`, but neither
+the supervisor nor workers resolve `uv.lock`, synchronize, or install there.
+Only the reviewed read-only inventory and probe helpers may execute against
+that environment.
 
 The server owns the run record and initializes canonical phases, shards, tasks,
 candidates, validations, verdicts, mutations, limitations, pending work,

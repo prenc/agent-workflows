@@ -88,9 +88,36 @@ unchanged.
 ## Git Worktrees
 
 Place Git worktrees under `<project>/.worktrees/<name>` and ensure
-`.worktrees/` is ignored by the main worktree. In each secondary worktree, link
-`.venv` to the main project's `.venv`; do not create, copy, or synchronize a
-separate environment.
+`.worktrees/` is ignored by the main worktree. For a Python worktree, the agent
+controlling the worktree must choose and record one environment mode before
+delegating work:
+
+- Use `shared` for source-only work with unchanged dependency, packaging,
+  entry-point, compiled-extension, and import-layout inputs. Link `.venv` to the
+  main project's `.venv`, derive project-relative `PYTHONPATH` roots from the
+  repository configuration, and prefix every command with `UV_NO_SYNC=1` and
+  that `PYTHONPATH`. This includes Make targets so nested `uv` calls inherit the
+  protection. Never run an installer or environment-mutating command in this
+  mode.
+- Use `isolated` whenever those conditions do not hold or shared mode proves
+  insufficient. The controlling agent first checks a tracked `uv.lock`
+  non-mutatingly and blocks on unauthorized staleness. It verifies and unlinks
+  only a `.venv` symlink targeting the main environment before resolving the
+  lock, creating the worktree-local `.venv`, and populating it with a frozen
+  offline `uv sync` using the repository's documented groups or extras. It
+  never provisions through a symlink. Workers still use
+  `UV_NO_SYNC=1`; they report dependency-input changes for controller refresh
+  rather than changing the environment themselves.
+- Use `native` for non-Python projects and do not create or link `.venv`.
+
+Respect the repository's lockfile convention: retain tracked locks, keep
+ignored locks local, and keep an otherwise unwanted generated lock in a private
+cache beside the managed worktree root rather than adding it to the change. Reuse one resolved lock
+only for worktrees whose dependency inputs are directly confirmed identical.
+Resolve and synchronize offline first; ask before network access. A stale
+tracked lock requires scope or user authority to update. On interrupted
+provisioning, restore the prior lock and verified `.venv` link state without
+following or deleting an unexpected symlink target.
 
 ## GitHub Interaction
 

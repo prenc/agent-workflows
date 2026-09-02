@@ -1314,6 +1314,84 @@ class TestExtensionMcp:
                 if path.is_symlink():
                     pytest.fail(f"extension resource must not be a symlink: {path}")
 
+    def test_shared_guidance_defines_github_pagination_and_pr_label_calls(self) -> None:
+        runtime_policy = (EXTENSION / "references/github-runtime-policy.md").read_text(
+            encoding="utf-8"
+        )
+        issue_conventions = (EXTENSION / "references/github-issue-conventions.md").read_text(
+            encoding="utf-8"
+        )
+
+        assert all(
+            term in runtime_policy
+            for term in ("`get_commit`", "`page`", "`perPage`", "first page alone")
+        )
+        assert all(
+            term in issue_conventions
+            for term in ("`issue_write`", "`issue_number`", "`get_labels`", "complete desired")
+        )
+
+    def test_implementation_guidance_requires_evidence_based_validation_and_drafts(self) -> None:
+        supervisor = (EXTENSION / "skills/gh-implement-issue/SKILL.md").read_text(encoding="utf-8")
+        worker = (EXTENSION / "agents/gh-implement-issue-worker.md").read_text(encoding="utf-8")
+
+        for document in (supervisor, worker):
+            assert all(
+                term in document
+                for term in (
+                    "initial_draft",
+                    "required_worker_draft",
+                    "current state",
+                    "shebang",
+                    "pre-edit SHA",
+                    "baseline limitation",
+                )
+            )
+
+    def test_worktree_environment_contract_is_consistent_across_agents(self) -> None:
+        documents = [
+            (ROOT / "user-policies/codex.md").read_text(encoding="utf-8"),
+            (ROOT / "user-policies/qwen.md").read_text(encoding="utf-8"),
+            (ROOT / "codex/skills/gh-pickup-work/SKILL.md").read_text(encoding="utf-8"),
+            (EXTENSION / "references/github-runtime-policy.md").read_text(encoding="utf-8"),
+            (EXTENSION / "skills/gh-implement-issue/SKILL.md").read_text(encoding="utf-8"),
+            (EXTENSION / "agents/gh-implement-issue-worker.md").read_text(encoding="utf-8"),
+        ]
+
+        for document in documents:
+            assert all(
+                contract in document
+                for contract in ("shared", "isolated", "UV_NO_SYNC", "PYTHONPATH")
+            )
+
+        supervisor_documents = documents[:5]
+        for document in supervisor_documents:
+            assert all(
+                contract in document
+                for contract in ("uv.lock", "offline", "frozen", "tracked", "ignored")
+            )
+
+        for document in documents[2:5]:
+            normalized = document.lower()
+            assert all(
+                contract in normalized for contract in ("uv lock --check", "unlink", "symlink")
+            )
+
+        runtime_policy = documents[3]
+        assert all(
+            contract in runtime_policy
+            for contract in (
+                "execution_environment",
+                "CORRECTION_NEEDED",
+                "private `0700` cache",
+                "stale tracked lock",
+            )
+        )
+        assert runtime_policy.index("uv lock --check") < runtime_policy.index("unlink .venv")
+        assert runtime_policy.index("unlink .venv") < runtime_policy.index(
+            "\nuv lock --offline --no-python-downloads"
+        )
+
     def test_worktree_workers_expose_reliable_search_tools(self) -> None:
         search_tools = {"run_shell_command", "grep_search", "read_file", "glob"}
         expected = {

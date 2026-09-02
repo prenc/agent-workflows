@@ -14,6 +14,14 @@ changes. Invoke project executables through `uv run`; direct `uv` environment
 and packaging operations such as `uv venv`, `uv pip install`, and `uv build`
 are the exceptions.
 
+The prohibition on `uv.lock` and `uv sync` applies to the primary and shared
+environment. A worktree supervisor may generate an ignored worktree lock and
+use `uv sync --frozen --offline` only to populate an isolated worktree
+environment. It must check a tracked lock before updating it and verify and
+unlink only the expected shared `.venv` symlink before creating isolation;
+provisioning through that symlink is prohibited. Workers never synchronize
+either environment.
+
 The public CLI is `agent-workflows`. Its `install` subcommand owns Qwen, Codex,
 and third-party skill integration; `workflow` is the recovery interface; `mcp`
 is reserved for the Qwen extension. Keep these as native CLI interfaces rather

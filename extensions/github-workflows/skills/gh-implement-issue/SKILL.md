@@ -83,7 +83,7 @@ are resume context rather than a fallback. The supervisor remains authoritative
 for claims, scheduling, issue/label state, final live verification, and every
 draft-to-ready transition.
 
-Use the linked project `.venv`, `uv`, and lightweight login-node checks. Keep
+Use the supervisor-selected environment, `uv`, and lightweight login-node checks. Keep
 repository-root `data/` contents, secrets, unrelated changes, CI/check APIs,
 merges, reviews, and reassessment outside this workflow. Validate taxonomy and
 report drift while mutating only assignment, `in-progress`, `partial`, and
@@ -241,8 +241,7 @@ existing PR:      <root>/issue-<anchor>-pr-<P>-continue
 
 Use the preferred root only when `git check-ignore --no-index` confirms
 `.worktrees/` is ignored. Otherwise use the project-namespaced fallback root;
-do not modify ignore files merely to place a worktree. Link the secondary
-worktree's `.venv` to the main project environment. Inspect registered worktrees, branch ownership, Git
+do not modify ignore files merely to place a worktree. Inspect registered worktrees, branch ownership, Git
 operation state, local changes, and remote refs. Reuse matching durable Qwen or
 Codex state when repository, unit, and branch ownership are unambiguous.
 
@@ -258,11 +257,69 @@ Record each conflict and focused validation. Abort and restore the rebase when
 resolution requires new product, scientific, dependency, security, or data
 authority.
 
+Choose the worktree environment after the rebase and before worker assignment.
+Use `native` for a non-Python project. For Python, use `shared` only when the
+unit cannot affect dependency inputs, packaging, entry points, compiled
+extensions, or import layout and the repository establishes unambiguous
+project-relative source roots. Link the worktree `.venv` to the verified main
+project `.venv`; do not overwrite an unexpected path or follow its target.
+
+Use `isolated` for every other Python unit and when a repository command may
+write the environment. Stop any worker before changing modes. Classify the
+worktree `uv.lock` first. Check a tracked lock with
+`uv lock --check --offline --no-python-downloads` and stop on staleness unless
+its update is authorized; only then may mutating `uv lock` run. Inspect `.venv`
+without following it. Unlink it only when it is a symlink resolving exactly to
+the verified main `.venv`; block on any other existing target. Create the now
+absent worktree `.venv` with the main environment's interpreter and populate it
+only with `UV_OFFLINE=1 uv sync --frozen --no-python-downloads` plus the
+documented groups or extras. Never run either command through a `.venv`
+symlink. The supervisor alone runs these environment writers.
+
+Respect the repository's lock convention: preserve a tracked lock, keep an
+ignored lock local, or retain an otherwise unwanted generated lock in private
+cache beside the managed worktree root and remove its temporary worktree copy
+after synchronization. Make the cache directory `0700`; reject symlinks and
+foreign ownership. Do not
+update a stale tracked lock without scope or user authority. Reuse one lock
+only for worktrees whose dependency inputs are directly confirmed identical.
+On failure, remove only an incomplete worktree environment, restore the prior
+lock and verified `.venv` link state, preserve resumable state, and ask before
+network access. Retain isolated environments across rounds and suspension;
+validate them on resume and remove them with their owning worktrees.
+
 Before each active round, refresh the unit and confirm its recorded claim. For
 an existing PR, remove `ready-to-merge`, apply PR `in-progress`, and preserve
 `partial` while accepted scope remains incomplete.
 
+Record the PR's observed draft flag as `initial_draft` in every existing-PR
+assignment and set `required_worker_draft` to `true`. State the transition
+explicitly: tell the worker to keep an existing draft as draft, or to change a
+ready PR to draft before editing because only the supervisor may restore ready
+status. Never say to keep the PR in its "current state." If the user's current
+instruction forbids changing a ready PR to draft, stop for direction instead of
+launching a worker under contradictory rules.
+
 ## Stage 4: run bounded implementation rounds
+
+Build the round's validation plan from inspected evidence before registering
+the assignment. Copy repository-owned validation commands exactly; do not add
+files to their argument lists. Derive any file-specific check from the file's
+actual shebang, language configuration, and syntax rather than its extension or
+name. Run a cheap supervisor-added syntax or static check against the recorded
+pre-edit SHA before making it a completion gate. A check that already fails at
+that SHA is an informational baseline limitation, not required worker
+validation. Do not invent broad test, formatter, interpreter, or compiler
+commands when the repository does not establish them.
+
+Put `execution_environment` in every assignment. It contains `mode: native`,
+`mode: isolated`, or `mode: shared` plus `pythonpath`, an ordered list of
+existing project-relative source roots. Do not put absolute paths, lock
+contents, or environment details the worker can derive from the mode in the
+assignment. Record mode, lock ownership, and selected sync groups in the
+supervisor ledger. Every Python validation command must run with
+`UV_NO_SYNC=1`; shared mode also sets the assigned `PYTHONPATH`, including on a
+top-level Make command so nested uv calls inherit it.
 
 Register the complete round assignment with
 `mcp__github_workflows__task_manage` using action `plan` and a typed `task`.
@@ -324,7 +381,8 @@ round. If a correction or additional inspection is delegated, register it throug
 Draft-to-ready promotion requires:
 
 - every required outcome for every covered issue is complete;
-- focused tests and `.venv/bin/pre-commit run --all-files` pass;
+- focused tests and the repository's pre-commit command pass under the assigned
+  environment with `UV_NO_SYNC=1`;
 - the complete diff is cohesive and contains no unrelated or sensitive work;
 - no unresolved authority-sensitive decision remains;
 - the worktree has no active Git operation.

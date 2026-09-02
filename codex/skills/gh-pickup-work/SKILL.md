@@ -61,7 +61,7 @@ reviewed-execution boundary.
 - Never access secrets or confidential data. Preserve scientific and research
   semantics unless accepted scope and current user authority explicitly permit
   a change.
-- Use the project `.venv`, `uv`, and lightweight login-node checks. Do not add
+- Use the selected worktree environment, `uv`, and lightweight login-node checks. Do not add
   dependencies or run Slurm/GPU/heavy work without explicit authority.
 - Never create or execute a temporary orchestration script. Repository source,
   tests, and scripts may be created or run only when genuinely required by the
@@ -209,8 +209,32 @@ Use the preferred root only when `git check-ignore --no-index` confirms
 do not modify ignore files merely to place a worktree. Inspect `git worktree list --porcelain`, branch
 state, Git-operation state, and local changes. Reuse a worktree only when it
 demonstrably belongs to the selected repository, unit, and branch. Never reset,
-clean, stash, overwrite, or repurpose unrelated state. Link `.venv` to the main
-project `.venv` when present.
+clean, stash, overwrite, or repurpose unrelated state.
+
+Choose and record `native`, `shared`, or `isolated` environment mode before
+implementation. Use `native` for non-Python projects. Use `shared` only for
+source-only Python work with unchanged dependency, packaging, entry-point,
+compiled-extension, and import-layout inputs and unambiguous project-relative
+source roots. Link `.venv` to the verified main project environment; never
+overwrite an unexpected path or follow its target. Prefix every command with
+`UV_NO_SYNC=1` and the derived `PYTHONPATH`, including Make targets, and never
+run an environment writer in shared mode.
+
+Otherwise stop concurrent work and use `isolated`. Classify `uv.lock` first and
+non-mutatingly run `uv lock --check --offline --no-python-downloads` for a
+tracked lock. Stop on staleness unless updating it is authorized; only then may
+mutating `uv lock` run. Inspect `.venv` without following it, require any
+symlink to resolve exactly to the verified main environment, and unlink only
+that symlink before creating the local environment. Block on any other existing
+target, and never run `uv venv` or `uv sync` through a symlink. Populate the
+environment with a frozen offline sync and documented groups or extras. Respect
+tracked, ignored, and intentionally omitted lockfile conventions; keep an unwanted
+generated lock in a private `0700` cache beside the managed worktree root rather
+than adding it to the change; reject symlinks and foreign ownership.
+Reuse a lock only across directly identical dependency inputs. Restore the
+prior lock and verified link state after a failed provision, and ask before
+network access. After provisioning, use `UV_NO_SYNC=1`; refresh the lock and
+environment yourself before validation whenever dependency inputs change.
 
 Fetch the exact latest base and selected remote head. Record the remote head
 SHA as the future lease. Create scratch branches from the exact latest base.
@@ -246,10 +270,12 @@ discarding it. Never publish a reassessment comment.
 ## 6. Implement and validate
 
 Implement the smallest cohesive change satisfying every selected issue. Track
-coverage per issue throughout the work. Add focused tests where practical. Use
-`PYTHONPATH=src` only when established by repository instructions. Run the
-fastest relevant checks and always run
-`.venv/bin/pre-commit run --all-files` when the project uses pre-commit.
+coverage per issue throughout the work. Add focused tests where practical. Run
+the fastest relevant checks under the recorded environment and always set
+`UV_NO_SYNC=1` for Python work. Shared mode also sets the derived `PYTHONPATH`
+on every command; isolated mode relies on its worktree-local editable install.
+Run the repository's pre-commit command under the same environment when the
+project uses pre-commit.
 
 Review the complete diff from latest base for scope, secrets/data exposure,
 unrelated files, and accidental research-semantic changes. Commit focused

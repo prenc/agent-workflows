@@ -13,6 +13,12 @@ supervisors and workers.
 - Paginate list and search operations in batches of 5-10 whenever practical.
   Continue through every required page when the workflow needs a complete
   result set so compact responses preserve evidence completeness.
+- Treat `get_commit` changed files as paginated for both `stats` and
+  `full_patch`: pass `page` and `perPage`, start at page 1, and continue until
+  the returned page contains fewer than `perPage` files. Never infer that a
+  path is absent from a commit from the first page alone. If the active tool
+  schema does not expose `page` and `perPage`, report incomplete commit-detail
+  coverage and do not use the missing hunk as evidence.
 - Expand to full output only when required metadata is unavailable from the
   compact form. The repository-feature error diagnostic is one such explicit
   exception: `search_repositories` uses `minimal_output: false` to read
@@ -25,7 +31,7 @@ supervisors and workers.
   prohibited, including under `.qwen/runs/`, legacy `.qwen/tmp/`, `/tmp`, run
   state, and worktrees.
 - Temporary workflow artifacts must be declarative and non-executable: JSON,
-  JSONL, Markdown, text, SQLite databases, or command output. Keep their
+  JSONL, Markdown, text, TOML lockfiles, SQLite databases, or command output. Keep their
   executable bit unset.
 - Execute only reviewed workflow helpers, repository-owned commands that are
   relevant to accepted implementation or validation scope, and visible inline
@@ -87,7 +93,74 @@ Implementation workflows may create, modify, and execute repository source,
 tests, or scripts when those files are genuinely required by the accepted
 issue or pull-request scope. This does not permit temporary executable
 orchestration helpers. Validation should use the project's existing commands,
-the linked `.venv`, and `uv` under the repository instructions.
+the supervisor-selected environment, and `uv` under the repository instructions.
+
+## Implementation worktree environments
+
+The supervisor chooses and records `execution_environment.mode` before each
+implementation worker round. Use `native` for a non-Python project. For Python,
+use `shared` only for source-only work whose dependency, packaging, entry-point,
+compiled-extension, and import-layout inputs are unchanged and unambiguous;
+otherwise use `isolated`. Ambiguous source roots, an environment-mutating
+project command, installation-sensitive validation, or an observed import from
+another worktree also requires isolation.
+
+A shared assignment contains only project-relative source roots, for example:
+
+```json
+{"execution_environment":{"mode":"shared","pythonpath":["src"]}}
+```
+
+The worker prefixes every command, including Make targets and direct project
+executables, with `env UV_NO_SYNC=1 PYTHONPATH="$PWD/src"` using the assigned
+roots. It never runs `uv sync`, `uv pip install`, `pip install`, or another
+environment writer. The prefix protects nested `uv run` calls but is not a
+substitute for prohibiting explicit installers.
+
+For isolated mode, the supervisor stops the worker and classifies `uv.lock` as
+tracked, ignored, or absent before any mutation. For a tracked lock, first run
+`uv lock --check --offline --no-python-downloads`; if it is stale, stop unless
+updating it is authorized. Only ignored, absent, or authorized stale locks may
+then be resolved with mutating `uv lock`.
+
+Before creating the isolated environment, inspect `.venv` without following it.
+If it is a symlink, resolve it strictly, require its target to equal the verified
+primary `.venv`, and unlink only the worktree symlink. Block on any other target
+or filesystem object. Never invoke `uv venv` or `uv sync` while `.venv` is a
+symlink. Then populate the worktree environment from the exact lock with the
+repository's documented dependency groups or extras:
+
+```sh
+uv lock --check --offline --no-python-downloads  # existing tracked lock
+unlink .venv                                      # verified shared link only
+uv lock --offline --no-python-downloads
+uv venv --python <primary-project>/.venv/bin/python .venv
+UV_OFFLINE=1 uv sync --frozen --no-python-downloads <groups-or-extras>
+```
+
+Workers use the populated environment with `UV_NO_SYNC=1` and no `PYTHONPATH`
+override. A worker that changes dependency inputs or discovers that shared mode
+is insufficient returns `CORRECTION_NEEDED`; the supervisor refreshes the lock
+and environment before another round. Dependency changes still require their
+ordinary authority.
+
+Respect repository lock ownership. Preserve a tracked lock and include an
+authorized resulting lock change in the implementation. Keep an ignored lock
+local. When the repository intentionally omits a lock, retain the generated
+lock in a private `0700` cache beside the managed worktree root, use a temporary
+worktree copy for frozen sync, and remove that copy afterward. Reject symlinked
+or foreign-owned cache directories. Reuse a resolved lock only when dependency
+inputs are directly identical. A stale tracked lock blocks unless updating it
+is in scope. If offline resolution or sync fails, restore the prior lock and
+verified `.venv` link state, preserve resumable state, and ask before network
+access. Never follow, replace, or delete an unexpected symlink target or run a
+mutating lock command before the tracked-lock check.
+
+Retain an isolated environment with a suspended worktree and remove it only
+when its owning worktree is deliberately removed. On resume, validate the mode,
+link target, interpreter, lock ownership, and environment before reuse. Audit
+worktrees remain immutable: they use the existing read-only probe environment
+and never resolve locks or install dependencies.
 
 ## Runtime failures
 

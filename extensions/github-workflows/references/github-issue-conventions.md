@@ -122,6 +122,14 @@ status labels. Preserve unrelated labels after the canonical labels. GitHub's
 UI may render labels in a different order; workflows control only their request
 and report order.
 
+Pull requests use the issue-label API. With the GitHub MCP tools, read the
+current PR labels through `issue_read` method `get_labels`, then call
+`issue_write` method `update` with the PR number in `issue_number` and the
+complete desired label list, preserving unrelated labels. Read the labels back
+through `issue_read` before recording success. `label_write` manages repository
+label definitions, while `update_pull_request` does not mutate labels; neither
+is the PR-label assignment interface.
+
 ## Label responsibility
 
 - The issue-curation workflow owns correction of canonical label definitions
