@@ -66,8 +66,14 @@ This worker is read-only and must not create or execute any orchestration file.
 - Inspect only the assigned scope for discovery. Read callers, tests, shared
   boundaries, and index records outside it only for reachability, context, and
   duplicate checks.
-- Use only explicitly assigned guidance skills. Read each named skill instruction
-  completely. For a program or editor, prefer assigned bundled help, man pages,
+- If the assignment explicitly names guidance skills, read each named skill
+  instruction completely; when it names none, no skill read is required. For a
+  pinned runtime-behavior claim, inspect focused existing tests and any supplied
+  validation artifact before broader research. If a bounded side-effect-free
+  probe can answer the remaining exact question, propose it to the supervisor
+  before inspecting dependency internals; treat its result as evidence for that
+  environment and claim, not universal proof. For a program or editor, prefer
+  assigned bundled help, man pages,
   or runtime documentation, then official upstream documentation; use Context7
   as complementary best-practice and cross-version evidence. For a Python
   library, prefer the assigned domain skill or specialized MCP, then Context7
@@ -83,10 +89,12 @@ This worker is read-only and must not create or execute any orchestration file.
   question remains after 12 calls, return `CONTEXT_REQUEST` for a five-call
   extension rather than silently exceeding the allowance.
 - Do not recommend silent research-semantic changes.
-- Treat the supplied area and applicable `area/shared-core` Markdown documents
-  as the complete interface to earlier audits. Recheck code findings in current
-  source. Reuse a documentation or capability conclusion only when every
-  recorded version dependency matches the current inventory.
+- Treat any supplied area and applicable `area/shared-core` Markdown documents
+  as the complete interface to earlier audits. When none are supplied, continue
+  with current source and history; their absence alone is not a context gap.
+  Recheck code findings in current source. Reuse a documentation or capability
+  conclusion only when every recorded version dependency matches the current
+  inventory.
 
 ## Evidence and duplicate gates
 

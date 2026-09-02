@@ -55,6 +55,12 @@ TASK_HISTORY_FIELDS = (
     "labels",
 )
 TASK_METADATA_FIELDS = ("id", "logical_id", "role", "unit", "attempt", "status", "required")
+WORKFLOW_REF_NAMES: dict[WorkflowName, str] = {
+    "gh-audit-repo": "audit",
+    "gh-curate-issues": "curate",
+    "gh-implement-issue": "implement",
+}
+REF_WORKFLOWS = {name: workflow for workflow, name in WORKFLOW_REF_NAMES.items()}
 
 
 class WorkflowRuntime:
@@ -114,15 +120,20 @@ class WorkflowRuntime:
         run_id = str(active[0].get("run_id")) if len(active) == 1 else None
         task: dict[str, str] | None = None
         if task_ref is not None:
-            parsed_workflow, parsed_run_id, task_id = self._parse_task_ref(task_ref)
+            parsed_workflow, parsed_run_ref, task_id = self._parse_task_ref(task_ref)
             workflow = parsed_workflow
-            run_id = parsed_run_id
+            # Legacy full workflow names carry the raw run ID for feedback attribution.
+            # Remove this branch with legacy task-ref parsing after pre-short-ref runs
+            # no longer need to resume.
+            run_id = parsed_run_ref if task_ref.split(":", 1)[0] in workflow_run.WORKFLOWS else None
             task = {"id": task_id}
             try:
                 state = self.state(parsed_workflow)
             except (OSError, ValueError):
                 state = {}
-            matching_state = state if state.get("run_id") == parsed_run_id else {}
+            matching_state = state if self._task_ref_matches(state, parsed_run_ref) else {}
+            if matching_state:
+                run_id = str(matching_state["run_id"])
             stored_task = matching_state.get("tasks", {}).get(task_id)
             if isinstance(stored_task, dict):
                 role = stored_task.get("role")
@@ -500,11 +511,23 @@ class WorkflowRuntime:
         }
 
     @staticmethod
+    def _run_ref(run_id: str) -> str:
+        return hashlib.blake2s(run_id.encode(), digest_size=6).hexdigest()
+
+    @classmethod
+    def _task_ref_matches(cls, state: dict[str, Any], run_ref: str) -> bool:
+        run_id = state.get("run_id")
+        # Accepting the raw run ID preserves legacy workflow:run-id:task-id refs.
+        # Remove the raw run_id alternative after pre-short-ref runs no longer
+        # need to resume.
+        return isinstance(run_id, str) and run_ref in {run_id, cls._run_ref(run_id)}
+
+    @staticmethod
     def _task_ref(workflow: WorkflowName, state: dict[str, Any], task_id: str) -> str:
         run_id = state.get("run_id")
         if not isinstance(run_id, str) or not SAFE_ID.fullmatch(run_id):
             raise ValueError("current run has an invalid run_id")
-        return f"{workflow}:{run_id}:{task_id}"
+        return f"{WORKFLOW_REF_NAMES[workflow]}:{WorkflowRuntime._run_ref(run_id)}:{task_id}"
 
     @staticmethod
     def _audit_task_role(plan: Any, fallback: str | None = None) -> str:
@@ -603,13 +626,16 @@ class WorkflowRuntime:
     def _parse_task_ref(task_ref: str) -> tuple[WorkflowName, str, str]:
         parts = task_ref.split(":", 2)
         if len(parts) != 3:
-            raise ValueError("task_ref must use workflow:run-id:task-id")
-        workflow, run_id, task_id = parts
+            raise ValueError("task_ref must be copied exactly from task_manage")
+        workflow_name, run_ref, task_id = parts
+        # Falling back to a full gh-* workflow name accepts legacy references.
+        # Remove the fallback after pre-short-ref runs no longer need to resume.
+        workflow = REF_WORKFLOWS.get(workflow_name, workflow_name)
         if workflow not in workflow_run.WORKFLOWS:
             raise ValueError("task_ref contains an unsupported workflow")
-        if not SAFE_ID.fullmatch(run_id) or not SAFE_ID.fullmatch(task_id):
-            raise ValueError("task_ref contains an invalid run_id or task_id")
-        return cast(WorkflowName, workflow), run_id, task_id
+        if not SAFE_ID.fullmatch(run_ref) or not SAFE_ID.fullmatch(task_id):
+            raise ValueError("task_ref contains an invalid run or task")
+        return cast(WorkflowName, workflow), run_ref, task_id
 
     @staticmethod
     def _generic_scheduler_status(state: dict[str, Any]) -> dict[str, Any]:
@@ -1442,13 +1468,13 @@ class WorkflowRuntime:
         }
 
     def task_context(self, task_ref: str) -> dict[str, Any]:
-        workflow, run_id, task_id = self._parse_task_ref(task_ref)
+        workflow, run_ref, task_id = self._parse_task_ref(task_ref)
         state = self.state(workflow)
-        if state.get("run_id") != run_id:
-            raise ValueError("task_ref belongs to a stale workflow run")
+        if not self._task_ref_matches(state, run_ref):
+            raise ValueError("task_ref is stale; use the current value from task_manage")
         task = state.get("tasks", {}).get(task_id)
         if not isinstance(task, dict):
-            raise ValueError("task_ref identifies an unknown task")
+            raise ValueError("task_ref is unknown; use the exact value from task_manage")
         assignment = task.get("assignment", {})
         source_kind = assignment.get(
             "source_kind", "program" if task.get("role") == "program" else "repository"

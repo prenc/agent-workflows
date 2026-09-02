@@ -241,7 +241,7 @@ class TestExtensionMcp:
                 assert not planned.is_error
                 task_id = planned.structured_content["task_id"]
                 task_ref = planned.structured_content["task_ref"]
-                assert task_ref.startswith("gh-curate-issues:")
+                assert re.fullmatch(r"curate:[0-9a-f]{12}:issue-12-1", task_ref)
                 revised = await client.call_tool(
                     "task_manage",
                     {
@@ -461,10 +461,20 @@ class TestExtensionMcp:
                 references[workflow] = receipt["task_ref"]
 
             assert references["gh-curate-issues"] != references["gh-implement-issue"]
+            prefixes = {
+                "gh-curate-issues": "curate",
+                "gh-implement-issue": "implement",
+            }
             for workflow, task_ref in references.items():
+                assert re.fullmatch(rf"{prefixes[workflow]}:[0-9a-f]{{12}}:issue-12-1", task_ref)
                 context = runtime.task_context(task_ref)
                 assert context["workflow"] == workflow
                 assert context["task_id"] == "issue-12-1"
+                # Legacy references remain accepted only while runs created before
+                # short task references may still need to resume. Remove this case
+                # with the corresponding compatibility branches in runtime.py.
+                legacy_ref = f"{workflow}:{context['run_id']}:{context['task_id']}"
+                assert runtime.task_context(legacy_ref)["task_ref"] == legacy_ref
 
             stale = references["gh-curate-issues"]
             runtime.run_manage(RunManageRequest(action="abort", workflow="gh-curate-issues"))
@@ -476,7 +486,7 @@ class TestExtensionMcp:
                     n=1,
                 )
             )
-            with pytest.raises(ValueError, match="stale workflow run"):
+            with pytest.raises(ValueError, match="task_ref is stale"):
                 runtime.task_context(stale)
 
     def test_generic_scheduler_enforces_lanes_and_finish_gates(self) -> None:
@@ -1108,3 +1118,23 @@ class TestExtensionMcp:
                 if line.startswith("  - ")
             }
             assert configured & search_tools == tools
+
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "gh-audit-repo-worker.md",
+            "gh-curate-issues-worker.md",
+            "gh-implement-issue-worker.md",
+        ],
+    )
+    def test_named_workers_can_fetch_public_documentation(self, filename: str) -> None:
+        frontmatter = (
+            (EXTENSION / "agents" / filename).read_text(encoding="utf-8").split("---", 2)[1]
+        )
+        configured_tools = frontmatter.split("tools:", 1)[1].split("disallowedTools:", 1)[0]
+        configured = {
+            line.removeprefix("  - ")
+            for line in configured_tools.splitlines()
+            if line.startswith("  - ")
+        }
+        assert "web_fetch" in configured

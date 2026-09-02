@@ -222,9 +222,12 @@ stop and report it for manual reconciliation. Refresh through
 when its declared or Python environment changed, invalidate affected same-run
 conclusions and validation while preserving environment-independent progress.
 Reconcile every recorded task attempt with `list_agents`. Resume a retained
-task once; otherwise mark that attempt failed or abandoned and create a new
-numbered attempt from its checkpoint. Never leave an old task recorded as
-running after replacement.
+task once. Before treating a timeout or delayed notification as failure, consume
+any final response already delivered by the worker and record its structured
+report. Only when no usable result exists should you mark that attempt failed or
+abandoned and create a new numbered attempt from its checkpoint. Never recover
+a worker report from an arbitrary temporary path, and never leave an old task
+recorded as running after replacement.
 
 User messages preempt the scheduler even when all material lanes are occupied.
 For a status question, reply immediately without changing lane accounting. For

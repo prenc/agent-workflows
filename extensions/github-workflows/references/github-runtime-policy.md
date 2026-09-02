@@ -65,8 +65,9 @@ supervisors and workers.
   maintained through the `audit_knowledge` MCP tool. Area-boundary changes archive the
   old document and bootstrap overlapping new areas with leads. Ordinary source
   changes preserve the area while requiring current-source revalidation.
-- Workers receive only a `workflow:run-id:task-id` reference and retrieve the
-  current assignment,
+- Workers receive only a short `workflow:run-token:task-id` reference returned
+  by `task_manage`; callers copy it exactly rather than constructing it. Workers
+  retrieve the current assignment,
   GitHub history snapshot, inventory revision, and relevant active area/shared
   knowledge through the read-only `task_context` MCP tool.
   Code findings always require current-source proof. Documentation and
@@ -96,6 +97,13 @@ the workflow can resume after the helper is extended.
 Missing project environments, programs, or optional modules are ordinary
 coverage limitations: record the precise unavailable capability and continue
 the static review that does not depend on it.
+
+Use `web_fetch` only for public documentation with a generic prompt that
+contains no private repository content, paths, instructions, or confidential
+data. Use authenticated GitHub MCP reads for private GitHub material. An HTTP
+404 is evidence about the requested URL, not proof that the sandbox or host is
+blocked; verify the repository and URL first, then use a known-public control
+before recording a broader capability limitation.
 
 ## Workflow feedback
 

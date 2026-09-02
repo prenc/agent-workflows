@@ -309,6 +309,11 @@ work and send the smallest bounded correction back to the same worker for any
 missing, incorrect, unrelated, or regressive change. The worker commits, pushes,
 and updates the same draft before verification repeats.
 
+Do not invent a task reference or substitute an inline assignment for any worker
+round. If a correction or additional inspection is delegated, register it through
+`task_manage` and pass only the exact returned `task_ref`; a worker whose
+`task_context` call fails performs no work.
+
 Draft-to-ready promotion requires:
 
 - every required outcome for every covered issue is complete;

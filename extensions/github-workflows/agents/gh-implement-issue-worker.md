@@ -12,6 +12,7 @@ tools:
   - grep_search
   - read_file
   - write_file
+  - web_fetch
   - mcp__github__create_pull_request
   - mcp__github__get_commit
   - mcp__github__issue_read

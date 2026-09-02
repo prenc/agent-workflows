@@ -513,7 +513,7 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     def task_context(task_ref: str) -> dict[str, Any]:
-        """Resolve one namespaced task reference to its read-only worker assignment."""
+        """Resolve the exact short task_ref returned by task_manage."""
         return _public_call(runtime.task_context, task_ref)
 
     @mcp.tool(annotations=LOCAL_WRITE, structured_output=True)
