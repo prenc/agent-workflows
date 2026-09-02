@@ -466,7 +466,8 @@ def normalize_run_artifact(current: Path, value: Any, name: str) -> str:
     return relative.as_posix()
 
 
-def task_shard(state: dict[str, Any], task: dict[str, Any]) -> dict[str, Any] | None:
+def discovery_shard_id(task: dict[str, Any]) -> str | None:
+    """Return the shard owned by a discovery assignment, if any."""
     assignment = task.get("assignment")
     if (
         not isinstance(assignment, dict)
@@ -474,7 +475,14 @@ def task_shard(state: dict[str, Any], task: dict[str, Any]) -> dict[str, Any] | 
         or not assignment.get("shard_id")
     ):
         return None
-    shard_id = require_string(assignment.get("shard_id"), "assignment shard_id")
+    return require_string(assignment.get("shard_id"), "assignment shard_id")
+
+
+def task_shard(state: dict[str, Any], task: dict[str, Any]) -> dict[str, Any] | None:
+    assignment = task.get("assignment")
+    shard_id = discovery_shard_id(task)
+    if shard_id is None or not isinstance(assignment, dict):
+        return None
     area = require_string(assignment.get("area"), "assignment area")
     paths = assignment.get("paths", [])
     if not isinstance(paths, list) or not all(isinstance(path, str) and path for path in paths):
@@ -482,8 +490,7 @@ def task_shard(state: dict[str, Any], task: dict[str, Any]) -> dict[str, Any] | 
     owners = {
         item.get("logical_id")
         for item in state["tasks"].values()
-        if isinstance(item.get("assignment"), dict)
-        and item["assignment"].get("shard_id") == shard_id
+        if discovery_shard_id(item) == shard_id
     }
     if owners - {task.get("logical_id")}:
         raise ValueError("audit shard is already owned by another logical task")
@@ -522,15 +529,13 @@ def audit_event(args: argparse.Namespace) -> None:
         if len(matches) != 1 or matches[0].get("status") != "queued":
             raise ValueError("only one queued logical task can be revised")
         existing = matches[0]
-        old_assignment = existing.get("assignment", {})
-        old_shard_id = old_assignment.get("shard_id") if isinstance(old_assignment, dict) else None
+        old_shard_id = discovery_shard_id(existing)
         revised = dict(existing)
         for name in ("role", "unit", "assignment", "required"):
             if name in task:
                 revised[name] = task[name]
         task_shard(state, revised)
-        new_assignment = revised.get("assignment", {})
-        new_shard_id = new_assignment.get("shard_id") if isinstance(new_assignment, dict) else None
+        new_shard_id = discovery_shard_id(revised)
         if old_shard_id and old_shard_id != new_shard_id:
             old_shard = state["shards"].get(old_shard_id)
             if not isinstance(old_shard, dict) or old_shard.get("status") != "pending":
@@ -538,9 +543,7 @@ def audit_event(args: argparse.Namespace) -> None:
             other_owners = [
                 item
                 for item in tasks.values()
-                if item is not existing
-                and isinstance(item.get("assignment"), dict)
-                and item["assignment"].get("shard_id") == old_shard_id
+                if item is not existing and discovery_shard_id(item) == old_shard_id
             ]
             if other_owners:
                 raise ValueError("queued task shard is still owned by another task")
@@ -878,10 +881,25 @@ def audit_event(args: argparse.Namespace) -> None:
         if candidate_id not in state["candidates"]:
             raise ValueError("mutation record refers to an unknown candidate")
         action = require_string(mutation.get("action"), "mutation action")
+        terminal_status = {
+            "create": "published",
+            "update": "updated",
+            "no-op": "no-op",
+            "close": "closed",
+            "dry-run": "dry-run",
+        }.get(action)
+        if terminal_status is None:
+            raise ValueError("publication operation is unsupported")
+        candidate = state["candidates"][candidate_id]
+        current_status = candidate.get("status")
+        if current_status in AUDIT_CANDIDATE_TERMINAL and current_status != terminal_status:
+            raise ValueError("publication conflicts with the terminal candidate disposition")
         if value.get("publication_pending") is not False:
             raise ValueError("completed publication must clear publication_pending")
         state["history"] = value
         state["mutations"].append(mutation)
+        candidate["status"] = terminal_status
+        candidate["updated_at"] = utc_now()
         detail = {"candidate_id": candidate_id, "action": action, "publication_pending": False}
     elif event_type == "metrics-update":
         value = payload.get("value")

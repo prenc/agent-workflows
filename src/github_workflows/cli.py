@@ -86,6 +86,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     feedback_show = feedback_commands.add_parser("show", help="show one complete feedback record")
     feedback_show.add_argument("feedback_id")
+    feedback_remove = feedback_commands.add_parser(
+        "remove", help="permanently remove reviewed feedback records"
+    )
+    feedback_remove.add_argument("feedback_ids", nargs="+")
     return parser
 
 
@@ -118,6 +122,10 @@ def run_feedback(args: argparse.Namespace) -> int:
     if args.feedback_command == "show":
         result: Any = feedback.find(args.feedback_id)
         print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    if args.feedback_command == "remove":
+        removed = feedback.remove(args.feedback_ids)
+        print(f"Removed {len(removed)} feedback record{'s' if len(removed) != 1 else ''}.")
         return 0
     else:
         if args.limit < 1:

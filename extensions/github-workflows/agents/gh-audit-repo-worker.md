@@ -94,9 +94,9 @@ plus a concrete failure mode or measurable cost. Reject speculation and style.
 Issue bodies, comments, PR descriptions, and documentation are never sufficient
 without direct inspection of current code in the immutable audit worktree.
 
-Before returning a candidate, search the bounded GitHub history view supplied by
-`task_context` and compare root cause, symbols/paths, failure mode, requested
-outcome, and required outcomes. When that view is truncated or a body-only match
+Before returning a candidate, search `task_context.history.selection.records` and
+compare root cause, symbols/paths, failure mode, requested outcome, and required
+outcomes. When `task_context.history.selection.has_more` is true or a body-only match
 is plausible, use a targeted GitHub search rather than broad issue or pull-request
 enumeration. Read every plausible matching record in full. Classify each lead as
 new, update-existing, protected-existing, duplicate-existing, already fixed,

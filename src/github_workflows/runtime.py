@@ -44,6 +44,17 @@ from .models import (
 SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 HISTORY_ARTIFACT_BYTES = 5 * 1024 * 1024
 HISTORY_ARTIFACT_TOTAL_BYTES = 25 * 1024 * 1024
+TASK_HISTORY_LIMIT = 40
+TASK_HISTORY_FIELDS = (
+    "kind",
+    "number",
+    "url",
+    "title",
+    "state",
+    "state_reason",
+    "labels",
+)
+TASK_METADATA_FIELDS = ("id", "logical_id", "role", "unit", "attempt", "status", "required")
 
 
 class WorkflowRuntime:
@@ -1327,10 +1338,18 @@ class WorkflowRuntime:
                     terms_file=None,
                     kind=None,
                     state="open",
-                    limit=40,
+                    limit=TASK_HISTORY_LIMIT,
                     output=None,
                 )
-            records = queried.get("records", [])
+            records = [
+                {
+                    key: record[key]
+                    for key in TASK_HISTORY_FIELDS
+                    if isinstance(record, dict) and key in record
+                }
+                for record in queried.get("records", [])
+                if isinstance(record, dict)
+            ]
             by_key = {
                 (record.get("kind"), record.get("number")): record
                 for record in records
@@ -1349,12 +1368,77 @@ class WorkflowRuntime:
             ]
         else:
             records = []
+            queried = {"has_more": False}
         return {
-            "generation": history.get("generation"),
-            "record_count": history.get("record_count"),
-            "full_history_complete": True,
-            "records": records[:40],
-            "truncated": len(records) >= 40,
+            "cache": {
+                "generation": history.get("generation"),
+                "record_count": history.get("record_count"),
+                "complete": True,
+            },
+            "selection": {
+                "record_count": len(records),
+                "limit": TASK_HISTORY_LIMIT,
+                "has_more": bool(queried.get("has_more")),
+                "records": records,
+            },
+        }
+
+    @staticmethod
+    def _worker_inventory(inventory: Any, assignment: dict[str, Any]) -> dict[str, Any] | None:
+        """Return task-relevant environment facts without the full package inventory."""
+        if not isinstance(inventory, dict):
+            return None
+        sources = inventory.get("sources")
+        if not isinstance(sources, dict):
+            sources = {}
+        environment = sources.get("python_environment")
+        if not isinstance(environment, dict):
+            environment = {}
+        packages = environment.get("packages")
+        if not isinstance(packages, dict):
+            packages = {}
+
+        def normalized(name: str) -> str:
+            return re.sub(r"[-_.]+", "-", name).lower()
+
+        available = {
+            normalized(str(name)): (str(name), version) for name, version in packages.items()
+        }
+        requested = assignment.get("python_packages", [])
+        requested_names = (
+            list(dict.fromkeys(item for item in requested if isinstance(item, str) and item))[:50]
+            if isinstance(requested, list)
+            else []
+        )
+        selected: dict[str, Any] = {}
+        missing: list[str] = []
+        for name in requested_names:
+            found = available.get(normalized(name))
+            if found is None:
+                missing.append(name)
+            else:
+                selected[found[0]] = found[1]
+        python_environment = {
+            key: environment[key]
+            for key in ("available", "source", "executable", "python")
+            if key in environment
+        }
+        python_environment.update(
+            {
+                "package_count": len(packages),
+                "packages": selected,
+                "missing_requested_packages": missing,
+            }
+        )
+        return {
+            "revision": inventory.get("revision"),
+            "updated_at": inventory.get("updated_at"),
+            "python_environment": python_environment,
+            "repository_manifests": sources.get("repository_manifests", {}),
+            "programs": sources.get("programs", {}),
+            "declared": sources.get("declared", {}),
+            "context": sources.get("context", {}),
+            "requests": inventory.get("requests", {}),
         }
 
     def task_context(self, task_ref: str) -> dict[str, Any]:
@@ -1404,9 +1488,9 @@ class WorkflowRuntime:
             "audit_sha": state.get("sha"),
             "audit_worktree": state.get("audit_worktree"),
             "repository": state.get("repository"),
-            "task": task,
+            "task": {key: task[key] for key in TASK_METADATA_FIELDS if key in task},
             "assignment": assignment,
-            "inventory": state.get("inventory"),
+            "inventory": self._worker_inventory(state.get("inventory"), assignment),
             "documentation": {
                 "source_priority": priorities,
                 "context7_query_budget": 12,
@@ -1859,17 +1943,19 @@ class WorkflowRuntime:
                     {
                         "publication_pending": True,
                         "candidate_id": request.candidate_id,
-                        "mutation": request.mutation,
+                        "operation": request.operation,
                     }
                 )
+                history.pop("mutation", None)
                 self._event({"type": "history-set", "value": history})
             else:
                 if not history.get("publication_pending"):
                     raise ValueError("no publication is pending")
                 if history.get("candidate_id") != request.candidate_id:
                     raise ValueError("publication does not match the pending candidate")
-                if history.get("mutation") != request.mutation:
-                    raise ValueError("publication mutation does not match the pending operation")
+                operation = history.get("operation", history.get("mutation"))
+                if operation not in {"create", "update", "no-op", "close", "dry-run"}:
+                    raise ValueError("pending publication has an unsupported operation")
                 if request.action == "finish" and not request.receipt:
                     raise ValueError("finished publication requires a non-empty receipt")
                 history.update(
@@ -1879,6 +1965,8 @@ class WorkflowRuntime:
                         "receipt": request.receipt,
                     }
                 )
+                history["operation"] = operation
+                history.pop("mutation", None)
                 if request.action == "finish":
                     self._event(
                         {
@@ -1886,7 +1974,7 @@ class WorkflowRuntime:
                             "value": history,
                             "mutation": {
                                 "candidate_id": request.candidate_id,
-                                "action": request.mutation,
+                                "action": operation,
                                 "receipt": request.receipt,
                             },
                         }

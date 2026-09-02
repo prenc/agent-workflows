@@ -372,6 +372,11 @@ importing packages (falling back to the selected system interpreter only when no
 identities, and whether the selected interpreter is `project-venv` or `system`.
 Reuse that snapshot for Python-library versions; do not issue one inventory call per
 library.
+When planning a task whose conclusions depend on installed Python versions, list
+only those distribution names in `assignment.python_packages`. `task_context`
+returns the selected installed versions plus the total package count, rather than
+copying the complete environment into every worker context. A worker requests any
+unexpected missing package through `CONTEXT_REQUEST`.
 Then use action `program` with one `programs` list containing the relevant configured
 programs and their optional version/help arguments. The tool runs the bounded sandboxed
 probes as one batch and records them in one inventory revision. Record
@@ -660,6 +665,13 @@ After an area's discovery and every candidate verification finish:
    fingerprints, refresh the current GitHub history view, and checkpoint before continuing.
    Later areas must consume that updated view. Add comments only through the
    guarded closure procedure.
+
+   Wrap each operation with `mcp__github_workflows__audit_publish`: call `begin`
+   with `candidate_id` and `operation`, perform the one GitHub operation, then call
+   `finish` with `candidate_id` and its compact receipt. A successful `finish`
+   atomically records the receipt and terminal candidate disposition; do not send a
+   separate candidate-status update. Use `uncertain` after an ambiguous external
+   result so resume preserves the pending operation.
 
 Use MCP to verify the stored artifact. If MCP cannot provide exact body bytes,
 record the `exact-body-read` capability gap and use the narrow read-only

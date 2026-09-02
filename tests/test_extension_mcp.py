@@ -141,6 +141,7 @@ class TestExtensionMcp:
                 assert conditional_required["audit_knowledge"]["reconcile"] == {"areas"}
                 assert conditional_required["audit_probe"]["python"] == {"code"}
                 assert conditional_required["audit_record"]["candidate"] == {"candidate"}
+                assert conditional_required["audit_publish"]["begin"] == {"operation"}
                 assert conditional_required["audit_publish"]["finish"] == {"receipt"}
                 ingest_contract = next(
                     condition["then"]

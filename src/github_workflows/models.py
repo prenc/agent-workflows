@@ -636,20 +636,18 @@ class AuditRecordRequest(ActionRequest, RootModel[AuditRecordAction]):
 class PublishBeginRequest(StrictRequest):
     action: Literal["begin"]
     candidate_id: str
-    mutation: str
+    operation: Literal["create", "update", "no-op", "close", "dry-run"]
 
 
 class PublishFinishRequest(StrictRequest):
     action: Literal["finish"]
     candidate_id: str
-    mutation: str
     receipt: dict[str, Any] = Field(min_length=1)
 
 
 class PublishUncertainRequest(StrictRequest):
     action: Literal["uncertain"]
     candidate_id: str
-    mutation: str
     receipt: dict[str, Any] = Field(default_factory=dict)
 
 

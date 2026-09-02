@@ -149,5 +149,7 @@ files, combined context dumps, system prompts, secrets, confidential instruction
 content, or unrelated output. Ordinary input mistakes, repository defects,
 unavailable dependencies, and transient external failures are not workflow
 feedback unless the workflow or its active instructions caused or obscured them.
-Recording distinct friction is expected when possible, but feedback bookkeeping
-never delays work or blocks workflow completion.
+Run progress, findings, evidence, checkpoints, and ordinary limitations belong in
+workflow state or task reports, not feedback. Recording distinct friction is
+expected when possible, but feedback bookkeeping never delays work or blocks
+workflow completion.

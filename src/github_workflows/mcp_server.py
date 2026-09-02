@@ -96,7 +96,10 @@ ACTION_REQUIREMENTS: dict[str, tuple[str, dict[str, tuple[str, ...]]]] = {
             "supervisor_start": ("activity",),
         },
     ),
-    "audit_publish": ("action", {"finish": ("receipt",)}),
+    "audit_publish": (
+        "action",
+        {"begin": ("operation",), "finish": ("receipt",)},
+    ),
 }
 
 
@@ -603,10 +606,10 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
     def audit_publish(
         action: Literal["begin", "finish", "uncertain"],
         candidate_id: str,
-        mutation: str,
+        operation: Literal["create", "update", "no-op", "close", "dry-run"] | None = None,
         receipt: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Persist publication intent and record its GitHub receipt."""
+        """Begin publication or finish it atomically with its receipt and disposition."""
         return _request_call(runtime.audit_publish, PublishRequest, **locals())
 
     @mcp.tool(annotations=LOCAL_WRITE, structured_output=True)

@@ -367,6 +367,41 @@ def test_reader_waits_for_feedback_writer_lock(cache: Path) -> None:
         assert len(future.result(timeout=1)) == 1
 
 
+def test_feedback_remove_accepts_exact_and_unique_suffix_ids(cache: Path) -> None:
+    first = append_feedback(message="First reviewed item")
+    second = append_feedback(message="Keep this item")
+    third = append_feedback(message="Third reviewed item")
+
+    removed = feedback.remove([str(first["feedback_id"]), str(third["feedback_id"])[-8:]])
+
+    assert removed == [first["feedback_id"], third["feedback_id"]]
+    assert [record["feedback_id"] for record in feedback.read_records()] == [second["feedback_id"]]
+
+
+def test_feedback_remove_validation_preserves_the_store(cache: Path) -> None:
+    append_feedback(message="Keep this item")
+    path = feedback.storage_path()
+    original = path.read_bytes()
+
+    with pytest.raises(ValueError, match="not found"):
+        feedback.remove(["missing-feedback"])
+
+    assert path.read_bytes() == original
+
+
+def test_failed_feedback_remove_preserves_the_store(cache: Path) -> None:
+    result = append_feedback(message="Keep this item")
+    path = feedback.storage_path()
+    original = path.read_bytes()
+
+    with mock.patch.object(feedback.os, "replace", side_effect=OSError("replace failed")):
+        with pytest.raises(OSError, match="replace failed"):
+            feedback.remove([str(result["feedback_id"])])
+
+    assert path.read_bytes() == original
+    assert feedback.find(str(result["feedback_id"]))["message"] == "Keep this item"
+
+
 def test_feedback_cli_lists_compact_records_and_shows_context(
     cache: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -399,6 +434,13 @@ def test_feedback_cli_lists_compact_records_and_shows_context(
     shown = json.loads(capsys.readouterr().out)
     assert shown["arguments"] == {"report": {"status": "complete"}}
     assert shown["response"] == "report must be an object"
+
+    remove_args = argparse.Namespace(
+        feedback_command="remove", feedback_ids=[str(result["feedback_id"])[-8:]]
+    )
+    assert run_feedback(remove_args) == 0
+    assert capsys.readouterr().out == "Removed 1 feedback record.\n"
+    assert feedback.read_records() == []
 
 
 def test_feedback_table_formats_legacy_ids_and_empty_results() -> None:

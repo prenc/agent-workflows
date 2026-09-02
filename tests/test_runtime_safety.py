@@ -192,7 +192,7 @@ class TestRuntimeSafety:
                 AuditRecordRequest,
                 {"action": "phase", "phase": {"name": "structure", "status": "complete"}},
             ),
-            (PublishRequest, {"action": "begin", "candidate_id": "C-1", "mutation": "create"}),
+            (PublishRequest, {"action": "begin", "candidate_id": "C-1", "operation": "create"}),
         ]
         for model, payload in cases:
             with pytest.raises(ValidationError):
@@ -502,7 +502,7 @@ class TestRuntimeSafety:
                     PublishRequest(
                         action="begin",
                         candidate_id="C-missing",
-                        mutation="create",
+                        operation="create",
                     )
                 )
             assert not runtime.state("gh-audit-repo")["history"]["publication_pending"]
@@ -517,7 +517,7 @@ class TestRuntimeSafety:
                 PublishRequest(
                     action="begin",
                     candidate_id="C-1",
-                    mutation="create",
+                    operation="create",
                 )
             )
             state = runtime.state("gh-audit-repo")
@@ -529,7 +529,6 @@ class TestRuntimeSafety:
                     PublishRequest(
                         action="finish",
                         candidate_id="C-1",
-                        mutation="create",
                         receipt={"url": "https://example.invalid/1"},
                     )
                 )
@@ -537,6 +536,83 @@ class TestRuntimeSafety:
             assert failed["revision"] == revision
             assert failed["history"]["publication_pending"]
             assert failed["mutations"] == []
+
+    @pytest.mark.parametrize(
+        ("operation", "status"),
+        [
+            ("create", "published"),
+            ("update", "updated"),
+            ("no-op", "no-op"),
+            ("close", "closed"),
+            ("dry-run", "dry-run"),
+        ],
+    )
+    def test_publication_finish_atomically_disposes_candidate(
+        self, operation: str, status: str
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-publish-disposition-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            candidate_id = f"C-{operation}"
+            runtime.audit_record(
+                AuditRecordRequest(
+                    action="candidate",
+                    candidate={"id": candidate_id, "status": "verified"},
+                )
+            )
+            runtime.audit_publish(
+                PublishRequest(action="begin", candidate_id=candidate_id, operation=operation)
+            )
+            result = runtime.audit_publish(
+                PublishRequest(
+                    action="finish",
+                    candidate_id=candidate_id,
+                    receipt={"url": "https://example.invalid/1"},
+                )
+            )
+
+            state = runtime.state("gh-audit-repo")
+            assert state["candidates"][candidate_id]["status"] == status
+            assert state["mutations"][-1]["action"] == operation
+            assert result["publication"]["publication_pending"] is False
+
+    def test_publication_finish_reads_legacy_pending_operation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-publish-legacy-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.audit_record(
+                AuditRecordRequest(
+                    action="candidate",
+                    candidate={"id": "C-legacy", "status": "verified"},
+                )
+            )
+            state = runtime.state("gh-audit-repo")
+            state["history"].update(
+                {
+                    "publication_pending": True,
+                    "candidate_id": "C-legacy",
+                    "mutation": "update",
+                }
+            )
+            workflow_run.write_state(runtime.current("gh-audit-repo"), state)
+
+            runtime.audit_publish(
+                PublishRequest(
+                    action="finish",
+                    candidate_id="C-legacy",
+                    receipt={"url": "https://example.invalid/1"},
+                )
+            )
+
+            updated = runtime.state("gh-audit-repo")
+            assert updated["candidates"]["C-legacy"]["status"] == "updated"
+            assert updated["history"] == {
+                "candidate_id": "C-legacy",
+                "operation": "update",
+                "outcome": "finish",
+                "publication_pending": False,
+                "receipt": {"url": "https://example.invalid/1"},
+            }
 
     def test_missing_history_query_does_not_create_a_database(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-history-readonly-") as directory:
@@ -589,6 +665,19 @@ class TestRuntimeSafety:
                 )
             )
             assert completed["task"]["result"] == "areas/discover-core-1.json"
+            runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    task={
+                        "logical_id": "verify-core",
+                        "assignment": {
+                            "mode": "verify",
+                            "shard_id": "shard-core",
+                            "candidate": {"id": "C-core"},
+                        },
+                    },
+                )
+            )
             runtime.task_manage(
                 TaskManageRequest(action="integration_begin", task_id="discover-core-1")
             )
@@ -713,6 +802,19 @@ class TestRuntimeSafety:
                     },
                 )
             )
+            runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    task={
+                        "logical_id": "verify-core",
+                        "assignment": {
+                            "mode": "verify",
+                            "shard_id": "shard-old",
+                            "candidate": {"id": "C-core"},
+                        },
+                    },
+                )
+            )
             revised = runtime.task_manage(
                 TaskManageRequest(
                     action="plan",
@@ -784,12 +886,128 @@ class TestRuntimeSafety:
 
             context = runtime.task_context(planned["task_ref"])
 
-            assert context["history"]["full_history_complete"] is True
-            assert context["history"]["record_count"] == 3
+            assert context["history"]["cache"] == {
+                "generation": 1,
+                "record_count": 3,
+                "complete": True,
+            }
+            assert context["history"]["selection"]["record_count"] == 2
+            assert context["history"]["selection"]["has_more"] is False
             assert [
                 (record["kind"], record["number"], record["title"])
-                for record in context["history"]["records"]
+                for record in context["history"]["selection"]["records"]
             ] == [
                 ("issue", 2, "Earlier parser defect"),
                 ("issue", 1, "Shared core cache grows"),
             ]
+
+    def test_audit_task_context_reports_an_exact_history_window(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-audit-history-window-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.history_manage(HistoryManageRequest(action="prepare"))
+            runtime.history_manage(
+                HistoryManageRequest(
+                    action="ingest",
+                    records=[
+                        {
+                            "kind": "issue",
+                            "number": number,
+                            "state": "open",
+                            "title": f"Shared core finding {number}",
+                            "labels": ["area/shared-core"],
+                        }
+                        for number in range(1, 42)
+                    ],
+                )
+            )
+            runtime.history_manage(
+                HistoryManageRequest(action="commit", full_history_complete=True)
+            )
+            planned = runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    task={
+                        "logical_id": "discover-core",
+                        "assignment": {
+                            "mode": "discover",
+                            "area": "area/shared-core",
+                            "focus": "shared core",
+                        },
+                    },
+                )
+            )
+
+            selection = runtime.task_context(planned["task_ref"])["history"]["selection"]
+
+            assert selection["record_count"] == 40
+            assert selection["limit"] == 40
+            assert selection["has_more"] is True
+            assert len(selection["records"]) == 40
+
+    def test_audit_task_context_selects_only_requested_python_packages(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-audit-inventory-context-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.history_manage(HistoryManageRequest(action="prepare"))
+            runtime.history_manage(
+                HistoryManageRequest(action="commit", full_history_complete=True)
+            )
+            state = runtime.state("gh-audit-repo")
+            state["inventory"] = {
+                "revision": 7,
+                "updated_at": "2026-09-01T12:00:00Z",
+                "sources": {
+                    "python_environment": {
+                        "available": True,
+                        "source": "project-venv",
+                        "executable": ".venv/bin/python",
+                        "python": "3.12.8",
+                        "packages": {
+                            **{f"unused-package-{index}": "1.0" for index in range(250)},
+                            "Pydantic": "2.13.0",
+                        },
+                    },
+                    "repository_manifests": {"pyproject.toml": "sha256:abc"},
+                    "programs": {"rg": {"status": "available", "version": "14.1.1"}},
+                    "declared": {"python": ">=3.12"},
+                    "context": {},
+                },
+                "requests": {},
+            }
+            workflow_run.write_state(runtime.current("gh-audit-repo"), state)
+            planned = runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    task={
+                        "logical_id": "discover-core",
+                        "assignment": {
+                            "mode": "discover",
+                            "area": "area/shared-core",
+                            "python_packages": ["pydantic", "missing-package"],
+                        },
+                    },
+                )
+            )
+
+            context = runtime.task_context(planned["task_ref"])
+
+            assert context["task"] == {
+                "id": "discover-core-1",
+                "logical_id": "discover-core",
+                "role": "discover",
+                "unit": "discover-core",
+                "attempt": 1,
+                "status": "queued",
+                "required": True,
+            }
+            assert context["inventory"]["python_environment"] == {
+                "available": True,
+                "source": "project-venv",
+                "executable": ".venv/bin/python",
+                "python": "3.12.8",
+                "package_count": 251,
+                "packages": {"Pydantic": "2.13.0"},
+                "missing_requested_packages": ["missing-package"],
+            }
+            assert len(json.dumps(context)) < 8_000

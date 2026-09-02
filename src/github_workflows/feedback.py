@@ -1,4 +1,4 @@
-"""Private, append-only workflow and instruction feedback storage."""
+"""Private workflow and instruction feedback storage."""
 
 from __future__ import annotations
 
@@ -334,6 +334,10 @@ def compact_records(
 def find(feedback_id: str) -> dict[str, Any]:
     """Return one complete feedback record by exact ID or unique legacy suffix."""
     records = read_records()
+    return _find_record(records, feedback_id)
+
+
+def _find_record(records: list[dict[str, Any]], feedback_id: str) -> dict[str, Any]:
     record = next((item for item in records if item.get("feedback_id") == feedback_id), None)
     if record is not None:
         return record
@@ -347,6 +351,56 @@ def find(feedback_id: str) -> dict[str, Any]:
     if len(matches) > 1:
         raise ValueError("feedback ID suffix is ambiguous")
     return matches[0]
+
+
+def remove(feedback_ids: list[str]) -> list[str]:
+    """Atomically remove explicitly selected feedback records."""
+    if not feedback_ids:
+        raise ValueError("at least one feedback ID is required")
+    path = storage_path()
+    if not path.is_file():
+        raise ValueError("feedback ID was not found")
+    with _locked(path, exclusive=True):
+        records = _read(path)
+        selected = [_find_record(records, value) for value in dict.fromkeys(feedback_ids)]
+        selected_ids = list(dict.fromkeys(str(record["feedback_id"]) for record in selected))
+        selected_set = set(selected_ids)
+        retained = [record for record in records if record.get("feedback_id") not in selected_set]
+        encoded = b"".join(
+            (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
+            for record in retained
+        )
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.new")
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temporary, flags, 0o600)
+        try:
+            view = memoryview(encoded)
+            while view:
+                written = os.write(descriptor, view)
+                if written < 1:
+                    raise OSError("feedback rewrite made no progress")
+                view = view[written:]
+            os.fsync(descriptor)
+        except BaseException:
+            os.close(descriptor)
+            temporary.unlink(missing_ok=True)
+            raise
+        else:
+            os.close(descriptor)
+        try:
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        _private_file(path)
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory = os.open(path.parent, directory_flags)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    return selected_ids
 
 
 def _display_id(value: Any) -> str:

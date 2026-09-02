@@ -54,5 +54,6 @@ supervisors and named workers is kept locally in
 Review it with `agent-workflows feedback list` and inspect one complete record
 with `agent-workflows feedback show <feedback-id>`. The list prints compact
 metadata followed by each complete wrapped summary; use
-`agent-workflows feedback list --json` for machine-readable records. Cache cleanup
-may remove these diagnostic records.
+`agent-workflows feedback list --json` for machine-readable records. After review,
+remove selected records atomically with
+`agent-workflows feedback remove <feedback-id> [<feedback-id> ...]`.

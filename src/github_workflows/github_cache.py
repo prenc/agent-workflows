@@ -585,11 +585,16 @@ def query_records(args: argparse.Namespace) -> None:
                 continue
             if eligible(row, cutoff, linked):
                 selected[(row["kind"], row["number"])] = row
-            if args.limit and len(selected) >= args.limit:
+            if args.limit and len(selected) > args.limit:
                 break
+        selected_records = list(selected.values())
+        has_more = bool(args.limit and len(selected_records) > args.limit)
+        if args.limit:
+            selected_records = selected_records[: args.limit]
         result = {
             "cutoff": iso_utc(cutoff) if cutoff else None,
-            "records": [row_dict(row) for row in selected.values()],
+            "has_more": has_more,
+            "records": [row_dict(row) for row in selected_records],
         }
     rendered = json.dumps(result, indent=2, sort_keys=True) + "\n"
     if args.output:
