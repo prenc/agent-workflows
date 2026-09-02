@@ -12,7 +12,6 @@ tools:
   - grep_search
   - read_file
   - write_file
-  - glob
   - mcp__github__create_pull_request
   - mcp__github__get_commit
   - mcp__github__issue_read
@@ -35,6 +34,10 @@ pull request ready for review. You own the unit's implementation commits,
 branch pushes, and draft pull request. Use the inherited authenticated GitHub
 MCP tools for targeted reads and for the narrow draft-PR creation/update surface
 in this worker's allowlist. All other GitHub mutations remain supervisor-owned.
+
+Because the assigned worktree is beneath a Git-ignored root, use shell `rg`
+with `--hidden --no-ignore-vcs` and a narrow explicit worktree path for file
+discovery and text search; do not rely on native Glob there.
 
 Read the `runtime_policy`, `issue_conventions`, and `pull_request_template`
 paths returned in task context completely.

@@ -10,7 +10,6 @@ tools:
   - mcp__github_workflows__workflow_feedback
   - grep_search
   - read_file
-  - glob
   - web_fetch
   - mcp__github__get_commit
   - mcp__github__issue_read
@@ -46,6 +45,9 @@ This worker is read-only and must not create or execute any orchestration file.
 
 - Work only in the assigned immutable audit worktree and read-only run/history
   snapshots plus explicitly assigned version-matched local documentation paths.
+  The worktree is beneath a Git-ignored root, so use assigned paths,
+  `grep_search`, and exact `read_file` calls for discovery. Treat an empty search
+  as inconclusive until a known in-scope path confirms the search surface.
   Reread the shared environment inventory before each
   version-dependent conclusion and before the final report.
   Never edit, write, commit, push, comment, label, create issues, install

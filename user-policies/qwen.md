@@ -14,7 +14,9 @@ If either `.venv` or `uv` is unavailable, follow the repository instructions and
 
 When shell access is available, use ripgrep as the default repository search tool. Search text with `rg -n "pattern" [path]` and discover files with `rg --files [path]`. Narrow broad searches with explicit paths, `-g` inclusion globs, and `-g '!pattern'` exclusions; use `-C` or `-A` only when surrounding context is useful. Prefer these commands over shell `grep`, content searches with `find`, or custom Python search code.
 
-Keep search output focused. Use `-i` only for intentionally case-insensitive searches, `-l` when only matching filenames are needed, and `-c` when only counts are needed. When shell access is unavailable, use the native `grep_search` and `glob` tools instead.
+Keep search output focused. Use `-i` only for intentionally case-insensitive searches, `-l` when only matching filenames are needed, and `-c` when only counts are needed. When intentionally searching a known Git-ignored root such as an assigned `.worktrees/` checkout or `.venv/`, use `rg --files --hidden --no-ignore-vcs <explicit-root>` for file discovery and `rg -n --hidden --no-ignore-vcs "pattern" <explicit-root>` for text. Scope these searches narrowly and continue to obey every confidential-file and secret restriction.
+
+Until Qwen's native Glob tool supports per-call Git-ignore control, do not use it with a search root inside a Git-ignored directory. It filters results relative to the original project root even when that ignored root was supplied explicitly, so an empty result can be false. When shell access is unavailable, use `grep_search` and exact `read_file` calls instead. Treat any suspicious empty search as inconclusive until checked through a known in-scope path; never use it alone as evidence that a file or directory is absent.
 
 ## Validation
 

@@ -1089,3 +1089,26 @@ class TestExtensionMcp:
             for path in discovered.rglob("*"):
                 if path.is_symlink():
                     pytest.fail(f"extension resource must not be a symlink: {path}")
+
+    def test_worktree_workers_expose_reliable_search_tools(self) -> None:
+        search_tools = {"run_shell_command", "grep_search", "read_file", "glob"}
+        expected = {
+            "gh-audit-repo-worker.md": {"grep_search", "read_file"},
+            "gh-implement-issue-worker.md": {
+                "run_shell_command",
+                "grep_search",
+                "read_file",
+            },
+        }
+
+        for filename, tools in expected.items():
+            frontmatter = (
+                (EXTENSION / "agents" / filename).read_text(encoding="utf-8").split("---", 2)[1]
+            )
+            configured_tools = frontmatter.split("tools:", 1)[1].split("disallowedTools:", 1)[0]
+            configured = {
+                line.removeprefix("  - ")
+                for line in configured_tools.splitlines()
+                if line.startswith("  - ")
+            }
+            assert configured & search_tools == tools
