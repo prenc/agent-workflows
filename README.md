@@ -18,6 +18,12 @@ uv run agent-workflows install
 The command installs the project into `.venv`, renders the user-level Codex and
 Qwen instruction files, links this checkout as the Qwen extension, links the
 Codex skills, and installs the official Polars skill for both agents.
+It also detects missing GitHub and Context7 MCP registrations for each client
+and presents pending work in separate Codex, Qwen, and Shared sections. Press
+Enter to install everything, enter numbers or ranges such as `2 4-6` to exclude
+those entries, or enter `A` to exclude everything. Existing named MCP servers
+are preserved. Use `--skip-mcp` to leave MCP configuration unchanged; `--yes`
+selects every listed integration without prompting.
 The neutral source artifacts live under `user-policies/`; their filenames do
 not trigger repository instruction discovery before installation.
 It is safe to rerun. Use `--dry-run` to inspect changes, `--yes` for unattended

@@ -266,6 +266,8 @@ def main() -> int:
         if args.command == "feedback":
             return run_feedback(args)
         return run_workflow(args)
+    except KeyboardInterrupt:
+        return 130
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
         print(f"agent-workflows: {error}", file=sys.stderr)
         return 2

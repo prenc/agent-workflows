@@ -3,11 +3,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from github_workflows import installation
+from github_workflows import cli, installation
 
 
 def arguments(**overrides: object) -> argparse.Namespace:
@@ -17,6 +18,7 @@ def arguments(**overrides: object) -> argparse.Namespace:
         "yes": False,
         "verbose": False,
         "machine_role": "local",
+        "install_mcp": False,
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -49,8 +51,11 @@ def test_dry_run_lists_only_required_changes(
     assert "install the Python environment" in output
     assert "install Codex user instructions" in output
     assert "install Qwen user instructions" in output
-    assert "link Codex skill gh-audit-repo" in output
-    assert "clone the official Polars skill" in output
+    assert "Codex:\n    1) install Codex user instructions" in output
+    assert "link skill gh-audit-repo" in output
+    assert "Qwen:" in output
+    assert "Shared:" in output
+    assert "install the official Polars skill for Codex and Qwen" in output
     assert "Installation complete" not in output
 
 
@@ -180,3 +185,249 @@ def test_noninteractive_install_requires_yes(
 
     with pytest.raises(RuntimeError, match="rerun with --yes"):
         installer.approve()
+
+
+def test_mcp_plan_offers_each_missing_server_for_each_client(
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installer = installation.Installer(arguments(install_mcp=True), repository)
+    installer.home = repository / "home"
+    monkeypatch.setattr(installation, "command_path", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(
+        installer,
+        "_inspect_mcp",
+        lambda client, _executable: {"github"} if client == "codex" else set(),
+    )
+
+    installer.plan_mcp()
+
+    assert installer.changes == [
+        "configure the context7 MCP for Codex",
+        "configure the github MCP for Qwen",
+        "configure the context7 MCP for Qwen",
+    ]
+    assert installer.mcp_changes == {
+        ("codex", "context7"),
+        ("qwen", "github"),
+        ("qwen", "context7"),
+    }
+
+
+def test_qwen_mcp_inspection_reads_names_without_connecting(
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installer = installation.Installer(arguments(install_mcp=True), repository)
+    installer.home = repository / "home"
+    monkeypatch.delenv("QWEN_HOME", raising=False)
+    settings = installer.home / ".qwen" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "github": {"httpUrl": "https://custom.example/mcp"},
+                    "unrelated": {"command": "server"},
+                }
+            }
+        )
+    )
+
+    assert installer._inspect_mcp("qwen", "/bin/qwen") == {"github"}
+
+
+def test_qwen_mcp_inspection_honors_qwen_home(
+    repository: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installer = installation.Installer(arguments(install_mcp=True), repository)
+    installer.home = repository / "unused-home"
+    qwen_home = tmp_path / "custom-qwen"
+    qwen_home.mkdir()
+    (qwen_home / "settings.json").write_text(
+        json.dumps({"mcpServers": {"context7": {"httpUrl": "https://custom.example"}}})
+    )
+    monkeypatch.setenv("QWEN_HOME", str(qwen_home))
+
+    assert installer._inspect_mcp("qwen", "/bin/qwen") == {"context7"}
+
+
+def test_qwen_mcp_inspection_accepts_comments_without_altering_strings(
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installer = installation.Installer(arguments(install_mcp=True), repository)
+    installer.home = repository / "home"
+    monkeypatch.delenv("QWEN_HOME", raising=False)
+    settings = installer.home / ".qwen" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(
+        """{
+          // Qwen accepts comments in its settings.
+          "mcpServers": {
+            "github": {"httpUrl": "https://custom.example/mcp"},
+            /* Keep this user-owned server unchanged. */
+            "context7": {"httpUrl": "https://docs.example/mcp"}
+          }
+        }
+        """
+    )
+
+    assert installer._inspect_mcp("qwen", "/bin/qwen") == {"github", "context7"}
+
+
+def test_codex_mcp_inspection_preserves_configured_names(
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installer = installation.Installer(arguments(install_mcp=True), repository)
+
+    def inspect(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        name = command[3]
+        return subprocess.CompletedProcess(
+            command,
+            0 if name == "github" else 1,
+            stdout="{}" if name == "github" else "",
+            stderr="" if name == "github" else "No MCP server named 'context7' found.",
+        )
+
+    monkeypatch.setattr(installation.subprocess, "run", inspect)
+
+    assert installer._inspect_mcp("codex", "/bin/codex") == {"github"}
+
+
+def test_install_arguments_offer_mcp_by_default() -> None:
+    parser = argparse.ArgumentParser()
+    installation.add_install_arguments(parser)
+
+    assert parser.parse_args([]).install_mcp is True
+    assert parser.parse_args(["--skip-mcp"]).install_mcp is False
+
+
+def test_apply_mcp_uses_native_user_level_commands(
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    installer = installation.Installer(arguments(install_mcp=True), repository)
+    for client, name in (("codex", "github"), ("qwen", "context7")):
+        label = client.capitalize()
+        installer.add_change(f"configure the {name} MCP for {label}", group=label, component="mcp")
+        installer.mcp_changes.add((client, name))
+    monkeypatch.setattr(installation, "command_path", lambda name: f"/bin/{name}")
+    commands: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        installer,
+        "run",
+        lambda *command, **_kwargs: commands.append(command),
+    )
+
+    installer.apply_mcp()
+
+    assert commands == [
+        (
+            "/bin/codex",
+            "mcp",
+            "add",
+            "github",
+            "--url",
+            installation.MCP_SERVERS["github"],
+        ),
+        (
+            "/bin/qwen",
+            "mcp",
+            "add",
+            "--scope",
+            "user",
+            "--transport",
+            "http",
+            "context7",
+            installation.MCP_SERVERS["context7"],
+        ),
+    ]
+    assert capsys.readouterr().out.splitlines() == [
+        "[APPLY] Codex: configure the github MCP for Codex",
+        "[APPLY] Qwen: configure the context7 MCP for Qwen",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("", set()),
+        ("N", set()),
+        ("A", {1, 2, 3, 4, 5}),
+        ("1,3-4", {1, 3, 4}),
+        ("2 5", {2, 5}),
+    ],
+)
+def test_yay_style_exclusions(value: str, expected: set[int]) -> None:
+    assert installation.Installer.parse_exclusions(value, 5) == expected
+
+
+@pytest.mark.parametrize("value", ["0", "6", "3-2", "1-x", "1 ^3"])
+def test_yay_style_exclusions_reject_invalid_choices(value: str) -> None:
+    with pytest.raises(ValueError, match="selection"):
+        installation.Installer.parse_exclusions(value, 5)
+
+
+def test_interactive_selection_groups_clients_and_excludes_by_number(
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    installer = installation.Installer(arguments(dry_run=False), repository)
+    installer.add_change("install Codex workflow", group="Codex", component="codex")
+    installer.add_change("install Qwen workflow", group="Qwen", component="qwen")
+    installer.add_change("install runtime", group="Shared", component="runtime")
+    monkeypatch.setattr(installation.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "2")
+
+    assert installer.approve() is True
+
+    assert installer.changes == ["install Codex workflow", "install runtime"]
+    assert installer.changed_components == {"codex", "runtime"}
+    output = capsys.readouterr().out
+    assert "Codex:\n    1) install Codex workflow" in output
+    assert "Qwen:\n    2) install Qwen workflow" in output
+    assert "Shared:\n    3) install runtime" in output
+
+
+def test_interactive_selection_can_exclude_everything(
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    installer = installation.Installer(arguments(dry_run=False), repository)
+    installer.add_change("install Codex workflow", group="Codex", component="codex")
+    monkeypatch.setattr(installation.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "A")
+
+    assert installer.approve() is False
+    assert installer.changes == []
+    assert installer.changed_components == set()
+    assert "[OK] Nothing selected" in capsys.readouterr().out
+
+
+def test_keyboard_interrupt_is_a_silent_cli_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class Parser:
+        @staticmethod
+        def parse_args() -> argparse.Namespace:
+            return argparse.Namespace(command="install")
+
+    monkeypatch.setattr(cli, "build_parser", Parser)
+
+    def interrupt(_args: argparse.Namespace) -> int:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "install_from_args", interrupt)
+
+    assert cli.main() == 130
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
