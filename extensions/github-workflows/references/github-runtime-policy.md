@@ -100,18 +100,54 @@ the static review that does not depend on it.
 ## Workflow feedback
 
 Supervisors and named workers use `mcp__github_workflows__workflow_feedback` to
-record every distinct extension-related friction: a missing capability or tool,
-a supported operation that cannot execute, a confusing or ambiguous schema,
-an unnecessarily complicated API, misleading guidance or errors, repeated
-retries, or a forced workaround. Record one concise item for the friction
-encountered, rather than another item for each retry in the same encounter.
-Independent agents may report the same friction; do not spend time coordinating
-or reconciling their feedback. Add only the relevant tool name, argument object,
-and response excerpt when those details help reproduce it. Do not spend workflow
-time investigating feedback beyond identifying the friction clearly.
+record every distinct workflow friction: a missing capability or tool, a
+supported operation that cannot execute, a confusing or ambiguous schema, an
+unnecessarily complicated API, misleading guidance or errors, repeated
+retries, a forced workaround, or a materially problematic active instruction.
+Instruction friction includes contradictory layers, stale or ambiguous rules,
+guidance incompatible with the available environment or tools, and rules that
+cause avoidable repeated work or context growth. It may originate in user-level,
+repository-root, nested, local, imported, extension, skill, or named-agent
+instructions, regardless of the project's language or toolchain.
 
-Never attach conversations, user prompts, issue bodies, secrets, or unrelated
-output. Ordinary input mistakes, repository defects, unavailable dependencies,
-and transient external failures are not workflow feedback unless the extension
-caused or obscured them. Recording distinct friction is expected when possible,
-but feedback bookkeeping never delays work or blocks workflow completion.
+For instruction feedback, identify the known layer and project-relative file or
+section, paraphrase only the relevant rule, describe the observed consequence,
+and include an evident clarification when useful. If provenance is unavailable,
+say only that an active instruction caused the behavior; do not guess its source,
+loading order, preservation, or precedence. A named worker reports only its own
+observed context and does not infer what a supervisor or another worker received.
+Report a suspected loading failure only after the client or task context provides
+direct evidence that the expected instruction was absent. Do not report a valid
+project constraint merely because it limited the task, and never resolve
+instruction friction by silently ignoring the active higher-precedence rule.
+
+Keep calls simple. Instruction or general workflow friction needs only
+`message`. A named worker also supplies its exact `task_ref` from
+`task_context`. When a failed `github-workflows` MCP call provides an
+`error_ref`, pass that reference instead of repeating the rejected arguments or
+error response; the server attaches its sanitized failure snapshot
+automatically. Use `tool` with optional `arguments` and `response` only for a
+Qwen-native or external tool failure, or a confusing successful interaction the
+workflow server could not observe. Never combine `error_ref` with manual tool
+context.
+
+Record one concise item for the friction encountered, rather than another item
+for each retry in the same encounter. Independent agents may report the same
+friction; do not spend time coordinating or reconciling their feedback. Add only
+the relevant tool name, argument object, and response excerpt when those details
+help reproduce a tool interaction. Instruction-only feedback needs only the
+message. Do not spend workflow time investigating feedback beyond identifying
+the friction clearly.
+
+State directly observed behavior separately from any unverified causal
+hypothesis. The feedback reminder on an MCP error is an invitation, not a
+requirement: ordinary correctable input mistakes do not merit feedback merely
+because the reminder appeared.
+
+Never attach conversations, user prompts, issue bodies, complete instruction
+files, combined context dumps, system prompts, secrets, confidential instruction
+content, or unrelated output. Ordinary input mistakes, repository defects,
+unavailable dependencies, and transient external failures are not workflow
+feedback unless the workflow or its active instructions caused or obscured them.
+Recording distinct friction is expected when possible, but feedback bookkeeping
+never delays work or blocks workflow completion.

@@ -15,6 +15,7 @@ import pytest
 from mcp import Client
 from pydantic import ValidationError
 
+from github_workflows import feedback
 from github_workflows.mcp_server import _validation_issues, create_server
 from github_workflows.models import (
     AuditRecordRequest,
@@ -68,6 +69,14 @@ class TestExtensionMcp:
                 }
                 feedback_properties = tools["workflow_feedback"].input_schema["properties"]
                 assert tools["workflow_feedback"].input_schema["required"] == ["message"]
+                assert set(feedback_properties) == {
+                    "message",
+                    "task_ref",
+                    "error_ref",
+                    "tool",
+                    "arguments",
+                    "response",
+                }
                 assert feedback_properties["arguments"]["type"] == "object"
                 assert "anyOf" not in feedback_properties["arguments"]
                 assert tools["workflow_feedback"].annotations.idempotent_hint is False
@@ -317,9 +326,12 @@ class TestExtensionMcp:
                 )
                 assert not finished.is_error
 
-    async def test_expected_runtime_failure_is_actionable_tool_error(self, caplog: Any) -> None:
+    async def test_expected_runtime_failure_is_actionable_tool_error(
+        self, caplog: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         with tempfile.TemporaryDirectory(prefix="github-workflows-errors-") as directory:
             root = Path(directory)
+            monkeypatch.setenv("XDG_CACHE_HOME", str(root / "cache"))
             workspace = root / "repo"
             workspace.mkdir()
             runtime = WorkflowRuntime(workspace, root / "qwen-project")
@@ -365,6 +377,7 @@ class TestExtensionMcp:
                 internal_diagnostic = re.compile(
                     r"validation errors?|input_(?:value|type)|errors\.pydantic|Traceback"
                 )
+                failure_reference = None
                 for tool_name, arguments in invalid_calls:
                     result = await client.call_tool(tool_name, arguments)
                     assert result.is_error
@@ -372,6 +385,37 @@ class TestExtensionMcp:
                     message = result.content[0].text
                     assert "\n" not in message
                     assert internal_diagnostic.search(message) is None
+                    references = re.findall(r'error_ref="(err-[0-9a-f]{12})"', message)
+                    if tool_name == "workflow_feedback":
+                        assert references == []
+                    else:
+                        assert len(references) == 1
+                        failure_reference = failure_reference or references[0]
+
+                assert failure_reference is not None
+                recorded = await client.call_tool(
+                    "workflow_feedback",
+                    {
+                        "message": "The rejected request was difficult to correct",
+                        "error_ref": failure_reference,
+                    },
+                )
+                assert not recorded.is_error
+                assert recorded.structured_content["context_attached"] is True
+                stored = feedback.find(recorded.structured_content["feedback_id"])
+                assert stored["tool"]
+                assert stored["provenance"]["client"]["name"]
+                assert stored["provenance"]["server_version"]
+
+                expired = await client.call_tool(
+                    "workflow_feedback",
+                    {
+                        "message": "A failure reference was no longer available",
+                        "error_ref": "err-000000000000",
+                    },
+                )
+                assert not expired.is_error
+                assert expired.structured_content["context_attached"] is False
                 assert not (await client.call_tool("run_manage", request)).is_error
                 replaced = await client.call_tool("run_manage", request)
                 assert not replaced.is_error
@@ -391,6 +435,7 @@ class TestExtensionMcp:
                     item.text for item in crashed.content if hasattr(item, "text")
                 )
                 assert sentinel not in public_crash
+                assert re.search(r'error_ref="err-[0-9a-f]{12}"', public_crash)
                 assert any(record.exc_info for record in caplog.records)
 
     def test_task_references_disambiguate_workflows_and_reject_stale_runs(self) -> None:

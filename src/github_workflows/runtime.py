@@ -80,7 +80,17 @@ class WorkflowRuntime:
     def state(self, workflow: WorkflowName) -> dict[str, Any]:
         return workflow_run.load_state(self.current(workflow))
 
-    def _feedback_attribution(self) -> tuple[str | None, str | None, str | None]:
+    def feedback_private_paths(self) -> list[tuple[Path, str]]:
+        """Return path replacements shared by live failures and durable feedback."""
+        return [
+            (self.project_dir, "<project-state>"),
+            (self.workspace, "<workspace>"),
+            (Path.home(), "<home>"),
+        ]
+
+    def _feedback_attribution(
+        self, task_ref: str | None = None
+    ) -> tuple[str | None, str | None, str | None, dict[str, str] | None]:
         active: list[dict[str, Any]] = []
         for workflow in ("gh-audit-repo", "gh-curate-issues", "gh-implement-issue"):
             try:
@@ -91,6 +101,26 @@ class WorkflowRuntime:
                 active.append(state)
         workflow = str(active[0].get("workflow")) if len(active) == 1 else None
         run_id = str(active[0].get("run_id")) if len(active) == 1 else None
+        task: dict[str, str] | None = None
+        if task_ref is not None:
+            parsed_workflow, parsed_run_id, task_id = self._parse_task_ref(task_ref)
+            workflow = parsed_workflow
+            run_id = parsed_run_id
+            task = {"id": task_id}
+            try:
+                state = self.state(parsed_workflow)
+            except (OSError, ValueError):
+                state = {}
+            matching_state = state if state.get("run_id") == parsed_run_id else {}
+            stored_task = matching_state.get("tasks", {}).get(task_id)
+            if isinstance(stored_task, dict):
+                role = stored_task.get("role")
+                if isinstance(role, str) and role:
+                    task["role"] = role
+            repository = matching_state.get("repository")
+            if not isinstance(repository, str) or not re.fullmatch(r"[^/\s]+/[^/\s]+", repository):
+                repository = None
+            return repository, workflow, run_id, task
         repositories = {
             str(state["repository"])
             for state in active
@@ -112,25 +142,39 @@ class WorkflowRuntime:
             )
             if match:
                 repository = f"{match.group(1)}/{match.group(2)}"
-        return repository, workflow, run_id
+        return repository, workflow, run_id, task
 
-    def workflow_feedback(self, request: WorkflowFeedbackRequest) -> dict[str, Any]:
+    def workflow_feedback(
+        self,
+        request: WorkflowFeedbackRequest,
+        *,
+        provenance: dict[str, Any] | None = None,
+        failure_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Record one bounded agent observation outside workflow state."""
-        repository, workflow, run_id = self._feedback_attribution()
-        return feedback.append(
+        repository, workflow, run_id, task = self._feedback_attribution(request.task_ref)
+        attached = failure_context is not None or any(
+            value is not None for value in (request.tool, request.arguments, request.response)
+        )
+        context = failure_context or {}
+        stored_provenance = {
+            **(provenance or {}),
+            **(context.get("provenance") or {}),
+        }
+        if task is not None:
+            stored_provenance["task"] = task
+        result = feedback.append(
             message=request.message,
-            tool=request.tool,
-            arguments=request.arguments,
-            response=request.response,
+            tool=context.get("tool", request.tool),
+            arguments=context.get("arguments", request.arguments),
+            response=context.get("response", request.response),
             repository=repository,
             workflow=workflow,
             run_id=run_id,
-            private_paths=[
-                (self.project_dir, "<project-state>"),
-                (self.workspace, "<workspace>"),
-                (Path.home(), "<home>"),
-            ],
+            provenance=stored_provenance,
+            private_paths=self.feedback_private_paths(),
         )
+        return {**result, "context_attached": attached}
 
     @staticmethod
     def _invoke(

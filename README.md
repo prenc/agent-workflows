@@ -48,8 +48,11 @@ uv build
 Manual workflow recovery is available through `agent-workflows workflow --help`. Qwen starts the MCP server through the private `agent-workflows mcp`
 subcommand declared in `qwen-extension.json`.
 
-Material skill or MCP friction reported by supervisors and named workers is
-kept locally in `${XDG_CACHE_HOME:-~/.cache}/agent-workflows/feedback.jsonl`.
+Material skill, MCP, workflow, or active-instruction friction reported by
+supervisors and named workers is kept locally in
+`${XDG_CACHE_HOME:-~/.cache}/agent-workflows/feedback.jsonl`.
 Review it with `agent-workflows feedback list` and inspect one complete record
-with `agent-workflows feedback show <feedback-id>`. Cache cleanup may remove
-these diagnostic records.
+with `agent-workflows feedback show <feedback-id>`. The list prints compact
+metadata followed by each complete wrapped summary; use
+`agent-workflows feedback list --json` for machine-readable records. Cache cleanup
+may remove these diagnostic records.

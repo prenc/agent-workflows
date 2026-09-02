@@ -10,6 +10,12 @@ When the project root contains `.venv` and `uv` is installed, invoke Python comm
 
 If either `.venv` or `uv` is unavailable, follow the repository instructions and use the available project or system command without creating an environment solely to run it.
 
+## Repository Search
+
+When shell access is available, use ripgrep as the default repository search tool. Search text with `rg -n "pattern" [path]` and discover files with `rg --files [path]`. Narrow broad searches with explicit paths, `-g` inclusion globs, and `-g '!pattern'` exclusions; use `-C` or `-A` only when surrounding context is useful. Prefer these commands over shell `grep`, content searches with `find`, or custom Python search code.
+
+Keep search output focused. Use `-i` only for intentionally case-insensitive searches, `-l` when only matching filenames are needed, and `-c` when only counts are needed. When shell access is unavailable, use the native `grep_search` and `glob` tools instead.
+
 ## Validation
 
 During implementation, run the fastest coherent lightweight checks for the behavior being changed. Use focused tests before broader validation and keep output concise unless diagnosing a failure. Running lightweight tests, formatters, linters, and pre-commit hooks is authorized when they are part of the repository's documented workflow. Report unavailable tools or skipped coverage instead of silently installing dependencies or claiming validation that did not run.

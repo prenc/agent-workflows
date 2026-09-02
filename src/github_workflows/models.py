@@ -30,12 +30,50 @@ class ExtensibleRecord(BaseModel):
 
 
 class WorkflowFeedbackRequest(StrictRequest):
-    """One concise observation with optional structured tool context."""
+    """One concise workflow or instruction observation with optional tool context."""
 
-    message: str = Field(min_length=1, max_length=2000)
-    tool: str | None = Field(default=None, min_length=1, max_length=200)
-    arguments: dict[str, Any] | None = None
-    response: str | None = Field(default=None, max_length=16_000)
+    message: str = Field(
+        min_length=1,
+        max_length=2000,
+        description=(
+            "Observed friction and consequence. For instruction friction, name the known "
+            "layer or project-relative section without copying the complete instruction context."
+        ),
+    )
+    task_ref: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=400,
+        description="Exact worker task reference returned by task_context, when available.",
+    )
+    error_ref: str | None = Field(
+        default=None,
+        pattern=r"^err-[0-9a-f]{12}$",
+        description="Short reference included in a failed github-workflows MCP call.",
+    )
+    tool: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        description="Native or external tool name when no MCP error_ref is available.",
+    )
+    arguments: dict[str, Any] | None = Field(
+        default=None,
+        description="Small relevant argument object for manually attached tool context.",
+    )
+    response: str | None = Field(
+        default=None,
+        max_length=16_000,
+        description="Small relevant response excerpt for manually attached tool context.",
+    )
+
+    @model_validator(mode="after")
+    def one_tool_context_source(self) -> WorkflowFeedbackRequest:
+        if self.error_ref is not None and any(
+            value is not None for value in (self.tool, self.arguments, self.response)
+        ):
+            raise ValueError("error_ref cannot be combined with manual tool context")
+        return self
 
     @field_validator("message", "tool")
     @classmethod

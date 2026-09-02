@@ -6,13 +6,16 @@ import logging
 import re
 from copy import deepcopy
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Literal
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver.context import Context
 from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 from mcp.types import ToolAnnotations
 from pydantic import ValidationError
 
+from . import feedback
 from .models import (
     AreaDefinition,
     AuditRecordRequest,
@@ -220,6 +223,26 @@ def _expected_message(error: ToolError) -> str:
     return message or "tool request failed"
 
 
+def _request_provenance(context: Context[Any, Any] | None) -> dict[str, Any]:
+    """Return metadata the MCP server can derive without agent input."""
+    try:
+        server_version = version("agent-workflows")
+    except PackageNotFoundError:  # pragma: no cover - editable installs provide metadata
+        server_version = "unknown"
+    result: dict[str, Any] = {"server_version": server_version}
+    if context is None:
+        return result
+    request_context = context.request_context
+    result["protocol_version"] = request_context.protocol_version
+    params = request_context.session.client_params
+    if params is not None:
+        result["client"] = {
+            "name": params.client_info.name,
+            "version": params.client_info.version,
+        }
+    return result
+
+
 def _action_requirement(
     discriminator: str, action: str, required: tuple[str, ...]
 ) -> dict[str, Any]:
@@ -314,6 +337,34 @@ def _public_input_schema(name: str, schema: dict[str, Any]) -> dict[str, Any]:
 class WorkflowMCPServer(MCPServer[Any]):
     """Keep SDK and model diagnostics out of agent-facing tool results."""
 
+    def __init__(self, name: str, *, failures: feedback.FailureRegistry) -> None:
+        super().__init__(name)
+        self.failures = failures
+
+    def _failure_message(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        message: str,
+        context: Context[Any, Any] | None,
+    ) -> str:
+        if name == "workflow_feedback":
+            return message
+        try:
+            reference = self.failures.record(
+                tool=name,
+                arguments=arguments,
+                response=message,
+                provenance=_request_provenance(context),
+            )
+        except Exception:  # pragma: no cover - feedback must never obscure the original failure
+            LOGGER.exception("Unable to retain MCP failure context")
+            return message
+        return (
+            f'{message} Consider workflow_feedback(message="what was confusing", '
+            f'error_ref="{reference}") if this is confusing or repeated API friction.'
+        )
+
     async def list_tools(self) -> list[Any]:
         tools = await super().list_tools()
         return [
@@ -324,12 +375,21 @@ class WorkflowMCPServer(MCPServer[Any]):
         ]
 
     async def call_tool(
-        self, name: str, arguments: dict[str, Any], context: Any | None = None
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        context: Context[Any, Any] | None = None,
     ) -> Any:
         try:
             return await super().call_tool(name, arguments, context)
         except UnexpectedToolError as error:
-            raise UnexpectedToolError("Internal tool failure; inspect server logs") from error
+            message = self._failure_message(
+                name,
+                arguments,
+                "Internal tool failure; inspect server logs.",
+                context,
+            )
+            raise UnexpectedToolError(message) from error
         except ToolError as error:
             validation = _validation_cause(error)
             if validation is not None:
@@ -338,8 +398,10 @@ class WorkflowMCPServer(MCPServer[Any]):
                     name,
                     validation.errors(include_url=False, include_input=False),
                 )
-                raise ToolError(_render_validation_error(validation, arguments)) from validation
-            raise ToolError(_expected_message(error)) from error
+                message = _render_validation_error(validation, arguments)
+            else:
+                message = _expected_message(error)
+            raise ToolError(self._failure_message(name, arguments, message, context)) from error
 
 
 def _public_call(operation: Any, *arguments: Any) -> Any:
@@ -362,17 +424,43 @@ def _request_call(operation: Any, model: type[Any], **values: Any) -> Any:
 
 def create_server(runtime: WorkflowRuntime) -> MCPServer:
     """Create a server whose tools operate on one validated workspace."""
-    mcp = WorkflowMCPServer("github-workflows")
+    mcp = WorkflowMCPServer(
+        "github-workflows",
+        failures=feedback.FailureRegistry(runtime.feedback_private_paths()),
+    )
 
     @mcp.tool(annotations=APPEND_WRITE, structured_output=True)
     def workflow_feedback(
         message: str,
+        task_ref: str | None = None,
+        error_ref: str | None = None,
         tool: str | None = None,
         arguments: dict[str, Any] | None = None,
         response: str | None = None,
+        context: Context[Any, Any] | None = None,
     ) -> dict[str, Any]:
-        """Record one distinct extension friction once, with optional relevant tool context."""
-        return _request_call(runtime.workflow_feedback, WorkflowFeedbackRequest, **locals())
+        """Record friction; usually send message, plus task_ref or an offered error_ref."""
+        values = {
+            "message": message,
+            "task_ref": task_ref,
+            "error_ref": error_ref,
+            "tool": tool,
+            "arguments": arguments,
+            "response": response,
+        }
+
+        def record() -> dict[str, Any]:
+            request = WorkflowFeedbackRequest.model_validate(
+                {name: value for name, value in values.items() if value is not None}
+            )
+            failure_context = mcp.failures.resolve(error_ref) if error_ref is not None else None
+            return runtime.workflow_feedback(
+                request,
+                provenance=_request_provenance(context),
+                failure_context=failure_context,
+            )
+
+        return _public_call(record)
 
     @mcp.tool(annotations=CONTROL_WRITE, structured_output=True)
     def run_manage(
