@@ -164,9 +164,7 @@ class WorkflowRuntime:
     ) -> dict[str, Any]:
         """Record one bounded agent observation outside workflow state."""
         repository, workflow, run_id, task = self._feedback_attribution(request.task_ref)
-        attached = failure_context is not None or any(
-            value is not None for value in (request.tool, request.arguments, request.response)
-        )
+        attached = failure_context is not None or request.tool is not None
         context = failure_context or {}
         stored_provenance = {
             **(provenance or {}),
@@ -174,11 +172,13 @@ class WorkflowRuntime:
         }
         if task is not None:
             stored_provenance["task"] = task
+        origin = dict(context.get("origin") or {})
+        if request.error_ref is not None:
+            origin["error_ref"] = request.error_ref
         result = feedback.append(
             message=request.message,
             tool=context.get("tool", request.tool),
-            arguments=context.get("arguments", request.arguments),
-            response=context.get("response", request.response),
+            origin=origin or None,
             repository=repository,
             workflow=workflow,
             run_id=run_id,

@@ -54,6 +54,16 @@ supervisors and named workers is kept locally in
 Review it with `agent-workflows feedback list` and inspect one complete record
 with `agent-workflows feedback show <feedback-id>`. The list prints compact
 metadata followed by each complete wrapped summary; use
-`agent-workflows feedback list --json` for machine-readable records. After review,
-remove selected records atomically with
-`agent-workflows feedback remove <feedback-id> [<feedback-id> ...]`.
+`agent-workflows feedback list --json` for machine-readable records. `feedback ls`
+is a short alias; repeat `--source <name>` to include one or more normalized tool
+sources, and use `feedback sources` to print every unique source with its count.
+Use `feedback stats` to monitor retained size and `feedback trace <feedback-id>`
+to locate the exact Qwen session and tool call without printing conversation
+content. Feedback stores PHI-free summaries and bounded call shapes only; raw
+tool arguments, responses, prompts, and source-data excerpts remain exclusively
+in the Qwen transcript.
+The legacy `--tool` spelling remains an alias for `--source`. Close reviewed
+records with `feedback close <feedback-id> [<feedback-id> ...]`, optionally
+selecting a disposition and a short PHI-free note; default lists
+show only open feedback, while `feedback ls --closed` and `feedback sources --closed` inspect the retained closed set. Use `feedback reopen` to restore a
+closed record. `feedback remove` remains the explicit permanent-deletion command.

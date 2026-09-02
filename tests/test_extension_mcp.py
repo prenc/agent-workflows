@@ -74,11 +74,7 @@ class TestExtensionMcp:
                     "task_ref",
                     "error_ref",
                     "tool",
-                    "arguments",
-                    "response",
                 }
-                assert feedback_properties["arguments"]["type"] == "object"
-                assert "anyOf" not in feedback_properties["arguments"]
                 assert tools["workflow_feedback"].annotations.idempotent_hint is False
                 context_properties = tools["task_context"].input_schema["properties"]
                 assert "task_ref" in context_properties

@@ -125,28 +125,30 @@ Keep calls simple. Instruction or general workflow friction needs only
 `message`. A named worker also supplies its exact `task_ref` from
 `task_context`. When a failed `github-workflows` MCP call provides an
 `error_ref`, pass that reference instead of repeating the rejected arguments or
-error response; the server attaches its sanitized failure snapshot
-automatically. Use `tool` with optional `arguments` and `response` only for a
-Qwen-native or external tool failure, or a confusing successful interaction the
-workflow server could not observe. Never combine `error_ref` with manual tool
-context.
+error response; the server attaches a PHI-safe call shape automatically. Use
+`tool` only to name a Qwen-native or external tool, or a confusing successful
+interaction the workflow server could not observe. Never combine `error_ref`
+with `tool`.
 
 Record one concise item for the friction encountered, rather than another item
 for each retry in the same encounter. Independent agents may report the same
 friction; do not spend time coordinating or reconciling their feedback. Add only
-the relevant tool name, argument object, and response excerpt when those details
-help reproduce a tool interaction. Instruction-only feedback needs only the
-message. Do not spend workflow time investigating feedback beyond identifying
-the friction clearly.
+the relevant tool name when it helps identify an interaction. Do not copy tool
+arguments or responses into the message; the local transcript remains the
+source for full context. Instruction-only feedback needs only the message. Do
+not spend workflow time investigating feedback beyond identifying the friction
+clearly.
 
 State directly observed behavior separately from any unverified causal
 hypothesis. The feedback reminder on an MCP error is an invitation, not a
 requirement: ordinary correctable input mistakes do not merit feedback merely
 because the reminder appeared.
 
-Never attach conversations, user prompts, issue bodies, complete instruction
-files, combined context dumps, system prompts, secrets, confidential instruction
-content, or unrelated output. Ordinary input mistakes, repository defects,
+Never include PHI, PII, patient identifiers, source-data excerpts,
+conversations, user prompts, issue bodies, complete instruction files, combined
+context dumps, system prompts, secrets, confidential instruction content, or
+unrelated output. Describe data-bearing failures structurally without copying
+values. Ordinary input mistakes, repository defects,
 unavailable dependencies, and transient external failures are not workflow
 feedback unless the workflow or its active instructions caused or obscured them.
 Run progress, findings, evidence, checkpoints, and ordinary limitations belong in

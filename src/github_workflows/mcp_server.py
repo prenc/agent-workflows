@@ -273,13 +273,6 @@ def _public_input_schema(name: str, schema: dict[str, Any]) -> dict[str, Any]:
             **object_schema,
             "description": "Structured report object; do not JSON-encode it as a string.",
         }
-    if name == "workflow_feedback":
-        arguments = result.get("properties", {}).get("arguments", {})
-        object_schema = next(
-            (variant for variant in arguments.get("anyOf", []) if variant.get("type") == "object"),
-            {"type": "object", "additionalProperties": True},
-        )
-        result["properties"]["arguments"] = object_schema
     conditions = result.setdefault("allOf", [])
     contract = ACTION_REQUIREMENTS.get(name)
     if contract is not None:
@@ -350,6 +343,8 @@ class WorkflowMCPServer(MCPServer[Any]):
         arguments: dict[str, Any],
         message: str,
         context: Context[Any, Any] | None,
+        *,
+        failure_kind: str,
     ) -> str:
         if name == "workflow_feedback":
             return message
@@ -357,7 +352,7 @@ class WorkflowMCPServer(MCPServer[Any]):
             reference = self.failures.record(
                 tool=name,
                 arguments=arguments,
-                response=message,
+                failure_kind=failure_kind,
                 provenance=_request_provenance(context),
             )
         except Exception:  # pragma: no cover - feedback must never obscure the original failure
@@ -391,6 +386,7 @@ class WorkflowMCPServer(MCPServer[Any]):
                 arguments,
                 "Internal tool failure; inspect server logs.",
                 context,
+                failure_kind="internal",
             )
             raise UnexpectedToolError(message) from error
         except ToolError as error:
@@ -404,7 +400,15 @@ class WorkflowMCPServer(MCPServer[Any]):
                 message = _render_validation_error(validation, arguments)
             else:
                 message = _expected_message(error)
-            raise ToolError(self._failure_message(name, arguments, message, context)) from error
+            raise ToolError(
+                self._failure_message(
+                    name,
+                    arguments,
+                    message,
+                    context,
+                    failure_kind="validation" if validation is not None else "domain",
+                )
+            ) from error
 
 
 def _public_call(operation: Any, *arguments: Any) -> Any:
@@ -438,18 +442,14 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
         task_ref: str | None = None,
         error_ref: str | None = None,
         tool: str | None = None,
-        arguments: dict[str, Any] | None = None,
-        response: str | None = None,
         context: Context[Any, Any] | None = None,
     ) -> dict[str, Any]:
-        """Record friction; usually send message, plus task_ref or an offered error_ref."""
+        """Record PHI-free friction; send a message, task_ref, error_ref, or tool name."""
         values = {
             "message": message,
             "task_ref": task_ref,
             "error_ref": error_ref,
             "tool": tool,
-            "arguments": arguments,
-            "response": response,
         }
 
         def record() -> dict[str, Any]:

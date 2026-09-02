@@ -55,24 +55,16 @@ class WorkflowFeedbackRequest(StrictRequest):
         default=None,
         min_length=1,
         max_length=200,
-        description="Native or external tool name when no MCP error_ref is available.",
-    )
-    arguments: dict[str, Any] | None = Field(
-        default=None,
-        description="Small relevant argument object for manually attached tool context.",
-    )
-    response: str | None = Field(
-        default=None,
-        max_length=16_000,
-        description="Small relevant response excerpt for manually attached tool context.",
+        description=(
+            "Native or external tool name when no MCP error_ref is available; never put "
+            "PHI, PII, prompts, or payload values in the feedback message."
+        ),
     )
 
     @model_validator(mode="after")
     def one_tool_context_source(self) -> WorkflowFeedbackRequest:
-        if self.error_ref is not None and any(
-            value is not None for value in (self.tool, self.arguments, self.response)
-        ):
-            raise ValueError("error_ref cannot be combined with manual tool context")
+        if self.error_ref is not None and self.tool is not None:
+            raise ValueError("error_ref cannot be combined with tool")
         return self
 
     @field_validator("message", "tool")

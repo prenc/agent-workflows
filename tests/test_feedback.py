@@ -13,7 +13,7 @@ from unittest import mock
 import pytest
 
 from github_workflows import feedback
-from github_workflows.cli import run_feedback
+from github_workflows.cli import build_parser, run_feedback
 from github_workflows.models import (
     RunManageRequest,
     TaskManageRequest,
@@ -36,8 +36,15 @@ def append_feedback(**overrides: object) -> dict[str, object]:
     values = {
         "message": "The schema rejected a structured report",
         "tool": "task_manage",
-        "arguments": {"report": {"status": "complete"}},
-        "response": "report must be an object",
+        "origin": {
+            "failure_kind": "validation",
+            "invocation": {
+                "argument_types": {"action": "string", "report": "object"},
+                "selectors": {"action": "complete"},
+                "omitted": ["report"],
+                "complete": False,
+            },
+        },
         "repository": "example/repo",
         "workflow": "gh-audit-repo",
         "run_id": "run-1",
@@ -51,12 +58,12 @@ def test_feedback_is_private_and_sanitized(cache: Path) -> None:
     private = cache.parent / "workspace"
     first = append_feedback(
         message=f"Confusing path {private}",
-        arguments={"token": "secret", "path": str(private / "src")},
+        origin={"error_ref": "err-123456789abc", "path": str(private / "src")},
         private_paths=[(private, "<workspace>")],
     )
     second = append_feedback(
         message=f"Confusing path {private}",
-        arguments={"token": "secret", "path": str(private / "src")},
+        origin={"error_ref": "err-123456789abc", "path": str(private / "src")},
         private_paths=[(private, "<workspace>")],
     )
 
@@ -66,11 +73,9 @@ def test_feedback_is_private_and_sanitized(cache: Path) -> None:
     assert second["feedback_id"] != first["feedback_id"]
     assert re.fullmatch(r"fb-[0-9a-f]{12}", str(first["feedback_id"]))
     assert len(records) == 2
+    assert records[0]["status"] == "open"
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", records[0]["timestamp"])
-    assert records[0]["arguments"] == {
-        "token": "<redacted>",
-        "path": "<workspace>/src",
-    }
+    assert records[0]["origin"]["path"] == "<workspace>/src"
     assert records[0]["message"] == "Confusing path <workspace>"
     assert stat.S_IMODE(feedback.storage_path().stat().st_mode) == 0o600
     assert stat.S_IMODE(feedback.storage_path().parent.stat().st_mode) == 0o700
@@ -234,8 +239,8 @@ def test_feedback_ignores_local_path_git_remote(cache: Path, tmp_path: Path) -> 
 
 
 def test_feedback_rejects_oversized_records_without_creating_a_file(cache: Path) -> None:
-    with pytest.raises(ValueError, match="64 KiB"):
-        append_feedback(arguments={"payload": "x" * feedback.MAX_RECORD_BYTES})
+    with pytest.raises(ValueError, match="8 KiB"):
+        append_feedback(message="x" * feedback.MAX_RECORD_BYTES)
 
     assert not feedback.storage_path().exists()
 
@@ -278,18 +283,28 @@ def test_failure_registry_sanitizes_bounds_and_expires(tmp_path: Path) -> None:
                 "path": str(private / "src"),
                 "token": "private",
             },
-            response=f"Failed under {private}",
+            failure_kind="validation",
         )
         stored = registry.resolve(first)
         assert stored is not None
-        assert stored["arguments"] == {
-            "action": "start",
-            "candidate_id": "<dict>",
+        assert stored["origin"] == {
+            "failure_kind": "validation",
+            "invocation": {
+                "argument_types": {
+                    "action": "string",
+                    "candidate_id": "object",
+                    "instructions": "string",
+                    "records": "array",
+                },
+                "selectors": {"action": "start"},
+                "omitted": ["candidate_id", "instructions", "records"],
+                "complete": False,
+                "unknown_argument_count": 2,
+            },
         }
-        assert stored["response"] == "Failed under <workspace>"
 
-        registry.record(tool="run_status", arguments={}, response="failed")
-        third = registry.record(tool="task_manage", arguments={}, response="failed")
+        registry.record(tool="run_status", arguments={}, failure_kind="domain")
+        third = registry.record(tool="task_manage", arguments={}, failure_kind="internal")
         assert registry.resolve(first) is None
         assert registry.resolve(third) is not None
 
@@ -297,17 +312,21 @@ def test_failure_registry_sanitizes_bounds_and_expires(tmp_path: Path) -> None:
         assert registry.resolve(third) is None
 
 
-def test_failure_registry_omits_oversized_arguments(tmp_path: Path) -> None:
+def test_failure_registry_omits_argument_values(tmp_path: Path) -> None:
     registry = feedback.FailureRegistry([(tmp_path, "<workspace>")])
     reference = registry.record(
         tool="task_manage",
         arguments={"report": "x" * feedback.MAX_FAILURE_BYTES},
-        response="report was rejected",
+        failure_kind="validation",
     )
 
     stored = registry.resolve(reference)
     assert stored is not None
-    assert stored["arguments"] == {"omitted": "automatic failure arguments were not retained"}
+    assert stored["origin"]["invocation"] == {
+        "argument_types": {"report": "string"},
+        "complete": False,
+        "omitted": ["report"],
+    }
 
 
 def test_failure_registry_bounds_the_complete_snapshot(tmp_path: Path) -> None:
@@ -315,14 +334,14 @@ def test_failure_registry_bounds_the_complete_snapshot(tmp_path: Path) -> None:
     reference = registry.record(
         tool="task_manage",
         arguments={"action": "complete"},
-        response="x" * (feedback.MAX_FAILURE_BYTES * 3),
+        failure_kind="validation",
         provenance={"client": {"name": "qwen"}},
     )
 
     stored = registry.resolve(reference)
     assert stored is not None
     assert feedback._encoded_size(stored) <= feedback.MAX_FAILURE_BYTES
-    assert str(stored["response"]).endswith("… <truncated>")
+    assert stored["origin"]["invocation"]["complete"] is True
 
 
 def test_failed_append_restores_previous_file_length(cache: Path) -> None:
@@ -410,7 +429,8 @@ def test_feedback_cli_lists_compact_records_and_shows_context(
         feedback_command="list",
         repository=None,
         workflow=None,
-        tool=None,
+        sources=None,
+        closed=False,
         limit=50,
         json_output=False,
     )
@@ -432,8 +452,7 @@ def test_feedback_cli_lists_compact_records_and_shows_context(
     )
     assert run_feedback(show_args) == 0
     shown = json.loads(capsys.readouterr().out)
-    assert shown["arguments"] == {"report": {"status": "complete"}}
-    assert shown["response"] == "report must be an object"
+    assert shown["origin"]["invocation"]["omitted"] == ["report"]
 
     remove_args = argparse.Namespace(
         feedback_command="remove", feedback_ids=[str(result["feedback_id"])[-8:]]
@@ -441,6 +460,280 @@ def test_feedback_cli_lists_compact_records_and_shows_context(
     assert run_feedback(remove_args) == 0
     assert capsys.readouterr().out == "Removed 1 feedback record.\n"
     assert feedback.read_records() == []
+
+
+def test_feedback_cli_closes_filters_and_reopens_records(
+    cache: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    first = append_feedback(tool="task_context", message="Reviewed item")
+    second = append_feedback(tool="web_fetch", message="Pending item")
+
+    close_args = build_parser().parse_args(["feedback", "close", str(first["feedback_id"])[-8:]])
+    assert run_feedback(close_args) == 0
+    assert capsys.readouterr().out == "Closed 1 feedback record.\n"
+    closed_record = feedback.find(str(first["feedback_id"]))
+    assert closed_record["status"] == "closed"
+    assert closed_record["resolution"] == {"disposition": "addressed"}
+    assert closed_record["closed_at"].endswith("Z")
+    assert [record["feedback_id"] for record in feedback.compact_records()] == [
+        second["feedback_id"]
+    ]
+
+    closed_args = build_parser().parse_args(["feedback", "ls", "--closed", "--json"])
+    assert run_feedback(closed_args) == 0
+    closed = json.loads(capsys.readouterr().out)
+    assert [record["feedback_id"] for record in closed] == [first["feedback_id"]]
+    assert feedback.source_counts() == [{"source": "web_fetch", "count": 1}]
+    assert feedback.source_counts(closed=True) == [{"source": "task_context", "count": 1}]
+
+    reopen_args = build_parser().parse_args(["feedback", "reopen", str(first["feedback_id"])])
+    assert run_feedback(reopen_args) == 0
+    assert capsys.readouterr().out == "Reopened 1 feedback record.\n"
+    reopened = feedback.find(str(first["feedback_id"]))
+    assert "resolution" not in reopened
+    assert "closed_at" not in reopened
+    assert [record["feedback_id"] for record in feedback.compact_records()] == [
+        second["feedback_id"],
+        first["feedback_id"],
+    ]
+
+
+def test_feedback_close_records_requested_disposition_and_note(cache: Path) -> None:
+    result = append_feedback()
+
+    changed = feedback.set_closed(
+        [str(result["feedback_id"])],
+        closed=True,
+        disposition="external",
+        note="Requires an upstream client fix",
+    )
+
+    assert changed == [result["feedback_id"]]
+    record = feedback.find(str(result["feedback_id"]))
+    assert record["resolution"] == {
+        "disposition": "external",
+        "note": "Requires an upstream client fix",
+    }
+
+
+def test_feedback_legacy_payloads_are_scrubbed_atomically(cache: Path) -> None:
+    path = feedback.storage_path()
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "feedback_id": "fb-123456789abc",
+                "timestamp": "2026-09-02T12:00:00Z",
+                "message": "The tool rejected an object",
+                "tool": "task_manage",
+                "arguments": {
+                    "action": "complete",
+                    "report": {"patient_name": "Example Person"},
+                },
+                "response": "Example Person was rejected",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    record = feedback.read_records()[0]
+
+    assert record["status"] == "open"
+    assert record["origin"] == {
+        "failure_kind": "legacy",
+        "invocation": {
+            "argument_types": {"action": "string", "report": "object"},
+            "selectors": {"action": "complete"},
+            "omitted": ["report"],
+            "complete": False,
+        },
+    }
+    stored = path.read_text(encoding="utf-8")
+    assert "Example Person" not in stored
+    assert '"arguments"' not in stored
+    assert '"response"' not in stored
+
+
+def test_feedback_stats_reports_retained_records(cache: Path) -> None:
+    first = append_feedback(message="First")
+    append_feedback(message="Second")
+    feedback.set_closed([str(first["feedback_id"])], closed=True)
+
+    stats = feedback.storage_stats()
+
+    assert stats["records"] == 2
+    assert stats["open"] == 1
+    assert stats["closed"] == 1
+    assert stats["bytes"] > 0
+    assert stats["largest_record_bytes"] >= stats["average_record_bytes"]
+
+
+def test_feedback_trace_locates_exact_worker_call_without_content(
+    cache: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = append_feedback(
+        tool="task_manage",
+        origin={
+            "error_ref": "err-123456789abc",
+            "failure_kind": "validation",
+            "invocation": {"argument_types": {"report": "string"}, "complete": False},
+        },
+    )
+    feedback_id = str(result["feedback_id"])
+    qwen_home = tmp_path / "qwen-home"
+    transcript = (
+        qwen_home
+        / "projects"
+        / "-workspace"
+        / "subagents"
+        / "session-1"
+        / "agent-worker-call.jsonl"
+    )
+    transcript.parent.mkdir(parents=True)
+    rows = [
+        {
+            "type": "tool_result",
+            "timestamp": "2026-09-02T12:00:00Z",
+            "sessionId": "session-1",
+            "agentId": "worker-call",
+            "message": {
+                "role": "user",
+                "parts": [
+                    {
+                        "functionResponse": {
+                            "id": "origin-call",
+                            "name": "mcp__github_workflows__task_manage",
+                            "response": {
+                                "output": 'report must be an object; error_ref="err-123456789abc"'
+                            },
+                        }
+                    }
+                ],
+            },
+        },
+        {
+            "type": "assistant",
+            "message": {
+                "role": "model",
+                "parts": [
+                    {
+                        "functionCall": {
+                            "id": "feedback-call",
+                            "name": "mcp__github_workflows__workflow_feedback",
+                            "args": {
+                                "message": "The report type was unclear",
+                                "error_ref": "err-123456789abc",
+                            },
+                        }
+                    }
+                ],
+            },
+        },
+        {
+            "type": "tool_result",
+            "message": {
+                "role": "user",
+                "parts": [
+                    {
+                        "functionResponse": {
+                            "id": "rejected-feedback-call",
+                            "name": "mcp__github_workflows__workflow_feedback",
+                            "response": {
+                                "output": "error_ref cannot be combined with tool: err-123456789abc"
+                            },
+                        }
+                    }
+                ],
+            },
+        },
+        {
+            "type": "tool_result",
+            "timestamp": "2026-09-02T12:00:01Z",
+            "sessionId": "session-1",
+            "agentId": "worker-call",
+            "message": {
+                "role": "user",
+                "parts": [
+                    {
+                        "functionResponse": {
+                            "id": "feedback-call",
+                            "name": "mcp__github_workflows__workflow_feedback",
+                            "response": {
+                                "output": json.dumps({"recorded": True, "feedback_id": feedback_id})
+                            },
+                        }
+                    }
+                ],
+            },
+        },
+    ]
+    transcript.write_text(
+        "\n".join(json.dumps(row) for row in rows) + '\n{"type":"partial"',
+        encoding="utf-8",
+    )
+    incidental = qwen_home / "projects" / "-workspace" / "chats" / "incidental.jsonl"
+    incidental.parent.mkdir(parents=True)
+    incidental.write_text(json.dumps({"message": feedback_id}) + "\n", encoding="utf-8")
+    monkeypatch.setenv("QWEN_HOME", str(qwen_home))
+
+    traced = feedback.trace(feedback_id)
+
+    assert traced == {
+        "feedback_id": feedback_id,
+        "matches": [
+            {
+                "timestamp": "2026-09-02T12:00:01Z",
+                "session_id": "session-1",
+                "agent_id": "worker-call",
+                "feedback_tool_call_id": "feedback-call",
+                "transcript": (
+                    "$QWEN_HOME/projects/-workspace/subagents/session-1/agent-worker-call.jsonl"
+                ),
+                "origin": {
+                    "match": "exact-error-ref",
+                    "tool": "mcp__github_workflows__task_manage",
+                    "tool_call_id": "origin-call",
+                },
+            }
+        ],
+    }
+    assert "report must be an object" not in feedback.format_trace(traced)
+
+
+def test_feedback_cli_filters_and_counts_normalized_sources(
+    cache: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    append_feedback(tool="task_context", message="Legacy source")
+    append_feedback(tool="mcp__github_workflows__task_context", message="Qualified source")
+    append_feedback(tool="web_fetch", message="Native source")
+    append_feedback(tool=None, message="General feedback")
+
+    parsed = build_parser().parse_args(
+        ["feedback", "ls", "--source", "task_context", "--tool", "web_fetch"]
+    )
+    assert parsed.feedback_command == "list"
+    assert parsed.sources == ["task_context", "web_fetch"]
+    parsed.json_output = True
+    assert run_feedback(parsed) == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert [feedback.source_name(record) for record in listed] == [
+        "web_fetch",
+        "task_context",
+        "task_context",
+    ]
+
+    source_args = argparse.Namespace(
+        feedback_command="sources",
+        repository=None,
+        workflow=None,
+        closed=False,
+        json_output=False,
+    )
+    assert run_feedback(source_args) == 0
+    table = capsys.readouterr().out
+    rows = {tuple(line.split()) for line in table.splitlines()[2:]}
+    assert rows == {("task_context", "2"), ("general", "1"), ("web_fetch", "1")}
 
 
 def test_feedback_table_formats_legacy_ids_and_empty_results() -> None:
@@ -465,9 +758,28 @@ def test_feedback_table_formats_legacy_ids_and_empty_results() -> None:
     assert "2026-09-01 23:25:45Z" in table
     assert "example/repository-with-a-long-name" in table
     assert "discover-core" in table
+    assert "glob" in table
     assert "Summary:" in table
     assert "\n           " in table
     assert " ".join(message.split()) in " ".join(table.split())
+
+
+def test_feedback_table_labels_records_without_tools_as_general() -> None:
+    table = feedback.format_table(
+        [
+            {
+                "feedback_id": "fb-123456789abc",
+                "timestamp": "2026-09-01T23:25:45Z",
+                "repository": "example/repo",
+                "workflow": "gh-audit-repo",
+                "tool": None,
+                "message": "The active instruction was ambiguous",
+            }
+        ],
+        width=120,
+    )
+
+    assert "general" in table
 
 
 def test_feedback_table_escapes_terminal_controls() -> None:
