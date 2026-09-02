@@ -80,9 +80,12 @@ at most 120 turns for investigation, implementation, and validation. Reserve
 the final eight turns for complete diff review, essential remaining checks,
 recoverable-state capture, and exactly one checkpoint.
 
-Record a concise recoverable checkpoint after major milestones. When the
-objective cannot finish within the working budget, preserve the worktree state
-and return the smallest next objective rather than starting another activity.
+Maintain concise recoverable state after major milestones and return exactly one
+checkpoint in the final report. `task_manage` is intentionally unavailable to
+workers; never attempt to call it or ask for access. The supervisor persists the
+returned report. When the objective cannot finish within the working budget,
+preserve the worktree state and return the smallest next objective rather than
+starting another activity.
 
 ## Establish the inherited state
 

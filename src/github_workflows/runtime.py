@@ -13,7 +13,7 @@ import stat
 import subprocess
 import tempfile
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from typing import Any, cast
@@ -643,6 +643,9 @@ class WorkflowRuntime:
         tasks = state.get("tasks")
         if not isinstance(scheduler, dict) or not isinstance(tasks, dict):
             raise ValueError("generic workflow scheduler state is missing")
+        inputs = state.get("inputs")
+        if not isinstance(inputs, dict):
+            raise ValueError("generic workflow inputs state is missing")
         limit = scheduler.get("limit")
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("generic workflow concurrency must be a positive integer")
@@ -655,6 +658,11 @@ class WorkflowRuntime:
         )
         available = max(0, limit - running - (1 if activity is not None else 0))
         if queue:
+            available = 0
+        pending = state.get("pending", [])
+        if not isinstance(pending, list):
+            raise ValueError("generic workflow pending state is invalid")
+        if pending:
             available = 0
         statuses = {task.get("status") for task in tasks.values() if isinstance(task, dict)}
         logical: dict[str, list[dict[str, Any]]] = {}
@@ -673,6 +681,10 @@ class WorkflowRuntime:
             next_action = "finish-integration"
         elif queue:
             next_action = "integrate-result"
+        elif pending:
+            next_action = "resolve-pending"
+        elif state.get("workflow") == "gh-implement-issue" and inputs.get("targets") and not tasks:
+            next_action = "plan-tasks"
         elif "queued" in statuses and available > 0:
             next_action = "launch-worker"
         elif "checkpointed" in statuses:
@@ -716,6 +728,14 @@ class WorkflowRuntime:
         tasks = state.get("tasks", {})
         if not isinstance(tasks, dict):
             raise ValueError("generic workflow tasks state is invalid")
+        inputs = state.get("inputs", {})
+        if (
+            state.get("workflow") == "gh-implement-issue"
+            and isinstance(inputs, dict)
+            and inputs.get("targets")
+            and not tasks
+        ):
+            errors.append("target work has not been planned")
         terminal = {"completed", "failed", "abandoned"}
         nonterminal = sorted(
             task_id
@@ -794,7 +814,7 @@ class WorkflowRuntime:
                         "integration_queue": [],
                         "supervisor_activity": None,
                     }
-                    inputs["pending"] = request.pending
+                    inputs["pending"] = []
                 with self._json_file(inputs) as source:
                     self._invoke(
                         workflow_run.initialize, **self._base(request.workflow), input=source
@@ -834,14 +854,22 @@ class WorkflowRuntime:
                     "finish": "complete",
                 }[request.action]
                 terminal = request.action in {"abort", "finish"}
-                self._invoke(
-                    lambda args: workflow_run.update_state(args, terminal=terminal),
-                    **self._base(request.workflow),
-                    expected_revision=state["revision"],
-                    status=status,
-                    input=None,
-                    event=request.note,
+                update = (
+                    {"pending": request.pending}
+                    if request.action == "checkpoint"
+                    and request.workflow != "gh-audit-repo"
+                    and "pending" in request.model_fields_set
+                    else None
                 )
+                with self._json_file(update) if update is not None else nullcontext() as source:
+                    self._invoke(
+                        lambda args: workflow_run.update_state(args, terminal=terminal),
+                        **self._base(request.workflow),
+                        expected_revision=state["revision"],
+                        status=status,
+                        input=source,
+                        event=request.note or ("pending_updated" if update is not None else None),
+                    )
             state = self.state(request.workflow)
             return self._receipt(
                 request.workflow, state, True, next_actions=self._next_actions(state)

@@ -121,6 +121,13 @@ class RunManageRequest(StrictRequest):
             raise ValueError("instructions must not be blank")
         return value
 
+    @field_validator("targets")
+    @classmethod
+    def non_blank_targets(cls, value: list[str]) -> list[str]:
+        if any(not target.strip() for target in value):
+            raise ValueError("targets must contain only non-blank references")
+        return value
+
     @model_validator(mode="after")
     def validate_action_fields(self) -> RunManageRequest:
         control = {"action", "workflow", "note"}
@@ -137,11 +144,14 @@ class RunManageRequest(StrictRequest):
                 "regression_sweep",
                 "dry_run",
                 "separate",
-                "pending",
                 "source_confirmed",
             }
         elif self.action == "resume":
             allowed = {"n"}
+        elif self.action == "checkpoint":
+            allowed = {"pending"}
+            if self.workflow == "gh-audit-repo" and "pending" in supplied:
+                raise ValueError("audit pending state must use audit_record")
         elif self.action == "directive":
             if self.workflow != "gh-audit-repo":
                 raise ValueError("directives are supported only by repository audits")
@@ -163,14 +173,15 @@ class RunManageRequest(StrictRequest):
                     "targets",
                     "refresh_history",
                     "dry_run",
-                    "pending",
                 },
-                "gh-implement-issue": {"targets", "separate", "pending"},
+                "gh-implement-issue": {"targets", "separate"},
             }[self.workflow]
             common = {"repository", "n", "source_confirmed"}
             irrelevant = supplied - common - workflow_fields
             if irrelevant:
                 raise ValueError(f"{self.workflow} does not accept fields: {sorted(irrelevant)}")
+            if self.workflow == "gh-implement-issue" and not self.targets:
+                raise ValueError("gh-implement-issue start requires at least one target")
         return self
 
     def invocation(self) -> dict[str, Any]:

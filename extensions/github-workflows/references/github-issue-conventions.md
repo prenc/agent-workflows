@@ -254,6 +254,14 @@ insufficiently distinct. Read plausible matches in full. Return the existing
 canonical record unchanged for a duplicate. A regression must cite the older
 closed issue and show current evidence.
 
+GitHub `search_issues` uses natural-language semantic matching. Treat it as a
+discovery aid for conceptual, paraphrased, or possible body-only matches, not as
+an exact or exhaustive index. Pass `owner` and `repo` separately and keep GitHub
+search qualifiers out of `query`. A zero-result semantic search is inconclusive
+and never proves absence. When the workflow provides a complete record inventory
+or committed history, use it for indexed duplicate coverage, then read every
+plausible issue or pull request in full.
+
 ## Title
 
 Use a concise sentence-case title in the present tense that names the specific

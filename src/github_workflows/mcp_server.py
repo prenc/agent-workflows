@@ -263,6 +263,26 @@ def _action_requirement(
 def _public_input_schema(name: str, schema: dict[str, Any]) -> dict[str, Any]:
     """Add compact client-side checks for statically knowable request mistakes."""
     result = deepcopy(schema)
+    result["additionalProperties"] = False
+    if name == "run_manage":
+        properties = result.get("properties", {})
+        properties["targets"]["description"] = (
+            "Requested issue or pull-request references; required and non-empty when starting "
+            "gh-implement-issue."
+        )
+        targets_array = next(
+            (
+                variant
+                for variant in properties["targets"].get("anyOf", [])
+                if variant.get("type") == "array"
+            ),
+            properties["targets"],
+        )
+        targets_array.setdefault("items", {})["pattern"] = r"\S"
+        properties["pending"]["description"] = (
+            "External mutations awaiting read-back, rollback, or reconciliation; accepted only "
+            "by generic workflow checkpoints."
+        )
     if name == "task_manage":
         report = result.get("properties", {}).get("report", {})
         object_schema = next(
@@ -325,6 +345,27 @@ def _public_input_schema(name: str, schema: dict[str, Any]) -> dict[str, Any]:
                 ]
             }
         )
+    if name == "run_manage":
+        conditions.append(
+            {
+                "if": {
+                    "allOf": [
+                        {
+                            "properties": {"action": {"const": "start"}},
+                            "required": ["action"],
+                        },
+                        {
+                            "properties": {"workflow": {"const": "gh-implement-issue"}},
+                            "required": ["workflow"],
+                        },
+                    ]
+                },
+                "then": {
+                    "required": ["targets"],
+                    "properties": {"targets": {"type": "array", "minItems": 1}},
+                },
+            }
+        )
     if not conditions:
         result.pop("allOf", None)
     return result
@@ -379,6 +420,14 @@ class WorkflowMCPServer(MCPServer[Any]):
         context: Context[Any, Any] | None = None,
     ) -> Any:
         try:
+            tool = self._tool_manager.get_tool(name)
+            if tool is not None:
+                properties = tool.parameters.get("properties", {})
+                unknown = sorted(set(arguments) - set(properties))
+                if unknown:
+                    if len(unknown) == 1:
+                        raise ToolError(f"{unknown[0]} is not accepted")
+                    raise ToolError(f"fields are not accepted: {', '.join(unknown)}")
             return await super().call_tool(name, arguments, context)
         except UnexpectedToolError as error:
             message = self._failure_message(
@@ -421,12 +470,12 @@ def _public_call(operation: Any, *arguments: Any) -> Any:
         raise ToolError(str(error)) from error
 
 
-def _request_call(operation: Any, model: type[Any], **values: Any) -> Any:
+def _request_call(handler: Any, request_model: type[Any], /, **values: Any) -> Any:
     """Validate a flat public call through the internal action model."""
     payload = {
         name: value for name, value in values.items() if value is not None and name != "runtime"
     }
-    return _public_call(lambda: operation(model.model_validate(payload)))
+    return _public_call(lambda: handler(request_model.model_validate(payload)))
 
 
 def create_server(runtime: WorkflowRuntime) -> MCPServer:

@@ -122,10 +122,12 @@ $QWEN_CODE_PROJECT_DIR/workflows/gh-implement-issue/current/
 
 Record supplied inputs, repositories, minimally resolved issue numbers/URLs,
 timestamps, pre-claim labels, every attempted mutation, successful claim,
-read-back, rollback, and pending cleanup in `state.json`; keep detailed unit
-results declarative and journal significant transitions. Write a checkpoint
-atomically after every GitHub mutation so interruption leaves an actionable
-recovery record.
+read-back, rollback, and pending cleanup through `mcp__github_workflows__run_manage`
+action `checkpoint`; keep detailed unit results declarative and journal significant
+transitions. The `pending` field contains only external mutations awaiting read-back,
+rollback, or reconciliation, never requested targets or unplanned units. Update it
+atomically after every GitHub mutation so interruption leaves an actionable recovery
+record.
 
 Call `get_me`, then minimally refresh every resolved issue for state and labels.
 If any issue already has `in-progress`, record its URL and stop before claiming
@@ -270,6 +272,11 @@ Use its returned server-generated task ID and task reference, then launch
 ```text
 Task ref: <task-ref-returned-by-task-manage>
 ```
+
+The spawn message contains exactly that line. Do not add the assignment, task ID,
+or instructions to call supervisor-only workflow tools. Workers return their
+recoverable checkpoint in the final report; the supervisor alone persists that
+report through `task_manage` action `checkpoint` or `complete`.
 
 Maintain a ledger containing unit, semantic task ID, task reference, anchor,
 issues, grouping rationale,

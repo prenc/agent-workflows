@@ -107,8 +107,12 @@ without direct inspection of current code in the immutable audit worktree.
 Before returning a candidate, search `task_context.history.selection.records` and
 compare root cause, symbols/paths, failure mode, requested outcome, and required
 outcomes. When `task_context.history.selection.has_more` is true or a body-only match
-is plausible, use a targeted GitHub search rather than broad issue or pull-request
-enumeration. Read every plausible matching record in full. Classify each lead as
+is plausible, use targeted semantic GitHub search for additional plausible matches
+rather than broad issue or pull-request enumeration. Pass repository scope through
+`owner` and `repo`, not GitHub qualifiers in the natural-language query. A zero-result
+semantic search is inconclusive; rely on supplied indexed history for exact identifiers
+and report a coverage limitation when no authoritative surface covers the gap. Read
+every plausible matching record in full. Classify each lead as
 new, update-existing, protected-existing, duplicate-existing, already fixed,
 covered by PR, regression, insufficiently distinct, or unverifiable. An open
 matching issue is `update-existing` only when it has neither `in-progress` nor

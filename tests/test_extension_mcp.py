@@ -67,6 +67,9 @@ class TestExtensionMcp:
                     "audit_publish",
                     "audit_metrics",
                 }
+                assert all(
+                    tool.input_schema["additionalProperties"] is False for tool in tools.values()
+                )
                 feedback_properties = tools["workflow_feedback"].input_schema["properties"]
                 assert tools["workflow_feedback"].input_schema["required"] == ["message"]
                 assert set(feedback_properties) == {
@@ -99,6 +102,15 @@ class TestExtensionMcp:
                 assert "anyOf" not in report_schema
                 assert "report" not in tools["task_manage"].input_schema["required"]
                 assert "candidate_id" in tools["audit_probe"].input_schema["required"]
+                run_properties = tools["run_manage"].input_schema["properties"]
+                assert "required and non-empty" in run_properties["targets"]["description"]
+                targets_array = next(
+                    variant
+                    for variant in run_properties["targets"]["anyOf"]
+                    if variant.get("type") == "array"
+                )
+                assert targets_array["items"]["pattern"] == r"\S"
+                assert "External mutations" in run_properties["pending"]["description"]
                 history_properties = tools["history_manage"].input_schema["properties"]
                 assert "records" in history_properties
                 assert "artifacts" in history_properties
@@ -139,6 +151,13 @@ class TestExtensionMcp:
                 assert conditional_required["audit_record"]["candidate"] == {"candidate"}
                 assert conditional_required["audit_publish"]["begin"] == {"operation"}
                 assert conditional_required["audit_publish"]["finish"] == {"receipt"}
+                implementation_start = next(
+                    condition["then"]
+                    for condition in tools["run_manage"].input_schema["allOf"]
+                    if condition.get("if", {}).get("allOf")
+                )
+                assert implementation_start["required"] == ["targets"]
+                assert implementation_start["properties"]["targets"]["minItems"] == 1
                 ingest_contract = next(
                     condition["then"]
                     for condition in tools["history_manage"].input_schema["allOf"]
@@ -165,6 +184,12 @@ class TestExtensionMcp:
                             "repository": "example/repo",
                             "inputs": {"n": 2},
                         }
+                    )
+                with pytest.raises(ValueError, match="must use audit_record"):
+                    RunManageRequest(
+                        action="checkpoint",
+                        workflow="gh-audit-repo",
+                        pending=[],
                     )
                 audit_request = RunManageRequest(
                     action="start",
@@ -323,6 +348,152 @@ class TestExtensionMcp:
                 )
                 assert not finished.is_error
 
+    @pytest.mark.parametrize("targets", [[""], ["   "], ["#5", "\t"]])
+    def test_run_manage_rejects_blank_target_references(self, targets: list[str]) -> None:
+        with pytest.raises(ValueError, match="targets must contain only non-blank references"):
+            RunManageRequest(
+                action="start",
+                workflow="gh-implement-issue",
+                repository="example/repo",
+                targets=targets,
+            )
+
+    async def test_run_manage_validates_targets_and_pending_lifecycle(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="github-workflows-run-manage-") as directory:
+            root = Path(directory)
+            monkeypatch.setenv("XDG_CACHE_HOME", str(root / "cache"))
+            workspace = root / "repo"
+            workspace.mkdir()
+            runtime = WorkflowRuntime(workspace, root / "qwen-project")
+            workflow = "gh-implement-issue"
+            base = {
+                "action": "start",
+                "workflow": workflow,
+                "repository": "example/repo",
+            }
+            async with Client(
+                create_server(runtime),
+                raise_exceptions=False,
+                read_timeout_seconds=0.1,
+            ) as client:
+                unknown = await client.call_tool("run_manage", {**base, "target": ["#5"]})
+                assert unknown.is_error
+                assert unknown.content[0].text.startswith("target is not accepted")
+                assert not runtime.current(workflow).exists()
+
+                malformed = await client.call_tool("run_manage", {**base, "targets": 5})
+                assert malformed.is_error
+                assert malformed.content[0].text.startswith("targets must be a list")
+                assert not runtime.current(workflow).exists()
+
+                for targets in ([""], ["   "], ["#5", "\t"]):
+                    blank = await client.call_tool("run_manage", {**base, "targets": targets})
+                    assert blank.is_error
+                    assert not runtime.current(workflow).exists()
+
+                missing = await client.call_tool("run_manage", base)
+                assert missing.is_error
+                assert missing.content[0].text.startswith(
+                    "gh-implement-issue start requires at least one target"
+                )
+                assert not runtime.current(workflow).exists()
+
+                start_pending = await client.call_tool(
+                    "run_manage",
+                    {**base, "targets": ["#5"], "pending": []},
+                )
+                assert start_pending.is_error
+                assert start_pending.content[0].text.startswith(
+                    "start does not accept fields: ['pending']"
+                )
+                assert not runtime.current(workflow).exists()
+
+                started = await client.call_tool("run_manage", {**base, "targets": ["#5"]})
+                assert not started.is_error
+                assert runtime.state(workflow)["inputs"]["targets"] == ["#5"]
+                assert started.structured_content["next_actions"] == ["plan-tasks"]
+
+                revision = runtime.state(workflow)["revision"]
+                premature = await client.call_tool(
+                    "run_manage", {"action": "finish", "workflow": workflow}
+                )
+                assert premature.is_error
+                assert "target work has not been planned" in premature.content[0].text
+                assert runtime.state(workflow)["revision"] == revision
+
+                pending = await client.call_tool(
+                    "run_manage",
+                    {
+                        "action": "checkpoint",
+                        "workflow": workflow,
+                        "pending": ["issue #5 claim read-back"],
+                    },
+                )
+                assert not pending.is_error
+                assert pending.structured_content["next_actions"] == ["resolve-pending"]
+                status = await client.call_tool("run_status", {"workflow": workflow})
+                assert status.structured_content["pending"] == ["issue #5 claim read-back"]
+                assert status.structured_content["scheduler"]["worker_slots"] == 0
+                journal = runtime.current(workflow) / "journal.jsonl"
+                assert json.loads(journal.read_text(encoding="utf-8").splitlines()[-1])[
+                    "event"
+                ] == ("pending_updated")
+
+                cleared = await client.call_tool(
+                    "run_manage",
+                    {"action": "checkpoint", "workflow": workflow, "pending": []},
+                )
+                assert not cleared.is_error
+                assert cleared.structured_content["next_actions"] == ["plan-tasks"]
+
+                planned = await client.call_tool(
+                    "task_manage",
+                    {
+                        "action": "plan",
+                        "workflow": workflow,
+                        "task": {"logical_id": "issue-5"},
+                    },
+                )
+                task_id = planned.structured_content["task_id"]
+                await client.call_tool(
+                    "task_manage",
+                    {"action": "mark_running", "workflow": workflow, "task_id": task_id},
+                )
+                await client.call_tool(
+                    "task_manage",
+                    {
+                        "action": "complete",
+                        "workflow": workflow,
+                        "task_id": task_id,
+                        "report": {"status": "complete"},
+                    },
+                )
+                await client.call_tool(
+                    "task_manage",
+                    {
+                        "action": "integration_begin",
+                        "workflow": workflow,
+                        "task_id": task_id,
+                    },
+                )
+                integrated = await client.call_tool(
+                    "task_manage",
+                    {
+                        "action": "integration_end",
+                        "workflow": workflow,
+                        "task_id": task_id,
+                    },
+                )
+                assert integrated.structured_content["scheduler"]["next_action"] == (
+                    "ready-to-finish"
+                )
+                finished = await client.call_tool(
+                    "run_manage", {"action": "finish", "workflow": workflow}
+                )
+                assert not finished.is_error
+
     async def test_expected_runtime_failure_is_actionable_tool_error(
         self, caplog: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -449,6 +620,7 @@ class TestExtensionMcp:
                         workflow=workflow,
                         repository="example/repo",
                         n=1,
+                        targets=["#12"] if workflow == "gh-implement-issue" else [],
                     )
                 )
                 receipt = runtime.task_manage(
@@ -649,6 +821,7 @@ class TestExtensionMcp:
                     workflow=workflow,
                     repository="example/repo",
                     n=1,
+                    targets=["#1"],
                 )
             )
             runtime.task_manage(
@@ -718,6 +891,7 @@ class TestExtensionMcp:
                     workflow=workflow,
                     repository="example/repo",
                     n=1,
+                    targets=["#2"],
                 )
             )
             runtime.task_manage(
@@ -788,8 +962,18 @@ class TestExtensionMcp:
                     action="start",
                     workflow="gh-curate-issues",
                     repository="example/repo",
+                )
+            )
+            pending_runtime.run_manage(
+                RunManageRequest(
+                    action="checkpoint",
+                    workflow="gh-curate-issues",
                     pending=["issue mutation read-back"],
                 )
+            )
+            assert (
+                pending_runtime.run_status("gh-curate-issues")["scheduler"]["next_action"]
+                == "resolve-pending"
             )
             with pytest.raises(ValueError, match="pending operations"):
                 pending_runtime.run_manage(
@@ -998,6 +1182,18 @@ class TestExtensionMcp:
                 )
                 assert inherited_status.structured_content["history"]["full_history_complete"]
 
+                revision = runtime.state("gh-audit-repo")["revision"]
+                premature = await client.call_tool(
+                    "audit_publish",
+                    {
+                        "action": "uncertain",
+                        "candidate_id": "candidate-mcp-1",
+                    },
+                )
+                assert premature.is_error
+                assert premature.content[0].text.startswith("no publication is pending")
+                assert runtime.state("gh-audit-repo")["revision"] == revision
+
                 candidate_id = "candidate-mcp-1"
                 runtime.audit_record(
                     AuditRecordRequest(
@@ -1041,6 +1237,28 @@ class TestExtensionMcp:
                 assert validation["candidate_id"] == candidate_id
                 assert validation["status"] == "succeeded"
                 assert validation["artifact"] == "validation/probe-mcp-1/result.json"
+
+                begun = await client.call_tool(
+                    "audit_publish",
+                    {
+                        "action": "begin",
+                        "candidate_id": candidate_id,
+                        "operation": "no-op",
+                    },
+                )
+                assert not begun.is_error
+                finished = await client.call_tool(
+                    "audit_publish",
+                    {
+                        "action": "finish",
+                        "candidate_id": candidate_id,
+                        "receipt": {"reason": "no publication needed"},
+                    },
+                )
+                assert not finished.is_error
+                assert runtime.state("gh-audit-repo")["candidates"][candidate_id]["status"] == (
+                    "no-op"
+                )
 
     def test_audit_worktree_uses_private_cache_when_local_root_is_not_ignored(self) -> None:
         with tempfile.TemporaryDirectory(prefix="github-workflows-worktree-root-") as directory:

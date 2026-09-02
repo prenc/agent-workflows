@@ -113,6 +113,7 @@ def test_feedback_attribution_is_null_for_multiple_active_runs(cache: Path, tmp_
                 action="start",
                 workflow=workflow,
                 repository="example/repo",
+                targets=["#1"] if workflow == "gh-implement-issue" else [],
             )
         )
 
@@ -172,7 +173,12 @@ def test_feedback_task_ref_selects_repository_among_multiple_runs(
         ("gh-implement-issue", "example/implementation"),
     ):
         runtime.run_manage(
-            RunManageRequest(action="start", workflow=workflow, repository=repository)
+            RunManageRequest(
+                action="start",
+                workflow=workflow,
+                repository=repository,
+                targets=["#1"] if workflow == "gh-implement-issue" else [],
+            )
         )
         planned = runtime.task_manage(
             TaskManageRequest.model_validate(
@@ -436,7 +442,7 @@ def test_feedback_cli_lists_compact_records_and_shows_context(
     )
     assert run_feedback(list_args) == 0
     table = capsys.readouterr().out
-    assert "WHEN (UTC)" in table
+    assert "WHEN (LOCAL)" in table
     assert "example/repo" in table
     assert "run-1" not in table
     assert "report must be an object" not in table
@@ -755,13 +761,42 @@ def test_feedback_table_formats_legacy_ids_and_empty_results() -> None:
     )
 
     assert "5f009f5df7" in table
-    assert "2026-09-01 23:25:45Z" in table
+    expected_time = feedback._display_time("2026-09-01T23:25:45Z")
+    assert expected_time in table
     assert "example/repository-with-a-long-name" in table
     assert "discover-core" in table
     assert "glob" in table
     assert "Summary:" in table
     assert "\n           " in table
     assert " ".join(message.split()) in " ".join(table.split())
+
+
+def test_feedback_display_time_uses_system_timezone(monkeypatch: pytest.MonkeyPatch) -> None:
+    original = feedback.dt.datetime
+
+    class LocalDatetime(original):
+        def astimezone(self, tz: object = None) -> LocalDatetime:
+            if tz is None:
+                tz = feedback.dt.timezone(feedback.dt.timedelta(hours=2), name="CEST")
+            return super().astimezone(tz)  # type: ignore[arg-type, return-value]
+
+    monkeypatch.setattr(feedback.dt, "datetime", LocalDatetime)
+
+    assert feedback._display_time("2026-09-01T12:00:00Z") == "2026-09-01 14:00:00 CEST"
+
+
+def test_feedback_display_time_falls_back_to_edt(monkeypatch: pytest.MonkeyPatch) -> None:
+    original = feedback.dt.datetime
+
+    class NoLocalTimezoneDatetime(original):
+        def astimezone(self, tz: object = None) -> NoLocalTimezoneDatetime:
+            if tz is None:
+                raise OSError("local timezone unavailable")
+            return super().astimezone(tz)  # type: ignore[arg-type, return-value]
+
+    monkeypatch.setattr(feedback.dt, "datetime", NoLocalTimezoneDatetime)
+
+    assert feedback._display_time("2026-09-01T12:00:00Z") == "2026-09-01 08:00:00 EDT"
 
 
 def test_feedback_table_labels_records_without_tools_as_general() -> None:

@@ -87,6 +87,7 @@ SECRET_KEY = re.compile(
     r"(?:authorization|cookie|credential|password|private[_-]?key|secret|token|api[_-]?key)",
     re.IGNORECASE,
 )
+FALLBACK_EDT = dt.timezone(dt.timedelta(hours=-4), name="EDT")
 
 
 def storage_path() -> Path:
@@ -823,7 +824,13 @@ def _display_time(value: Any) -> str:
         parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return str(value or "-")
-    return parsed.astimezone(dt.UTC).strftime("%Y-%m-%d %H:%M:%SZ")
+    try:
+        localized = parsed.astimezone()
+        if localized.tzinfo is None or not localized.tzname():
+            raise ValueError("system timezone is unavailable")
+    except (OSError, ValueError):
+        localized = parsed.astimezone(FALLBACK_EDT)
+    return localized.strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 def _one_line(value: Any) -> str:
@@ -875,7 +882,7 @@ def format_table(records: list[dict[str, Any]], *, width: int) -> str:
     if not records:
         return "No feedback recorded."
     width = max(width, 100)
-    headers = ["ID", "WHEN (UTC)", "REPOSITORY", "CONTEXT", "SOURCE"]
+    headers = ["ID", "WHEN (LOCAL)", "REPOSITORY", "CONTEXT", "SOURCE"]
     rows: list[tuple[list[str], str]] = []
     for record in records:
         provenance = record.get("provenance")
@@ -953,7 +960,7 @@ def format_stats(stats: Mapping[str, Any]) -> str:
             f"Storage: {stats['bytes']} bytes",
             f"Record size: {stats['average_record_bytes']} average, "
             f"{stats['largest_record_bytes']} largest",
-            f"Range: {stats['oldest'] or '-'} to {stats['newest'] or '-'}",
+            f"Range: {_display_time(stats['oldest'])} to {_display_time(stats['newest'])}",
         )
     )
 
@@ -970,7 +977,7 @@ def format_trace(result: Mapping[str, Any]) -> str:
                 f"Session: {_one_line(match.get('session_id', '-'))}",
                 f"Agent: {_one_line(match.get('agent_id', '-'))}",
                 f"Feedback call: {_one_line(match.get('feedback_tool_call_id', '-'))}",
-                f"Recorded: {_one_line(match.get('timestamp', '-'))}",
+                f"Recorded: {_one_line(_display_time(match.get('timestamp')))}",
             )
         )
         origin = match.get("origin")

@@ -283,10 +283,13 @@ Using paginated MCP list tools, maintain a compact inventory containing number,
 URL, title, labels, state, assignees, timestamps, and relevant pull-request refs.
 Bulk list calls must omit bodies, comments, commits, relationships, and other detail
 collections. The history tool derives a rough summary from title and labels and
-discards detail fields even when a provider returns them. Use targeted GitHub search
-to find possible body-only matches, then call `issue_read` or `pull_request_read` for
-every plausible match and obtain relevant comments, commits/SHAs, native relationships,
-and resolution evidence live. Do not ingest those detail payloads into history. Use
+discards detail fields even when a provider returns them. Use `history_query` for
+exact identifiers and indexed duplicate candidates, and include plausible records
+in worker assignments. Use targeted semantic GitHub search only to discover
+conceptual, paraphrased, or possible body-only matches; a zero result is
+inconclusive. Then call `issue_read` or `pull_request_read` for every plausible
+match and obtain relevant comments, commits/SHAs, native relationships, and
+resolution evidence live. Do not ingest those detail payloads into history. Use
 the full-timeline `gh api` fallback only when MCP relationships are incomplete
 or contradictory.
 
