@@ -55,18 +55,26 @@ helps identify the interface.
 
 ## Analyze the queue
 
-Preserve the current worktree and begin with compact views:
+Preserve the current worktree and make one read call that matches the request.
+Use `feedback summary --json` for an aggregate overview. When record-level
+analysis is required, skip that preliminary call and use `feedback ls --all --json` directly (or `--limit 1` for only the newest record). From an
+`agent-workflows` checkout use its documented no-sync invocation; elsewhere use
+the installed executable, for example:
 
 ```sh
-agent-workflows feedback stats
-agent-workflows feedback sources
-agent-workflows feedback ls
+uv run --no-sync agent-workflows feedback summary --json
+agent-workflows feedback summary --json
 ```
 
-Apply any requested feedback ID or suffix, source, repository, or workflow
-filter. Use `feedback show <id>` for each selected record. Do not load all
-closed feedback merely for context and do not change status during default
-analysis.
+Apply requested source, repository, workflow, status, and cutoff filters. If
+both views are genuinely needed, carry the same `--cutoff` on summary and list
+so their scopes agree. The cutoff is an inclusive lower bound on record
+creation time. Reuse the resulting records
+throughout the contiguous task; refresh only when scope changes, the store may
+have changed, or resolution reports a conflict. Use one batched
+`feedback show <ref>...` call only when direct ID lookup is needed. Do not load
+closed feedback without a reason or change status during default analysis. Do
+not set a custom uv cache or synchronize the environment.
 
 Verify each report against current source, tests, documented interfaces, and
 installed-versus-source state. Classify it as locally actionable, duplicate,
@@ -80,20 +88,23 @@ Ask the user before calling `feedback trace` or opening any Qwen transcript. Aft
 permission, inspect only rows tied to the exact feedback and origin call IDs.
 Never scan, reproduce, or summarize the complete conversation.
 
-## Implement one coherent group
+## Implement authorized groups
 
-For an authorized implementation, choose exactly one coherent root-cause group.
-Preserve unrelated changes. Reproduce the behavior or establish direct proof,
-then inspect callers, schemas, error paths, agent clients, resumability,
-confidentiality, context-size impact, and installed-versus-source behavior.
-Make the smallest complete correction and add behavior-focused regression
-coverage. Do not encode legacy absence assertions or exact prose unless it is a
-consumed compatibility contract.
+For an authorized implementation, address every explicitly approved,
+non-conflicting root-cause group in dependency order. Do not expand beyond the
+approved groups merely to save calls. Preserve unrelated changes. For each
+group, reproduce the behavior or establish direct proof, then inspect callers,
+schemas, error paths, agent clients, resumability, confidentiality, context-size
+impact, and installed-versus-source behavior. Make the smallest complete
+correction and add behavior-focused regression coverage. Do not encode legacy
+absence assertions or exact prose unless it is a consumed compatibility
+contract.
 
-Run focused tests, the lightweight owning test group, and the repository's
-required pre-commit checks. Review the complete diff. If validation is partial
-or the cause remains uncertain, leave the records open and report the remaining
-evidence gap.
+Run focused validation per group, then consolidate overlapping owning tests and
+repository-wide checks into one final pass while tracked files remain unchanged.
+Review the complete diff. If one group remains uncertain or fails validation,
+leave only that group's records open and continue with independent approved
+groups.
 
 ## Resolve without deleting
 
@@ -105,9 +116,13 @@ After validation, close every proven record in the group with one concise note:
 - `not-actionable` for a false positive, ordinary caller mistake, stale
   observation, or unsupported premise.
 
-Use `agent-workflows feedback close`; never use `feedback remove` as routine
-cleanup. Leave partial or ambiguous records open. Reopen a record when later
-review invalidates its resolution, then repair and revalidate it.
+Apply mixed validated dispositions in one atomic
+`agent-workflows feedback close --input <JSON|file|->` request. The request
+contains a `resolutions` array whose entries have `ref`, `disposition`, and an
+optional `note`. Use positional `feedback close` for a simple group sharing one
+disposition and note; never use `feedback remove` as routine cleanup. Leave
+partial or ambiguous records open. Reopen a record when later review invalidates
+its resolution, then repair and revalidate it.
 
 Finish by reporting validation, records closed or retained, and whether the
 change needs `agent-workflows install`, an extension reload, a new Codex

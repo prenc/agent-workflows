@@ -570,6 +570,10 @@ class TestExtensionMcp:
                 )
                 assert not recorded.is_error
                 assert recorded.structured_content["context_attached"] is True
+                assert (
+                    recorded.structured_content["ref"]
+                    == recorded.structured_content["feedback_id"][-8:]
+                )
                 stored = feedback.find(recorded.structured_content["feedback_id"])
                 assert stored["tool"]
                 assert stored["provenance"]["client"]["name"]
@@ -1489,7 +1493,15 @@ class TestExtensionMcp:
                     "Record and analyze feedback from the active",
                     "Only implementation work",
                     "requires a writable `agent-workflows` checkout",
-                    "exactly one coherent root-cause group",
+                    "make one read call that matches the request",
+                    "skip that preliminary call",
+                    "Reuse the resulting records",
+                    "feedback summary --json",
+                    "`feedback show <ref>...`",
+                    "every explicitly approved",
+                    "non-conflicting root-cause group",
+                    "consolidate overlapping owning tests",
+                    "feedback close --input <JSON|file|->",
                     "Ask the user before calling `feedback trace`",
                     "never use `feedback remove`",
                     "commits, pushes, installation",

@@ -25,6 +25,7 @@ MAX_RECORD_BYTES = 8 * 1024
 MAX_FAILURE_BYTES = 4 * 1024
 FAILURE_LIMIT = 128
 FAILURE_TTL_SECONDS = 60 * 60
+SHORT_REF_LENGTH = 8
 SAFE_SELECTOR_ARGUMENTS = frozenset({"action", "kind", "method", "workflow"})
 SAFE_ARGUMENT_NAMES = frozenset(
     {
@@ -371,7 +372,6 @@ def append(
     timestamp = dt.datetime.now(dt.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
     replacements = _replacements(private_paths)
     record: dict[str, Any] = {
-        "feedback_id": f"fb-{uuid.uuid4().hex[:12]}",
         "timestamp": timestamp,
         "status": "open",
         "repository": repository,
@@ -386,16 +386,24 @@ def append(
     sanitized_provenance = _sanitize(provenance, replacements) if provenance else None
     if sanitized_provenance:
         record["provenance"] = sanitized_provenance
-    encoded = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    if len(encoded) > MAX_RECORD_BYTES:
-        raise ValueError("feedback record exceeds 8 KiB; shorten the PHI-free summary")
-
     path = storage_path()
     with _locked(path, exclusive=True):
-        if path.exists():
-            existing = _read(path)
-            if _normalize_legacy_records(existing):
-                _rewrite(path, existing)
+        existing = _read(path) if path.exists() else []
+        normalized = _normalize_legacy_records(existing)
+        existing_ids = {str(item["feedback_id"]) for item in existing}
+        while True:
+            feedback_id = f"fb-{uuid.uuid4().hex[:12]}"
+            short_ref = feedback_id[-SHORT_REF_LENGTH:]
+            if feedback_id not in existing_ids and not any(
+                existing_id.endswith(short_ref) for existing_id in existing_ids
+            ):
+                break
+        record["feedback_id"] = feedback_id
+        encoded = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        if len(encoded) > MAX_RECORD_BYTES:
+            raise ValueError("feedback record exceeds 8 KiB; shorten the PHI-free summary")
+        if normalized:
+            _rewrite(path, existing)
         flags = os.O_CREAT | os.O_RDWR | os.O_APPEND
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -417,7 +425,11 @@ def append(
                 raise
         finally:
             os.close(descriptor)
-    return {"recorded": True, "feedback_id": record["feedback_id"]}
+    return {
+        "recorded": True,
+        "feedback_id": record["feedback_id"],
+        "ref": feedback_ref(str(record["feedback_id"]), [*existing, record]),
+    }
 
 
 def append_manual(*, message: str, tool: str | None, workspace: Path) -> dict[str, Any]:
@@ -445,23 +457,164 @@ def compact_records(
     workflow: str | None = None,
     sources: list[str] | None = None,
     closed: bool = False,
-    limit: int = 50,
+    status: str | None = None,
+    cutoff: str | None = None,
+    limit: int | None = 50,
 ) -> list[dict[str, Any]]:
-    """Return newest matching records without bulky tool context."""
+    """Return newest matching records with globally resolvable short references."""
+    selected_status = status or ("closed" if closed else "open")
+    if selected_status not in {"open", "closed", "all"}:
+        raise ValueError("feedback status must be open, closed, or all")
+    if limit is not None and limit < 1:
+        raise ValueError("feedback limit must be positive")
+    cutoff_time = _parse_cutoff(cutoff)
     requested_sources = {source.casefold() for source in sources or []}
-    records = [
+    records = read_records()
+    matching = [
         record
-        for record in read_records()
+        for record in records
         if (repository is None or record.get("repository") == repository)
         and (workflow is None or record.get("workflow") == workflow)
-        and (record.get("status", "open") == ("closed" if closed else "open"))
+        and (selected_status == "all" or record.get("status", "open") == selected_status)
+        and (cutoff_time is None or _record_time(record) >= cutoff_time)
         and (
             not requested_sources
             or source_name(record).casefold() in requested_sources
             or str(record.get("tool") or "").casefold() in requested_sources
         )
     ]
-    return list(reversed(records[-limit:]))
+    selected = list(reversed(matching if limit is None else matching[-limit:]))
+    return [
+        {
+            **record,
+            "ref": feedback_ref(str(record["feedback_id"]), records),
+            "source": source_name(record),
+        }
+        for record in selected
+    ]
+
+
+def feedback_ref(feedback_id: str, records: list[dict[str, Any]]) -> str:
+    """Return the shortest collision-free display suffix, preferring eight characters."""
+    for length in range(SHORT_REF_LENGTH, len(feedback_id) + 1):
+        suffix = feedback_id[-length:]
+        if sum(str(record.get("feedback_id", "")).endswith(suffix) for record in records) == 1:
+            return suffix
+    return feedback_id
+
+
+def _parse_feedback_time(value: Any) -> dt.datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.UTC)
+    return parsed.astimezone(dt.UTC)
+
+
+def _iso_utc(value: dt.datetime) -> str:
+    return value.astimezone(dt.UTC).isoformat().replace("+00:00", "Z")
+
+
+def _parse_cutoff(value: str | None) -> dt.datetime | None:
+    if value is None:
+        return None
+    parsed = _parse_feedback_time(value)
+    if parsed is None:
+        raise ValueError("feedback cutoff must be an ISO-8601 timestamp")
+    return parsed
+
+
+def _record_time(record: Mapping[str, Any]) -> dt.datetime:
+    parsed = _parse_feedback_time(record.get("timestamp"))
+    if parsed is None:
+        raise ValueError("feedback record has an invalid timestamp")
+    return parsed
+
+
+def feedback_summary(
+    *,
+    repository: str | None = None,
+    workflow: str | None = None,
+    cutoff: str | None = None,
+) -> dict[str, Any]:
+    """Return aggregate feedback state for one repository, workflow, and time scope."""
+    cutoff_time = _parse_cutoff(cutoff)
+    records = read_records()
+    scoped = [
+        record
+        for record in records
+        if (repository is None or record.get("repository") == repository)
+        and (workflow is None or record.get("workflow") == workflow)
+        and (cutoff_time is None or _record_time(record) >= cutoff_time)
+    ]
+    open_sources: dict[str, int] = {}
+    closed_sources: dict[str, dict[str, Any]] = {}
+    for record in scoped:
+        source = source_name(record)
+        status = str(record.get("status", "open"))
+        if status == "open":
+            open_sources[source] = open_sources.get(source, 0) + 1
+            continue
+        resolution = record.get("resolution")
+        disposition = (
+            str(resolution.get("disposition"))
+            if isinstance(resolution, dict) and resolution.get("disposition")
+            else "unspecified"
+        )
+        source_summary = closed_sources.setdefault(source, {"records": 0, "dispositions": {}})
+        source_summary["records"] += 1
+        source_dispositions = source_summary["dispositions"]
+        source_dispositions[disposition] = source_dispositions.get(disposition, 0) + 1
+    timestamps = sorted(_record_time(record) for record in scoped)
+    sizes = [_encoded_size(record) for record in scoped]
+    return {
+        "scope": {
+            "repository": repository,
+            "workflow": workflow,
+            "cutoff": _iso_utc(cutoff_time) if cutoff_time is not None else None,
+        },
+        "open": {
+            "records": sum(open_sources.values()),
+            "sources": [
+                {"source": source, "records": count}
+                for source, count in sorted(
+                    open_sources.items(), key=lambda item: (-item[1], item[0])
+                )
+            ],
+        },
+        "closed": {
+            "records": sum(item["records"] for item in closed_sources.values()),
+            "sources": [
+                {
+                    "source": source,
+                    "records": values["records"],
+                    "dispositions": [
+                        {"disposition": disposition, "records": count}
+                        for disposition, count in sorted(
+                            values["dispositions"].items(),
+                            key=lambda item: (-item[1], item[0]),
+                        )
+                    ],
+                }
+                for source, values in sorted(
+                    closed_sources.items(), key=lambda item: (-item[1]["records"], item[0])
+                )
+            ],
+        },
+        "range": {
+            "oldest": _iso_utc(timestamps[0]) if timestamps else None,
+            "newest": _iso_utc(timestamps[-1]) if timestamps else None,
+        },
+        "storage": {
+            "bytes": sum(sizes),
+            "average_record_bytes": round(sum(sizes) / len(sizes)) if sizes else 0,
+            "largest_record_bytes": max(sizes, default=0),
+        },
+    }
 
 
 def source_name(record: dict[str, Any]) -> str:
@@ -472,49 +625,6 @@ def source_name(record: dict[str, Any]) -> str:
     if tool.startswith("mcp__") and "__" in tool[5:]:
         return tool.rsplit("__", 1)[-1]
     return tool
-
-
-def source_counts(
-    *,
-    repository: str | None = None,
-    workflow: str | None = None,
-    closed: bool = False,
-) -> list[dict[str, Any]]:
-    """Return unique logical feedback sources and their record counts."""
-    counts: dict[str, int] = {}
-    for record in read_records():
-        if repository is not None and record.get("repository") != repository:
-            continue
-        if workflow is not None and record.get("workflow") != workflow:
-            continue
-        if record.get("status", "open") != ("closed" if closed else "open"):
-            continue
-        source = source_name(record)
-        counts[source] = counts.get(source, 0) + 1
-    return [
-        {"source": source, "count": count}
-        for source, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
-    ]
-
-
-def storage_stats() -> dict[str, Any]:
-    """Return compact retention and size information for the feedback store."""
-    records = read_records()
-    path = storage_path()
-    sizes = [_encoded_size(record) for record in records]
-    timestamps = sorted(
-        str(record["timestamp"]) for record in records if isinstance(record.get("timestamp"), str)
-    )
-    return {
-        "records": len(records),
-        "open": sum(record.get("status", "open") == "open" for record in records),
-        "closed": sum(record.get("status", "open") == "closed" for record in records),
-        "bytes": path.stat().st_size if path.exists() else 0,
-        "average_record_bytes": round(sum(sizes) / len(sizes)) if sizes else 0,
-        "largest_record_bytes": max(sizes, default=0),
-        "oldest": timestamps[0] if timestamps else None,
-        "newest": timestamps[-1] if timestamps else None,
-    }
 
 
 def _qwen_home() -> Path:
@@ -724,9 +834,17 @@ def trace(feedback_id: str) -> dict[str, Any]:
 
 
 def find(feedback_id: str) -> dict[str, Any]:
-    """Return one complete feedback record by exact ID or unique legacy suffix."""
+    """Return one complete feedback record by exact ID or unique suffix."""
     records = read_records()
     return _find_record(records, feedback_id)
+
+
+def find_many(feedback_ids: list[str]) -> list[dict[str, Any]]:
+    """Return complete feedback records in requested order from one store read."""
+    if not feedback_ids:
+        raise ValueError("at least one feedback ID is required")
+    records = read_records()
+    return [_find_record(records, value) for value in feedback_ids]
 
 
 def _find_record(records: list[dict[str, Any]], feedback_id: str) -> dict[str, Any]:
@@ -780,6 +898,80 @@ def _rewrite(path: Path, records: list[dict[str, Any]]) -> None:
         os.fsync(directory)
     finally:
         os.close(directory)
+
+
+def resolve_records(resolutions: Any) -> dict[str, Any]:
+    """Atomically close records with independently specified dispositions."""
+    if not isinstance(resolutions, list) or not resolutions:
+        raise ValueError("resolutions must be a non-empty array")
+    normalized_resolutions: list[dict[str, str]] = []
+    for item in resolutions:
+        if not isinstance(item, dict) or set(item) - {"ref", "disposition", "note"}:
+            raise ValueError("each resolution requires ref and disposition, with optional note")
+        reference = item.get("ref")
+        disposition = item.get("disposition")
+        note = item.get("note")
+        if not isinstance(reference, str) or not reference.strip():
+            raise ValueError("resolution ref must be a non-empty string")
+        if disposition not in RESOLUTION_DISPOSITIONS:
+            raise ValueError("feedback disposition is invalid")
+        resolution = {"ref": reference.strip(), "disposition": str(disposition)}
+        if note is not None:
+            if not isinstance(note, str) or not note.strip():
+                raise ValueError("feedback resolution note must not be blank")
+            if len(note.strip()) > 500:
+                raise ValueError("feedback resolution note must be at most 500 characters")
+            resolution["note"] = note.strip()
+        normalized_resolutions.append(resolution)
+
+    path = storage_path()
+    if not path.is_file():
+        raise ValueError("feedback ID was not found")
+    with _locked(path, exclusive=True):
+        records = _read(path)
+        legacy_normalized = _normalize_legacy_records(records)
+        selected: list[tuple[dict[str, Any], dict[str, str], dict[str, str]]] = []
+        selected_ids: set[str] = set()
+        for item in normalized_resolutions:
+            record = _find_record(records, item["ref"])
+            feedback_id = str(record["feedback_id"])
+            if feedback_id in selected_ids:
+                raise ValueError("feedback resolution contains a duplicate record")
+            selected_ids.add(feedback_id)
+            resolution = {"disposition": item["disposition"]}
+            if "note" in item:
+                resolution["note"] = item["note"]
+            if record.get("status", "open") == "closed" and record.get("resolution") != resolution:
+                raise ValueError("closed feedback has a different resolution; reopen it first")
+            selected.append((record, item, resolution))
+
+        timestamp = dt.datetime.now(dt.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+        results: list[dict[str, Any]] = []
+        changed = False
+        for record, item, resolution in selected:
+            item_changed = not (
+                record.get("status", "open") == "closed" and record.get("resolution") == resolution
+            )
+            if item_changed:
+                record["status"] = "closed"
+                record["closed_at"] = timestamp
+                record["resolution"] = resolution
+                changed = True
+            results.append(
+                {
+                    "ref": feedback_ref(str(record["feedback_id"]), records),
+                    "feedback_id": record["feedback_id"],
+                    "disposition": item["disposition"],
+                    "changed": item_changed,
+                }
+            )
+        if changed or legacy_normalized:
+            _rewrite(path, records)
+    return {
+        "changed": sum(bool(item["changed"]) for item in results),
+        "unchanged": sum(not bool(item["changed"]) for item in results),
+        "resolved": results,
+    }
 
 
 def set_closed(
@@ -853,8 +1045,7 @@ def remove(feedback_ids: list[str]) -> list[str]:
 
 def _display_id(value: Any) -> str:
     rendered = str(value or "-")
-    legacy = re.fullmatch(r"fb-\d{14}-([0-9a-f]{10})", rendered)
-    return legacy.group(1) if legacy else rendered
+    return rendered[-SHORT_REF_LENGTH:] if rendered.startswith("fb-") else rendered
 
 
 def _display_time(value: Any) -> str:
@@ -935,7 +1126,7 @@ def format_table(records: list[dict[str, Any]], *, width: int) -> str:
         rows.append(
             (
                 [
-                    _one_line(_display_id(record.get("feedback_id"))),
+                    _one_line(record.get("ref") or record.get("feedback_id")),
                     _one_line(_display_time(record.get("timestamp"))),
                     _one_line(record.get("repository")),
                     _one_line(context),
@@ -973,34 +1164,49 @@ def format_table(records: list[dict[str, Any]], *, width: int) -> str:
     return "\n".join(line.rstrip() for line in rendered)
 
 
-def format_sources(sources: list[dict[str, Any]]) -> str:
-    """Render unique feedback sources and counts."""
-    if not sources:
-        return "No feedback recorded."
-    source_width = max(len("SOURCE"), *(len(str(item["source"])) for item in sources))
-    count_width = max(len("COUNT"), *(len(str(item["count"])) for item in sources))
-    rendered = [
-        f"{'SOURCE'.ljust(source_width)}  {'COUNT'.rjust(count_width)}",
-        f"{'-' * source_width}  {'-' * count_width}",
+def format_feedback_summary(summary: Mapping[str, Any]) -> str:
+    """Render aggregate feedback state without including record messages."""
+    scope = summary["scope"]
+    open_summary = summary["open"]
+    closed_summary = summary["closed"]
+    storage = summary["storage"]
+    time_range = summary["range"]
+    lines = [
+        f"Records: {open_summary['records'] + closed_summary['records']} total",
+        f"Range: {_display_time(time_range['oldest'])} to {_display_time(time_range['newest'])}",
+        f"Storage: {storage['bytes']} bytes; {storage['average_record_bytes']} average, "
+        f"{storage['largest_record_bytes']} largest",
     ]
-    rendered.extend(
-        f"{str(item['source']).ljust(source_width)}  {str(item['count']).rjust(count_width)}"
-        for item in sources
+    selected_scope = [f"{name}={value}" for name, value in scope.items() if value is not None]
+    if selected_scope:
+        lines.insert(0, f"Scope: {', '.join(selected_scope)}")
+    open_sources = open_summary["sources"]
+    open_width = max([len("SOURCE"), *(len(str(item["source"])) for item in open_sources)])
+    lines.extend(("", f"Open ({open_summary['records']})", f"{'SOURCE'.ljust(open_width)}  COUNT"))
+    lines.append(f"{'-' * open_width}  -----")
+    lines.extend(
+        f"{str(item['source']).ljust(open_width)}  {str(item['records']).rjust(5)}"
+        for item in open_sources
     )
-    return "\n".join(rendered)
-
-
-def format_stats(stats: Mapping[str, Any]) -> str:
-    """Render feedback storage statistics."""
-    return "\n".join(
+    closed_sources = closed_summary["sources"]
+    closed_width = max([len("SOURCE"), *(len(str(item["source"])) for item in closed_sources)])
+    lines.extend(
         (
-            f"Records: {stats['records']} ({stats['open']} open, {stats['closed']} closed)",
-            f"Storage: {stats['bytes']} bytes",
-            f"Record size: {stats['average_record_bytes']} average, "
-            f"{stats['largest_record_bytes']} largest",
-            f"Range: {_display_time(stats['oldest'])} to {_display_time(stats['newest'])}",
+            "",
+            f"Closed ({closed_summary['records']})",
+            f"{'SOURCE'.ljust(closed_width)}  COUNT  DISPOSITIONS",
+            f"{'-' * closed_width}  -----  ------------",
         )
     )
+    for item in closed_sources:
+        dispositions = ", ".join(
+            f"{entry['disposition']}={entry['records']}" for entry in item["dispositions"]
+        )
+        lines.append(
+            f"{str(item['source']).ljust(closed_width)}  "
+            f"{str(item['records']).rjust(5)}  {dispositions}"
+        )
+    return "\n".join(lines)
 
 
 def format_trace(result: Mapping[str, Any]) -> str:

@@ -82,10 +82,13 @@ def build_parser() -> argparse.ArgumentParser:
     feedback_add.add_argument("message", help="PHI-free workflow friction and its consequence")
     feedback_add.add_argument("--tool", help="related native or external tool name")
     feedback_commands.add_parser("path", help="print the feedback JSONL path")
-    feedback_stats = feedback_commands.add_parser(
-        "stats", help="summarize feedback retention and record sizes"
+    feedback_summary = feedback_commands.add_parser(
+        "summary", help="summarize the complete feedback state"
     )
-    feedback_stats.add_argument(
+    feedback_summary.add_argument("--repository")
+    feedback_summary.add_argument("--workflow")
+    feedback_summary.add_argument("--cutoff", help="include records created at or after this time")
+    feedback_summary.add_argument(
         "--json", action="store_true", dest="json_output", help="print machine-readable JSON"
     )
     feedback_list = feedback_commands.add_parser(
@@ -94,9 +97,11 @@ def build_parser() -> argparse.ArgumentParser:
     feedback_list.set_defaults(feedback_command="list")
     feedback_list.add_argument("--repository")
     feedback_list.add_argument("--workflow")
+    feedback_list.add_argument("--cutoff", help="include records created at or after this time")
     feedback_list.add_argument(
         "--closed", action="store_true", help="show closed feedback instead of open feedback"
     )
+    feedback_list.add_argument("--status", choices=("open", "closed", "all"))
     feedback_list.add_argument(
         "--source",
         "--tool",
@@ -104,23 +109,18 @@ def build_parser() -> argparse.ArgumentParser:
         dest="sources",
         help="include a logical source; repeat to include more than one",
     )
-    feedback_list.add_argument("--limit", type=int, default=50)
+    list_limit = feedback_list.add_mutually_exclusive_group()
+    list_limit.add_argument("--limit", type=int, default=50)
+    list_limit.add_argument(
+        "--all", action="store_true", dest="all_records", help="return every matching record"
+    )
     feedback_list.add_argument(
         "--json", action="store_true", dest="json_output", help="print machine-readable JSON"
     )
-    feedback_sources = feedback_commands.add_parser(
-        "sources", help="list unique logical feedback sources"
+    feedback_show = feedback_commands.add_parser(
+        "show", help="show one or more complete feedback records"
     )
-    feedback_sources.add_argument("--repository")
-    feedback_sources.add_argument("--workflow")
-    feedback_sources.add_argument(
-        "--closed", action="store_true", help="count closed feedback instead of open feedback"
-    )
-    feedback_sources.add_argument(
-        "--json", action="store_true", dest="json_output", help="print machine-readable JSON"
-    )
-    feedback_show = feedback_commands.add_parser("show", help="show one complete feedback record")
-    feedback_show.add_argument("feedback_id")
+    feedback_show.add_argument("feedback_ids", nargs="+")
     feedback_trace = feedback_commands.add_parser(
         "trace", help="locate feedback in Qwen transcripts without printing conversation content"
     )
@@ -131,16 +131,19 @@ def build_parser() -> argparse.ArgumentParser:
     feedback_close = feedback_commands.add_parser(
         "close", help="close reviewed feedback without deleting it"
     )
-    feedback_close.add_argument("feedback_ids", nargs="+")
+    feedback_close.add_argument("feedback_ids", nargs="*")
     feedback_close.add_argument(
         "--disposition",
         choices=sorted(feedback.RESOLUTION_DISPOSITIONS),
-        default="addressed",
         help="how the feedback was resolved (default: addressed)",
     )
     feedback_close.add_argument(
         "--note",
         help="optional short PHI-free resolution note",
+    )
+    feedback_close.add_argument("--input", help="JSON resolution object, JSON file, or - for stdin")
+    feedback_close.add_argument(
+        "--json", action="store_true", dest="json_output", help="print machine-readable JSON"
     )
     feedback_reopen = feedback_commands.add_parser("reopen", help="reopen closed feedback")
     feedback_reopen.add_argument("feedback_ids", nargs="+")
@@ -181,13 +184,14 @@ def run_feedback(args: argparse.Namespace) -> int:
             tool=request.tool,
             workspace=Path.cwd(),
         )
-        print(f"Recorded feedback {result['feedback_id']}.")
+        print(f"Recorded feedback {result['ref']}.")
         return 0
     if args.feedback_command == "path":
         print(feedback.storage_path())
         return 0
     if args.feedback_command == "show":
-        result: Any = feedback.find(args.feedback_id)
+        records = feedback.find_many(args.feedback_ids)
+        result: Any = records[0] if len(records) == 1 else records
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
     if args.feedback_command == "trace":
@@ -198,49 +202,67 @@ def run_feedback(args: argparse.Namespace) -> int:
             else feedback.format_trace(result)
         )
         return 0
-    if args.feedback_command == "stats":
-        result = feedback.storage_stats()
+    if args.feedback_command == "summary":
+        result = feedback.feedback_summary(
+            repository=args.repository,
+            workflow=args.workflow,
+            cutoff=args.cutoff,
+        )
         print(
             json.dumps(result, indent=2, sort_keys=True)
             if args.json_output
-            else feedback.format_stats(result)
+            else feedback.format_feedback_summary(result)
         )
         return 0
-    if args.feedback_command in {"close", "reopen"}:
-        closed = args.feedback_command == "close"
+    if args.feedback_command == "close":
+        if args.input is not None:
+            if args.feedback_ids or args.disposition is not None or args.note is not None:
+                raise ValueError(
+                    "feedback close --input cannot be combined with IDs, --disposition, or --note"
+                )
+            request = load_request(args.input)
+            if set(request) != {"resolutions"}:
+                raise ValueError("close input requires only a resolutions array")
+            result = feedback.resolve_records(request["resolutions"])
+            print(
+                json.dumps(result, indent=2, sort_keys=True)
+                if args.json_output
+                else f"Closed {result['changed']} feedback record"
+                f"{'s' if result['changed'] != 1 else ''}; {result['unchanged']} unchanged."
+            )
+            return 0
+        if not args.feedback_ids:
+            raise ValueError("feedback close requires IDs or --input")
         changed = feedback.set_closed(
             args.feedback_ids,
-            closed=closed,
-            disposition=getattr(args, "disposition", "addressed"),
-            note=getattr(args, "note", None),
+            closed=True,
+            disposition=args.disposition or "addressed",
+            note=args.note,
         )
-        action = "Closed" if closed else "Reopened"
-        print(f"{action} {len(changed)} feedback record{'s' if len(changed) != 1 else ''}.")
+        print(f"Closed {len(changed)} feedback record{'s' if len(changed) != 1 else ''}.")
+        return 0
+    if args.feedback_command == "reopen":
+        changed = feedback.set_closed(args.feedback_ids, closed=False)
+        print(f"Reopened {len(changed)} feedback record{'s' if len(changed) != 1 else ''}.")
         return 0
     if args.feedback_command == "remove":
         removed = feedback.remove(args.feedback_ids)
         print(f"Removed {len(removed)} feedback record{'s' if len(removed) != 1 else ''}.")
         return 0
-    if args.feedback_command == "sources":
-        result = feedback.source_counts(
-            repository=args.repository,
-            workflow=args.workflow,
-            closed=args.closed,
-        )
-        if args.json_output:
-            print(json.dumps(result, indent=2, sort_keys=True))
-        else:
-            print(feedback.format_sources(result))
-        return 0
     else:
-        if args.limit < 1:
+        if args.closed and args.status is not None:
+            raise ValueError("feedback list --closed cannot be combined with --status")
+        status = args.status or ("closed" if args.closed else "open")
+        limit = None if args.all_records else args.limit
+        if limit is not None and limit < 1:
             raise ValueError("feedback limit must be positive")
         result = feedback.compact_records(
             repository=args.repository,
             workflow=args.workflow,
             sources=args.sources,
-            closed=args.closed,
-            limit=args.limit,
+            status=status,
+            cutoff=args.cutoff,
+            limit=limit,
         )
     if getattr(args, "json_output", False):
         print(json.dumps(result, indent=2, sort_keys=True))

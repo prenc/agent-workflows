@@ -61,13 +61,16 @@ Qwen records feedback through the extension's `workflow_feedback` tool. Codex
 and other local callers can record the same concise observation with
 `agent-workflows feedback add "<message>" [--tool <name>]`; repository identity,
 time, storage, and CLI provenance are derived automatically.
-Review it with `agent-workflows feedback list` and inspect one complete record
-with `agent-workflows feedback show <feedback-id>`. The list prints compact
-metadata followed by each complete wrapped summary; use
-`agent-workflows feedback list --json` for machine-readable records. `feedback ls`
-is a short alias; repeat `--source <name>` to include one or more normalized tool
-sources, and use `feedback sources` to print every unique source with its count.
-Use `feedback stats` to monitor retained size and `feedback trace <feedback-id>`
+Use `agent-workflows feedback summary --json` for aggregate state: separate
+open and closed source counts, closed dispositions by source, timestamp range,
+and storage size. Use `feedback list` (`ls`) for records, with `--limit 1` for the
+newest record or `--all` for every match. Both commands accept `--repository`,
+`--workflow`, and an inclusive creation-time lower bound via `--cutoff`.
+Each listed record has a short collision-free `ref` for routine commands and
+retains its canonical `fb-` ID for storage and transcript correlation.
+`feedback show <ref>...` accepts one or more records. Repeat `--source <name>`
+on `ls` to include one or more normalized tool sources.
+Use `feedback trace <feedback-id>`
 to locate the exact Qwen session and tool call without printing conversation
 content. Feedback stores PHI-free summaries and bounded call shapes only; raw
 tool arguments, responses, prompts, and source-data excerpts remain exclusively
@@ -75,12 +78,17 @@ in the Qwen transcript.
 The legacy `--tool` spelling remains an alias for `--source`. Close reviewed
 records with `feedback close <feedback-id> [<feedback-id> ...]`, optionally
 selecting a disposition and a short PHI-free note; default lists
-show only open feedback, while `feedback ls --closed` and `feedback sources --closed` inspect the retained closed set. Use `feedback reopen` to restore a
-closed record. `feedback remove` remains the explicit permanent-deletion command.
+show only open feedback, while `feedback ls --closed` inspects the retained
+closed set. Use `feedback reopen` to restore a
+closed record. Apply mixed dispositions atomically with
+`feedback close --input <JSON|file|->`, whose `resolutions` entries contain
+`ref`, `disposition`, and an optional `note`. `feedback remove` remains the
+explicit permanent-deletion command.
 
 The `workflow-feedback` skill is available to both Codex and Qwen. With no
 explicit action it performs read-only inventory, investigation, classification,
-and grouping. An explicit fix request authorizes one coherent feedback group;
-validated records are closed with an evidence-based disposition rather than
-deleted. Raw Qwen transcript tracing, commits, pushes, installation, reloads,
-and MCP restarts remain separately authorized actions.
+and grouping from one reusable snapshot. An explicit implementation request may
+authorize multiple planned, non-conflicting feedback groups; validated records
+are closed with evidence-based dispositions rather than deleted. Raw Qwen
+transcript tracing, commits, pushes, installation, reloads, and MCP restarts
+remain separately authorized actions.
