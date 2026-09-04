@@ -1654,6 +1654,10 @@ class WorkflowRuntime:
             "runtime_policy": str(reference_root / "github-runtime-policy.md"),
             "issue_conventions": str(reference_root / "github-issue-conventions.md"),
         }
+        if workflow == "gh-audit-repo":
+            references["readonly_search"] = str(
+                reference_root.parent / "hooks" / "readonly-search.py"
+            )
         if workflow == "gh-implement-issue":
             references["pull_request_template"] = str(reference_root / "github-pr-template.md")
         result = {

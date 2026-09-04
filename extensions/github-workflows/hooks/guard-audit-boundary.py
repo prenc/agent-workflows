@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import sys
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,10 @@ PUBLIC_PATH_DENIAL = (
 UNIX_ABSOLUTE_PATH = re.compile(r"(?<![:</\w])/(?!/)(?:[A-Za-z0-9._+-]+/)*[A-Za-z0-9._+-]+")
 WINDOWS_ABSOLUTE_PATH = re.compile(r"(?i)(?<![A-Za-z0-9_])[A-Z]:[\\/](?:[^\s`'\"<>]+)")
 PUBLIC_TEXT_FIELDS = {"title", "body", "comment"}
+WORKER_SHELL_DENIAL = (
+    "The audit worker may use run_shell_command only for the bounded helper at "
+    "task_context.references.readonly_search; all other shell execution is denied."
+)
 
 
 def decision(value: str, reason: str | None = None) -> dict[str, Any]:
@@ -106,7 +111,90 @@ def public_text_has_absolute_path(payload: dict[str, Any]) -> bool:
     return False
 
 
+def allowed_worker_search(payload: dict[str, Any]) -> bool:
+    tool_input = payload.get("tool_input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    if not isinstance(command, str) or any(
+        value in command for value in ("\n", "\0", "`", "$(", "${")
+    ):
+        return False
+    if re.search(r"\$[A-Za-z_]", command):
+        return False
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="();<>|&")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return False
+    helper = str(Path(__file__).with_name("readonly-search.py").resolve())
+    if (
+        not tokens
+        or tokens[0] != helper
+        or any(token and all(character in "();<>|&" for character in token) for token in tokens[1:])
+    ):
+        return False
+    requested_roots = [
+        tokens[index + 1] for index, token in enumerate(tokens[:-1]) if token == "--root"
+    ] + [token.partition("=")[2] for token in tokens if token.startswith("--root=")]
+    assigned_root = assigned_audit_worktree(payload)
+    if len(requested_roots) != 1 or assigned_root is None:
+        return False
+    return Path(requested_roots[0]).resolve() == assigned_root
+
+
+def assigned_audit_worktree(payload: dict[str, Any]) -> Path | None:
+    transcript = payload.get("transcript_path")
+    if not isinstance(transcript, str):
+        return None
+    try:
+        lines = Path(transcript).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict) or row.get("type") != "tool_result":
+            continue
+        message = row.get("message") if isinstance(row, dict) else None
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        parts = message.get("parts") if isinstance(message, dict) else None
+        if not isinstance(parts, list):
+            continue
+        for part in reversed(parts):
+            response = part.get("functionResponse") if isinstance(part, dict) else None
+            if not isinstance(response, dict) or response.get("name") != (
+                "mcp__github_workflows__task_context"
+            ):
+                continue
+            response_body = response.get("response")
+            if not isinstance(response_body, dict):
+                continue
+            value = response_body.get("output")
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError:
+                    continue
+            if not isinstance(value, dict):
+                continue
+            for candidate in (
+                value,
+                value.get("structuredContent"),
+                value.get("structured_content"),
+            ):
+                root = candidate.get("audit_worktree") if isinstance(candidate, dict) else None
+                if isinstance(root, str) and Path(root).is_absolute():
+                    return Path(root).resolve()
+            return None
+    return None
+
+
 def main() -> int:
+    payload: Any = None
     try:
         payload = json.load(sys.stdin)
         if not isinstance(payload, dict):
@@ -114,7 +202,17 @@ def main() -> int:
         if payload.get("hook_event_name") != "PreToolUse":
             return 0
         if payload.get("agent_type") == "gh-audit-repo-worker":
-            print(json.dumps(decision("allow")))
+            allowed = payload.get("tool_name") != "run_shell_command" or allowed_worker_search(
+                payload
+            )
+            print(
+                json.dumps(
+                    decision(
+                        "allow" if allowed else "deny",
+                        None if allowed else WORKER_SHELL_DENIAL,
+                    )
+                )
+            )
             return 0
         if audit_session(payload):
             if public_text_has_absolute_path(payload):
@@ -125,6 +223,12 @@ def main() -> int:
                 return 0
         print(json.dumps(decision("allow")))
     except Exception:
+        if (
+            isinstance(payload, dict)
+            and payload.get("agent_type") == "gh-audit-repo-worker"
+            and payload.get("tool_name") == "run_shell_command"
+        ):
+            print(json.dumps(decision("deny", WORKER_SHELL_DENIAL)))
         # A local policy helper must not disrupt unrelated or malformed sessions.
         return 0
     return 0

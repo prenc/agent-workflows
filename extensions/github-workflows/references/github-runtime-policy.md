@@ -23,6 +23,12 @@ supervisors and workers.
   compact form. The repository-feature error diagnostic is one such explicit
   exception: `search_repositories` uses `minimal_output: false` to read
   `has_issues` and `has_pull_requests`.
+- `issue_read` does not expose `fields` or `minimal_output`. Use compact history
+  or projected list/search results for preliminary filtering, then make one
+  exact full issue read only when current single-issue evidence is required.
+  Do not replace it with broad pagination merely to avoid the full payload, and
+  do not copy the returned body or unrelated metadata into assignments or
+  history.
 
 ## Reviewed execution boundary
 
@@ -42,6 +48,15 @@ supervisors and workers.
   its code visible in the shell invocation and use `<project>/.venv/bin/python`
   when present, otherwise use the system Python selected by the reviewed
   executable; run it directly from the visible invocation.
+- Audit workers use `grep_search` first. When its result is empty or incomplete
+  because an immutable worktree is beneath an ignored parent, they may invoke
+  only the reviewed helper returned as `task_context.references.readonly_search`.
+  The helper bypasses parent ignores while preserving worktree ignore files,
+  enforces private-path exclusions and containment, and returns bounded JSON.
+  The pre-tool hook also requires `--root` to exactly match the authoritative
+  audit worktree in the worker's latest `task_context` tool result.
+  Its shell exception does not permit direct `rg`, operators, substitutions,
+  environment expansion, or any other command.
 - Database creation, queries, and mutation must use the reviewed database
   helper interface exclusively. Raw SQLite commands and generated database code
   are prohibited.

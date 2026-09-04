@@ -457,6 +457,10 @@ linked shard atomically. Task transitions then maintain the shard lifecycle, so
 do not repeat running, partial, complete, or failed states through
 `audit_record`. Use an explicit shard record only for skipped or supervisor-owned
 work without a task.
+For notebook evidence, identify the repository-relative `.ipynb` path, stable
+cell index, and a unique symbol or text anchor. Do not assign serialized notebook
+line ranges: `read_file` cannot page notebooks by offset, and JSON line numbers
+are not stable source locations.
 Use the returned server-generated task ID and task reference, then launch one
 `gh-audit-repo-worker` per selected shard according to
 `mcp__github_workflows__run_status`, with only this prompt:

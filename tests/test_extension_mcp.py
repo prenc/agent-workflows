@@ -1383,6 +1383,17 @@ class TestExtensionMcp:
                 )
             )
 
+        assert all(
+            term in supervisor
+            for term in (
+                "object/null `anyOf` error",
+                "do not infer a payload-size limit",
+                "compact native structured object",
+                "checking nested object and array boundaries",
+                "corrected retry also fails",
+            )
+        )
+
     def test_audit_guidance_uses_server_owned_candidate_fingerprints(self) -> None:
         supervisor = (EXTENSION / "skills/gh-audit-repo/SKILL.md").read_text(encoding="utf-8")
         worker = (EXTENSION / "agents/gh-audit-repo-worker.md").read_text(encoding="utf-8")
@@ -1401,6 +1412,23 @@ class TestExtensionMcp:
             assert "audit host" in document or "audit-host" in document
             assert "deployment constraints" in document
             assert "standard-library root" in document
+
+    def test_audit_guidance_handles_notebooks_and_full_issue_reads_explicitly(self) -> None:
+        supervisor = (EXTENSION / "skills/gh-audit-repo/SKILL.md").read_text(encoding="utf-8")
+        worker = (EXTENSION / "agents/gh-audit-repo-worker.md").read_text(encoding="utf-8")
+        policy = (EXTENSION / "references/github-runtime-policy.md").read_text(encoding="utf-8")
+
+        assert all(term in supervisor for term in ("`.ipynb` path", "cell index", "text anchor"))
+        assert all(term in worker for term in ("exact-file `grep_search`", "offset/limit"))
+        assert all(
+            term in policy
+            for term in (
+                "`issue_read` does not expose `fields` or `minimal_output`",
+                "preliminary filtering",
+                "exact full issue read",
+                "Do not replace it with broad pagination",
+            )
+        )
 
     def test_worktree_environment_contract_is_consistent_across_agents(self) -> None:
         documents = [
@@ -1449,7 +1477,7 @@ class TestExtensionMcp:
     def test_worktree_workers_expose_reliable_search_tools(self) -> None:
         search_tools = {"run_shell_command", "grep_search", "read_file", "glob"}
         expected = {
-            "gh-audit-repo-worker.md": {"grep_search", "read_file"},
+            "gh-audit-repo-worker.md": {"run_shell_command", "grep_search", "read_file"},
             "gh-implement-issue-worker.md": {
                 "run_shell_command",
                 "grep_search",
@@ -1468,6 +1496,19 @@ class TestExtensionMcp:
                 if line.startswith("  - ")
             }
             assert configured & search_tools == tools
+
+    def test_audit_worker_documents_guarded_search_fallback(self) -> None:
+        worker = (EXTENSION / "agents/gh-audit-repo-worker.md").read_text(encoding="utf-8")
+        policy = (EXTENSION / "references/github-runtime-policy.md").read_text(encoding="utf-8")
+
+        for document in (worker, policy):
+            assert "references.readonly_search" in document
+            assert "parent" in document
+            assert "bounded" in document
+            assert "task_context" in document
+        assert "audit_worktree" in worker
+        assert "authoritative" in policy
+        assert "audit worktree" in policy
 
     @pytest.mark.parametrize(
         "filename",

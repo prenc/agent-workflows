@@ -10,6 +10,7 @@ tools:
   - mcp__github_workflows__workflow_feedback
   - grep_search
   - read_file
+  - run_shell_command
   - web_fetch
   - mcp__github__get_commit
   - mcp__github__issue_read
@@ -22,7 +23,6 @@ tools:
   - mcp__context7__query-docs
 disallowedTools:
   - agent
-  - run_shell_command
   - write_file
   - edit
   - mcp__github__issue_write
@@ -51,7 +51,20 @@ This worker is read-only and must not create or execute any orchestration file.
   snapshots plus explicitly assigned version-matched local documentation paths.
   The worktree is beneath a Git-ignored root, so use assigned paths,
   `grep_search`, and exact `read_file` calls for discovery. Treat an empty search
-  as inconclusive until a known in-scope path confirms the search surface.
+  as inconclusive until a known in-scope path confirms the search surface. If
+  `grep_search` stays empty or incomplete because the immutable worktree is
+  beneath an ignored parent, use `run_shell_command` only to invoke the exact
+  bounded helper path in `task_context.references.readonly_search`. Its `files`
+  and `search` operations accept an absolute `--root` plus relative `--path`
+  values and return paginated JSON. This is a fallback, not the primary search
+  path; never use shell operators, substitutions, environment variables, or any
+  other command. The hook binds `--root` to the authoritative `audit_worktree`
+  from your latest `task_context` result; call `task_context` again if that
+  result is no longer present after compaction.
+  For `.ipynb` evidence, use the assigned cell index and unique anchor with an
+  exact-file `grep_search`; use a full `read_file` only when the surrounding cell
+  content is required. Do not treat serialized notebook line numbers as stable
+  source locations or attempt unsupported offset/limit reads.
   Reread the shared environment inventory before each
   version-dependent conclusion and before the final report.
   Treat the latest `task_context.inventory` revision as authoritative for
@@ -61,7 +74,8 @@ This worker is read-only and must not create or execute any orchestration file.
   inventory-provided interpreter prefix or standard-library root is an assigned
   version-matched local evidence path, but never publish its absolute host path.
   Never edit, write, commit, push, comment, label, create issues, install
-  dependencies, execute shell commands, or spawn agents.
+  dependencies, execute shell commands other than that bounded search fallback,
+  or spawn agents.
 - Use only read-only GitHub methods inherited from the supervisor's authenticated
   MCP registry. Before code
   analysis, complete one required read-only GitHub MCP call appropriate to the

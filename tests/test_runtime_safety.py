@@ -110,6 +110,10 @@ class TestRuntimeSafety:
 
             context = runtime.task_context(planned["task_ref"])
 
+            readonly_search = Path(context["references"]["readonly_search"])
+            assert readonly_search.name == "readonly-search.py"
+            assert readonly_search.is_file()
+
             assert context["validation"] == {
                 "candidate_id": "candidate-timeout",
                 "record_count": 1,

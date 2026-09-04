@@ -323,6 +323,12 @@ top-level Make command so nested uv calls inherit it.
 
 Register the complete round assignment with
 `mcp__github_workflows__task_manage` using action `plan` and a typed `task`.
+If client-side validation rejects `task` with an object/null `anyOf` error
+before the MCP call starts, do not infer a payload-size limit or repeat the
+identical call. Rebuild `task` once as a compact native structured object,
+checking nested object and array boundaries while preserving the assignment
+contract. If that corrected retry also fails, report the client validation
+limitation and stop rather than progressively splitting the assignment.
 Use its returned server-generated task ID and task reference, then launch
 `gh-implement-issue-worker` with fresh context and:
 
