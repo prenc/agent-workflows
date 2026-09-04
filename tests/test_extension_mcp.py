@@ -1499,7 +1499,12 @@ class TestExtensionMcp:
             assert all(
                 contract in document
                 for contract in (
-                    "default and is read-only",
+                    "does not change existing queue records",
+                    "secondary-record exception",
+                    "one primary operation",
+                    "qualifying workflow friction",
+                    "record needs no separate user request",
+                    "does not expand the approved",
                     "Record and analyze feedback from the active",
                     "Only implementation work",
                     "requires a writable `agent-workflows` checkout",
@@ -1512,6 +1517,7 @@ class TestExtensionMcp:
                     "non-conflicting root-cause group",
                     "consolidate overlapping owning tests",
                     "feedback close --input <JSON|file|->",
+                    "Prefer `--input -` with stdin",
                     "Ask the user before calling `feedback trace`",
                     "never use `feedback remove`",
                     "commits, pushes, installation",

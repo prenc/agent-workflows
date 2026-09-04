@@ -21,14 +21,25 @@ the required location instead of modifying another project.
 
 ## Select the operation
 
-Infer one operation from the user's request:
+Infer one primary operation from the user's request:
 
-- **record** requires an explicit request to report an observed friction;
-- **analyze** is the default and is read-only;
+- **record** as the primary operation requires an explicit request to report an
+  observed friction;
+- **analyze** is the default and does not change existing queue records; the
+  secondary-record exception below may append a new record;
 - **implement** requires `fix`, `implement`, `address`, or equally explicit
   authorization;
 - **resolve** changes feedback status only when explicitly requested or after
   an authorized implementation has been validated.
+
+While analyzing, implementing, or resolving feedback, also record any new,
+qualifying workflow friction encountered during that work. This secondary
+record needs no separate user request, but it does not expand the approved
+implementation scope. Confirm the behavior, sanitize and record it once, then
+continue the primary operation. Do not turn expected validation failures,
+ordinary repository defects, or the feedback tool's own failed recording
+attempt into recursive feedback; report a recording failure to the user and do
+not loop.
 
 An invocation never authorizes commits, pushes, installation into user config,
 MCP restart, extension reload, or permanent feedback deletion. Perform those
@@ -121,8 +132,9 @@ After validation, close every proven record in the group with one concise note:
 Apply mixed validated dispositions in one atomic
 `agent-workflows feedback close --input <JSON|file|->` request. The request
 contains a `resolutions` array whose entries have `ref`, `disposition`, and an
-optional `note`. Use positional `feedback close` for a simple group sharing one
-disposition and note; never use `feedback remove` as routine cleanup. Leave
+optional `note`. Prefer `--input -` with stdin for generated JSON so it cannot
+be mistaken for a file path. Use positional `feedback close` for a simple group
+sharing one disposition and note; never use `feedback remove` as routine cleanup. Leave
 partial or ambiguous records open. Reopen a record when later review invalidates
 its resolution, then repair and revalidate it.
 
