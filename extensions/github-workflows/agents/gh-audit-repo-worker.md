@@ -37,6 +37,10 @@ assignment, immutable source, scope, inventory, documentation strategy, and
 budget as authoritative. Verify mode additionally requires one canonical
 candidate and its fingerprint in that context. Return `CONTEXT_UNAVAILABLE`
 when the tool fails or the stored assignment is incomplete.
+Treat `assignment.candidate_fingerprint` as the server-owned identity of the
+exact candidate snapshot. Copy it unchanged into every completed verify report;
+never calculate, replace, or infer it. The fingerprint binds the report to its
+candidate snapshot but does not replace current evidence or validation.
 
 Read the `runtime_policy` path returned in task context completely.
 This worker is read-only and must not create or execute any orchestration file.

@@ -1232,11 +1232,42 @@ class TestExtensionMcp:
                 probe_result = probed.structured_content
                 assert probe_result["status"] == "succeeded"
                 assert probe_result["validation_recorded"]
+                assert probe_result["artifact"] == "validation/probe-mcp-1/result.json"
                 assert "ok" in probe_result["stdout_excerpt"]
                 validation = runtime.state("gh-audit-repo")["validations"]["probe-mcp-1"]
                 assert validation["candidate_id"] == candidate_id
                 assert validation["status"] == "succeeded"
                 assert validation["artifact"] == "validation/probe-mcp-1/result.json"
+
+                verify_task = await client.call_tool(
+                    "task_manage",
+                    {
+                        "action": "plan",
+                        "task": {
+                            "logical_id": "verify-mcp-1",
+                            "assignment": {
+                                "mode": "verify",
+                                "candidate": {
+                                    "id": candidate_id,
+                                    "observation": "ready to probe",
+                                },
+                            },
+                        },
+                    },
+                )
+                assert not verify_task.is_error
+                fingerprint = verify_task.structured_content["task"]["assignment"][
+                    "candidate_fingerprint"
+                ]
+                assert len(fingerprint) == 64
+                verify_context = await client.call_tool(
+                    "task_context", {"task_ref": verify_task.structured_content["task_ref"]}
+                )
+                assert not verify_context.is_error
+                assert (
+                    verify_context.structured_content["assignment"]["candidate_fingerprint"]
+                    == fingerprint
+                )
 
                 begun = await client.call_tool(
                     "audit_publish",
@@ -1347,6 +1378,15 @@ class TestExtensionMcp:
                     "baseline limitation",
                 )
             )
+
+    def test_audit_guidance_uses_server_owned_candidate_fingerprints(self) -> None:
+        supervisor = (EXTENSION / "skills/gh-audit-repo/SKILL.md").read_text(encoding="utf-8")
+        worker = (EXTENSION / "agents/gh-audit-repo-worker.md").read_text(encoding="utf-8")
+
+        for document in (supervisor, worker):
+            assert "candidate_fingerprint" in document
+            assert "server-owned" in document
+            assert "never calculate" in document
 
     def test_worktree_environment_contract_is_consistent_across_agents(self) -> None:
         documents = [

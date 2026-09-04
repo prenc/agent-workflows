@@ -515,6 +515,10 @@ Give every consolidated survivor to a fresh `gh-audit-repo-worker` in `verify`
 mode according to the result-first scheduler, with the candidate, immutable
 worktree, area/shard contracts, compact GitHub history snapshot,
 inventory, prior observations, focus/guidance, and relevant documentation MCPs.
+Put the complete canonical candidate object in `assignment.candidate`. The
+server derives `assignment.candidate_fingerprint`; never calculate or submit a
+fingerprint. New verify assignments without one canonical candidate are
+rejected before launch.
 The verifier must independently confirm
 the current-SHA code path, reachability, impact, confidence, taxonomy, one-PR sizing, required outcomes,
 duplicate status, and the proposed existing/new disposition. Reject
@@ -527,9 +531,10 @@ If the verifier proposes a materially independent probe, apply section 7 again
 before accepting its verdict and checkpoint the second result with the
 candidate fingerprint.
 
-Fingerprint each canonical candidate and store the fresh verifier result under
-that unit key. Prior observations may guide questions but never substitute for
-independent current-SHA proof. Refresh every GitHub-dependent disposition.
+Require the fresh verifier to copy the server-owned candidate fingerprint into
+its completed report, and store the result under that unit key. Prior
+observations may guide questions but never substitute for independent
+current-SHA proof. Refresh every GitHub-dependent disposition.
 The verifier returns evidence, disagreements, required outcomes, and concise
 publication facts, not a rendered issue body. The supervisor renders the final
 title and body centrally after accepting the verdict.

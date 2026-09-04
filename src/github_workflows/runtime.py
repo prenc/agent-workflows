@@ -55,6 +55,8 @@ TASK_HISTORY_FIELDS = (
     "labels",
 )
 TASK_METADATA_FIELDS = ("id", "logical_id", "role", "unit", "attempt", "status", "required")
+TASK_VALIDATION_FIELDS = ("id", "probe_id", "candidate_id", "status", "artifact")
+CANDIDATE_FINGERPRINT_FIELD = "candidate_fingerprint"
 WORKFLOW_REF_NAMES: dict[WorkflowName, str] = {
     "gh-audit-repo": "audit",
     "gh-curate-issues": "curate",
@@ -528,6 +530,68 @@ class WorkflowRuntime:
             return str(mode)
         return str(supplied or fallback or "worker")
 
+    @staticmethod
+    def _candidate_fingerprint(candidate: dict[str, Any]) -> str:
+        candidate_id = candidate.get("id")
+        if not isinstance(candidate_id, str) or not candidate_id.strip():
+            raise ValueError("verify assignment candidate requires a non-empty string id")
+        canonical = {
+            key: value
+            for key, value in candidate.items()
+            if key not in {"fingerprint", CANDIDATE_FINGERPRINT_FIELD}
+        }
+        try:
+            rendered = json.dumps(
+                canonical,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("verify assignment candidate must be canonical JSON") from error
+        return hashlib.sha256(rendered.encode()).hexdigest()
+
+    @classmethod
+    def _audit_task_assignment(
+        cls,
+        assignment: dict[str, Any],
+        *,
+        caller_supplied: bool,
+    ) -> dict[str, Any]:
+        if assignment.get("mode") != "verify":
+            return assignment
+        candidate = assignment.get("candidate")
+        if not isinstance(candidate, dict):
+            if caller_supplied:
+                raise ValueError("verify assignment requires one canonical candidate object")
+            raise ValueError(
+                "verify task assignment is incompatible; retry it with a canonical candidate"
+            )
+        if caller_supplied and (
+            CANDIDATE_FINGERPRINT_FIELD in assignment
+            or "fingerprint" in candidate
+            or CANDIDATE_FINGERPRINT_FIELD in candidate
+        ):
+            raise ValueError("candidate fingerprints are server-owned")
+        canonical = {
+            key: value
+            for key, value in candidate.items()
+            if key not in {"fingerprint", CANDIDATE_FINGERPRINT_FIELD}
+        }
+        fingerprint = cls._candidate_fingerprint(canonical)
+        if not caller_supplied:
+            stored_fingerprint = assignment.get(CANDIDATE_FINGERPRINT_FIELD)
+            if stored_fingerprint != fingerprint:
+                raise ValueError(
+                    "verify task assignment is incompatible; retry it with a canonical candidate"
+                )
+        return {
+            **assignment,
+            "candidate": canonical,
+            CANDIDATE_FINGERPRINT_FIELD: fingerprint,
+        }
+
     def _write_audit_task_report(
         self, task_id: str, report: dict[str, Any], *, checkpoint: bool
     ) -> tuple[Path, str]:
@@ -554,11 +618,14 @@ class WorkflowRuntime:
             raise
         return path, reference
 
-    @staticmethod
     def _validate_audit_report(
-        task: dict[str, Any], report: dict[str, Any], action: str
+        self,
+        task: dict[str, Any],
+        report: dict[str, Any],
+        action: str,
     ) -> str | None:
-        mode = task.get("assignment", {}).get("mode")
+        assignment = self._audit_task_assignment(task.get("assignment", {}), caller_supplied=False)
+        mode = assignment.get("mode")
         if mode not in {"discover", "verify"}:
             return str(report["status"]) if isinstance(report.get("status"), str) else None
         status = report.get("status")
@@ -569,6 +636,13 @@ class WorkflowRuntime:
         )
         if status not in allowed:
             raise ValueError(f"{action} report status must be one of: {', '.join(sorted(allowed))}")
+        if mode == "verify":
+            expected = assignment.get(CANDIDATE_FINGERPRINT_FIELD)
+            supplied = report.get(CANDIDATE_FINGERPRINT_FIELD)
+            if action == "complete" and not isinstance(supplied, str):
+                raise ValueError("complete verify report requires candidate_fingerprint")
+            if supplied is not None and supplied != expected:
+                raise ValueError("verify report candidate_fingerprint does not match assignment")
         return str(status)
 
     @staticmethod
@@ -1012,6 +1086,9 @@ class WorkflowRuntime:
                         role = self._audit_task_role(plan, str(queued[0].get("role") or "worker"))
                         revised = plan.model_dump(mode="json", exclude_none=True)
                         revised["role"] = role
+                        revised["assignment"] = self._audit_task_assignment(
+                            revised["assignment"], caller_supplied=True
+                        )
                         self._event(
                             {
                                 "type": "task-plan-update",
@@ -1036,6 +1113,9 @@ class WorkflowRuntime:
                     unit = plan.unit or logical_id
                     assignment = plan.assignment
                     required = plan.required
+                assignment = self._audit_task_assignment(
+                    assignment, caller_supplied=plan is not None
+                )
                 if not SAFE_ID.fullmatch(logical_id):
                     raise ValueError("logical_id contains unsupported characters")
                 if not SAFE_ID.fullmatch(task_id):
@@ -1483,6 +1563,30 @@ class WorkflowRuntime:
             "requests": inventory.get("requests", {}),
         }
 
+    @staticmethod
+    def _worker_validation(
+        state: dict[str, Any], assignment: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        if assignment.get("mode") != "verify":
+            return None
+        candidate = assignment.get("candidate")
+        candidate_id = candidate.get("id") if isinstance(candidate, dict) else None
+        if not isinstance(candidate_id, str) or not candidate_id:
+            return None
+        validations = state.get("validations", {})
+        if not isinstance(validations, dict):
+            return None
+        records = [
+            {key: validation[key] for key in TASK_VALIDATION_FIELDS if key in validation}
+            for validation in validations.values()
+            if isinstance(validation, dict) and validation.get("candidate_id") == candidate_id
+        ]
+        return {
+            "candidate_id": candidate_id,
+            "record_count": len(records),
+            "records": records,
+        }
+
     def task_context(self, task_ref: str) -> dict[str, Any]:
         workflow, run_ref, task_id = self._parse_task_ref(task_ref)
         state = self.state(workflow)
@@ -1492,6 +1596,8 @@ class WorkflowRuntime:
         if not isinstance(task, dict):
             raise ValueError("task_ref is unknown; use the exact value from task_manage")
         assignment = task.get("assignment", {})
+        if workflow == "gh-audit-repo":
+            assignment = self._audit_task_assignment(assignment, caller_supplied=False)
         source_kind = assignment.get(
             "source_kind", "program" if task.get("role") == "program" else "repository"
         )
@@ -1546,6 +1652,9 @@ class WorkflowRuntime:
             result["continuation"] = continuation
         if workflow == "gh-audit-repo":
             result["history"] = self._audit_task_history(state, assignment)
+            validation = self._worker_validation(state, assignment)
+            if validation is not None:
+                result["validation"] = validation
         return result
 
     def history_manage(self, request: HistoryManageRequest) -> dict[str, Any]:
@@ -1904,6 +2013,7 @@ class WorkflowRuntime:
                 "probe_id": request.probe_id,
                 "candidate_id": request.candidate_id,
                 "status": status,
+                "artifact": artifact_ref,
                 "returncode": artifact.get("returncode"),
                 "timed_out": bool(artifact.get("timed_out")),
                 "worktree_unchanged": bool(artifact.get("worktree_unchanged")),

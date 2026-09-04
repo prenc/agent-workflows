@@ -50,6 +50,10 @@ class TestRuntimeSafety:
         with tempfile.TemporaryDirectory(prefix="runtime-probe-timeout-") as directory:
             runtime = self.make_runtime(Path(directory))
             self.initialize_audit(runtime)
+            runtime.history_manage(HistoryManageRequest(action="prepare"))
+            runtime.history_manage(
+                HistoryManageRequest(action="commit", full_history_complete=True)
+            )
             runtime.audit_record(
                 AuditRecordRequest(
                     action="candidate",
@@ -87,9 +91,38 @@ class TestRuntimeSafety:
 
             assert result["status"] == "timed-out"
             assert result["stdout_excerpt"] == "partial output"
+            assert result["artifact"] == "validation/probe-timeout/result.json"
             validation = runtime.state("gh-audit-repo")["validations"]["probe-timeout"]
             assert validation["status"] == "timed-out"
             assert validation["candidate_id"] == "candidate-timeout"
+            planned = runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    task={
+                        "logical_id": "verify-timeout",
+                        "assignment": {
+                            "mode": "verify",
+                            "candidate": {"id": "candidate-timeout"},
+                        },
+                    },
+                )
+            )
+
+            context = runtime.task_context(planned["task_ref"])
+
+            assert context["validation"] == {
+                "candidate_id": "candidate-timeout",
+                "record_count": 1,
+                "records": [
+                    {
+                        "id": "probe-timeout",
+                        "probe_id": "probe-timeout",
+                        "candidate_id": "candidate-timeout",
+                        "status": "timed-out",
+                        "artifact": "validation/probe-timeout/result.json",
+                    }
+                ],
+            }
 
     @pytest.mark.parametrize(
         ("result", "expected"),
@@ -685,6 +718,176 @@ class TestRuntimeSafety:
                 TaskManageRequest(action="integration_end", task_id="discover-core-1")
             )
             assert runtime.state("gh-audit-repo")["shards"]["shard-core"]["status"] == "partial"
+
+    def test_verify_assignment_fingerprint_is_server_owned_and_report_bound(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-verify-fingerprint-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.history_manage(HistoryManageRequest(action="prepare"))
+            runtime.history_manage(
+                HistoryManageRequest(action="commit", full_history_complete=True)
+            )
+            candidate = {
+                "id": "C-core",
+                "root_cause": "cache entries are retained",
+                "paths": ["src/core.py"],
+            }
+
+            planned = runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    task={
+                        "logical_id": "verify-core",
+                        "assignment": {"mode": "verify", "candidate": candidate},
+                    },
+                )
+            )
+            fingerprint = planned["task"]["assignment"]["candidate_fingerprint"]
+
+            assert len(fingerprint) == 64
+            assert int(fingerprint, 16) >= 0
+            context = runtime.task_context(planned["task_ref"])
+            assert context["assignment"]["candidate"] == candidate
+            assert context["assignment"]["candidate_fingerprint"] == fingerprint
+
+            revised = runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    task={
+                        "logical_id": "verify-core",
+                        "assignment": {
+                            "candidate": {
+                                "paths": ["src/core.py"],
+                                "root_cause": "cache entries are retained",
+                                "id": "C-core",
+                            },
+                            "mode": "verify",
+                        },
+                    },
+                )
+            )
+            assert revised["task"]["assignment"]["candidate_fingerprint"] == fingerprint
+
+            with pytest.raises(ValueError, match="requires one canonical candidate"):
+                runtime.task_manage(
+                    TaskManageRequest(
+                        action="plan",
+                        task={
+                            "logical_id": "verify-missing",
+                            "assignment": {"mode": "verify", "candidate_id": "C-core"},
+                        },
+                    )
+                )
+            with pytest.raises(ValueError, match="server-owned"):
+                runtime.task_manage(
+                    TaskManageRequest(
+                        action="plan",
+                        task={
+                            "logical_id": "verify-supplied",
+                            "assignment": {
+                                "mode": "verify",
+                                "candidate": candidate,
+                                "candidate_fingerprint": fingerprint,
+                            },
+                        },
+                    )
+                )
+
+            runtime.task_manage(TaskManageRequest(action="mark_running", task_id="verify-core-1"))
+            with pytest.raises(ValueError, match="requires candidate_fingerprint"):
+                runtime.task_manage(
+                    TaskManageRequest(
+                        action="complete",
+                        task_id="verify-core-1",
+                        report={"status": "complete"},
+                    )
+                )
+            with pytest.raises(ValueError, match="does not match"):
+                runtime.task_manage(
+                    TaskManageRequest(
+                        action="complete",
+                        task_id="verify-core-1",
+                        report={"status": "complete", "candidate_fingerprint": "0" * 64},
+                    )
+                )
+            completed = runtime.task_manage(
+                TaskManageRequest(
+                    action="complete",
+                    task_id="verify-core-1",
+                    report={
+                        "status": "complete",
+                        "candidate_fingerprint": fingerprint,
+                    },
+                )
+            )
+            retried = runtime.task_manage(
+                TaskManageRequest(action="retry", task_id=completed["task_id"])
+            )
+            assert retried["task"]["assignment"]["candidate_fingerprint"] == fingerprint
+
+    def test_incompatible_verify_assignment_must_be_replanned(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-legacy-fingerprint-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.history_manage(HistoryManageRequest(action="prepare"))
+            runtime.history_manage(
+                HistoryManageRequest(action="commit", full_history_complete=True)
+            )
+            state = runtime.state("gh-audit-repo")
+            state["tasks"]["verify-legacy-1"] = {
+                "id": "verify-legacy-1",
+                "logical_id": "verify-legacy",
+                "agent_id": "verify-legacy-1",
+                "role": "verify",
+                "unit": "verify-legacy",
+                "attempt": 1,
+                "status": "queued",
+                "required": True,
+                "requires_integration": True,
+                "integrated": False,
+                "assignment": {"mode": "verify", "candidate_id": "C-legacy"},
+            }
+            workflow_run.write_state(runtime.current("gh-audit-repo"), state)
+            task_ref = runtime._task_ref("gh-audit-repo", state, "verify-legacy-1")
+
+            with pytest.raises(ValueError, match="incompatible; retry it"):
+                runtime.task_context(task_ref)
+
+            runtime.task_manage(TaskManageRequest(action="mark_running", task_id="verify-legacy-1"))
+            with pytest.raises(ValueError, match="incompatible; retry it"):
+                runtime.task_manage(
+                    TaskManageRequest(
+                        action="complete",
+                        task_id="verify-legacy-1",
+                        report={
+                            "status": "complete",
+                            "candidate_fingerprint": "0" * 64,
+                        },
+                    )
+                )
+
+            runtime.task_manage(
+                TaskManageRequest(
+                    action="fail",
+                    task_id="verify-legacy-1",
+                    note="incompatible verify assignment",
+                )
+            )
+            retried = runtime.task_manage(
+                TaskManageRequest(
+                    action="retry",
+                    task_id="verify-legacy-1",
+                    task={
+                        "logical_id": "verify-legacy",
+                        "unit": "verify-legacy",
+                        "assignment": {
+                            "mode": "verify",
+                            "candidate": {"id": "C-legacy"},
+                        },
+                    },
+                )
+            )
+            assert len(retried["task"]["assignment"]["candidate_fingerprint"]) == 64
 
     def test_suspended_audit_accepts_only_late_worker_results(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-audit-suspend-") as directory:
