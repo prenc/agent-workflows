@@ -396,9 +396,32 @@ class TestRuntimeSafety:
                 TaskManageRequest(action="fail", workflow=workflow, task_id="foo-1")
             )
             retry = runtime.task_manage(
-                TaskManageRequest(action="retry", workflow=workflow, task_id="foo-1")
+                TaskManageRequest(
+                    action="retry",
+                    workflow=workflow,
+                    task_id="foo-1",
+                    note="Use the refreshed issue state",
+                )
             )
             assert retry["task_id"] == "foo-2"
+            assert runtime.task_context(retry["task_ref"])["continuation"] == {
+                "retry": {"from_attempt": 1, "note": "Use the refreshed issue state"}
+            }
+            branched = runtime.task_manage(
+                TaskManageRequest(
+                    action="retry",
+                    workflow=workflow,
+                    task_id="foo-1",
+                    note="Branch again from the original failure",
+                )
+            )
+            assert branched["task_id"] == "foo-3"
+            assert runtime.task_context(branched["task_ref"])["continuation"] == {
+                "retry": {
+                    "from_attempt": 1,
+                    "note": "Branch again from the original failure",
+                }
+            }
             assert runtime.state(workflow)["tasks"]["unrelated-1"]["logical_id"] == "unrelated"
 
             second = WorkflowRuntime(runtime.workspace, Path(directory) / "qwen-concurrency")
@@ -820,10 +843,44 @@ class TestRuntimeSafety:
                     },
                 )
             )
+            runtime.task_manage(
+                TaskManageRequest(action="integration_begin", task_id=completed["task_id"])
+            )
+            runtime.task_manage(
+                TaskManageRequest(action="integration_end", task_id=completed["task_id"])
+            )
             retried = runtime.task_manage(
-                TaskManageRequest(action="retry", task_id=completed["task_id"])
+                TaskManageRequest(
+                    action="retry",
+                    task_id=completed["task_id"],
+                    note="Recheck the pinned runtime source only",
+                )
             )
             assert retried["task"]["assignment"]["candidate_fingerprint"] == fingerprint
+            assert runtime.task_context(retried["task_ref"])["continuation"] == {
+                "retry": {
+                    "from_attempt": 1,
+                    "note": "Recheck the pinned runtime source only",
+                }
+            }
+            runtime.task_manage(
+                TaskManageRequest(action="mark_running", task_id=retried["task_id"])
+            )
+            runtime.task_manage(TaskManageRequest(action="fail", task_id=retried["task_id"]))
+            branched = runtime.task_manage(
+                TaskManageRequest(
+                    action="retry",
+                    task_id=completed["task_id"],
+                    note="Branch again from the original verification",
+                )
+            )
+            assert branched["task_id"] == "verify-core-3"
+            assert runtime.task_context(branched["task_ref"])["continuation"] == {
+                "retry": {
+                    "from_attempt": 1,
+                    "note": "Branch again from the original verification",
+                }
+            }
 
     def test_incompatible_verify_assignment_must_be_replanned(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-legacy-fingerprint-") as directory:
@@ -888,6 +945,7 @@ class TestRuntimeSafety:
                 )
             )
             assert len(retried["task"]["assignment"]["candidate_fingerprint"]) == 64
+            assert "continuation" not in runtime.task_context(retried["task_ref"])
 
     def test_suspended_audit_accepts_only_late_worker_results(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-audit-suspend-") as directory:
@@ -985,6 +1043,28 @@ class TestRuntimeSafety:
             assert runtime.task_context(second["task_ref"])["continuation"]["report"] == {
                 "status": "partial",
                 "remaining": "documentation",
+            }
+            runtime.task_manage(
+                TaskManageRequest(
+                    action="fail",
+                    task_id="discover-core-1",
+                    note="turn budget exhausted",
+                )
+            )
+            retried = runtime.task_manage(
+                TaskManageRequest(
+                    action="retry",
+                    task_id="discover-core-1",
+                    note="Inspect only the remaining documentation",
+                )
+            )
+            assert runtime.task_context(retried["task_ref"])["continuation"] == {
+                "retry": {
+                    "from_attempt": 1,
+                    "note": "Inspect only the remaining documentation",
+                },
+                "attempt": 1,
+                "report": {"status": "partial", "remaining": "documentation"},
             }
 
     def test_revising_queued_audit_task_transfers_pending_shard(self) -> None:
@@ -1166,6 +1246,8 @@ class TestRuntimeSafety:
                         "source": "project-venv",
                         "executable": ".venv/bin/python",
                         "python": "3.12.8",
+                        "interpreter_prefix": "/workspace/.venv",
+                        "stdlib_root": "/usr/lib/python3.12",
                         "packages": {
                             **{f"unused-package-{index}": "1.0" for index in range(250)},
                             "Pydantic": "2.13.0",
@@ -1209,6 +1291,8 @@ class TestRuntimeSafety:
                 "source": "project-venv",
                 "executable": ".venv/bin/python",
                 "python": "3.12.8",
+                "interpreter_prefix": "/workspace/.venv",
+                "stdlib_root": "/usr/lib/python3.12",
                 "package_count": 251,
                 "packages": {"Pydantic": "2.13.0"},
                 "missing_requested_packages": ["missing-package"],

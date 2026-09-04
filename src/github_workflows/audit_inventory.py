@@ -119,8 +119,9 @@ def selected_python(project: Path) -> tuple[Path, str]:
 def package_inventory(project: Path) -> dict[str, Any]:
     python, source = selected_python(project)
     code = (
-        "import importlib.metadata as m,json,platform,sys;"
+        "import importlib.metadata as m,json,platform,sys,sysconfig;"
         "print(json.dumps({'python':platform.python_version(),"
+        "'interpreter_prefix':sys.prefix,'stdlib_root':sysconfig.get_path('stdlib'),"
         "'packages':dict(sorted((d.metadata.get('Name',d.name),d.version) for d in m.distributions()))}))"
     )
     try:

@@ -54,6 +54,12 @@ This worker is read-only and must not create or execute any orchestration file.
   as inconclusive until a known in-scope path confirms the search surface.
   Reread the shared environment inventory before each
   version-dependent conclusion and before the final report.
+  Treat the latest `task_context.inventory` revision as authoritative for
+  packages available on the audit host and their installed versions, even when
+  older assignment prose speculates otherwise. Declared deployment constraints
+  describe target environments and do not override current-host facts. An
+  inventory-provided interpreter prefix or standard-library root is an assigned
+  version-matched local evidence path, but never publish its absolute host path.
   Never edit, write, commit, push, comment, label, create issues, install
   dependencies, execute shell commands, or spawn agents.
 - Use only read-only GitHub methods inherited from the supervisor's authenticated

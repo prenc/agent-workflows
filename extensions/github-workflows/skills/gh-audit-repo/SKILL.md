@@ -387,6 +387,12 @@ only those distribution names in `assignment.python_packages`. `task_context`
 returns the selected installed versions plus the total package count, rather than
 copying the complete environment into every worker context. A worker requests any
 unexpected missing package through `CONTEXT_REQUEST`.
+The latest inventory revision is authoritative for audit-host package availability
+and installed versions; do not let speculative or stale assignment prose override
+it. Keep declared deployment constraints separate because they describe target
+environments rather than the current host. The inventory also supplies the selected
+interpreter prefix and standard-library root as version-matched local evidence paths;
+workers may inspect them but must not publish their absolute host paths.
 Then use action `program` with one `programs` list containing the relevant configured
 programs and their optional version/help arguments. The tool runs the bounded sandboxed
 probes as one batch and records them in one inventory revision. Record

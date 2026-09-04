@@ -64,6 +64,8 @@ class TestAuditInventory:
         assert python["available"]
         assert python["source"] == "system"
         assert python["executable"] == "python"
+        assert Path(python["interpreter_prefix"]).is_absolute()
+        assert Path(python["stdlib_root"]).is_dir()
         assert inventory["schema_version"] == 1
         assert inventory["revision"] == 1
         event = json.loads((self.run_dir / "journal.jsonl").read_text().splitlines()[0])
@@ -99,6 +101,8 @@ class TestAuditInventory:
         assert python["source"] == "project-venv"
         assert python["executable"] == "python"
         assert python["python"]
+        assert Path(python["interpreter_prefix"]) == self.project / ".venv"
+        assert Path(python["stdlib_root"]).is_dir()
         assert python["packages"]["audit-fixture"] == "1.2.3"
 
     def test_program_probe_prefers_project_venv_executable(self) -> None:

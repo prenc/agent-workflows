@@ -1133,6 +1133,9 @@ class WorkflowRuntime:
                     "required": required,
                     "assignment": assignment,
                 }
+                if request.action == "retry" and request.note:
+                    task["retry_note"] = request.note
+                    task["retry_from_attempt"] = int(previous.get("attempt", 1))
                 self._event({"type": "task-register", "task": task})
                 managed_task_id = task_id
             elif request.action in {"integration_begin", "integration_end"}:
@@ -1287,6 +1290,9 @@ class WorkflowRuntime:
                 "assignment": assignment,
                 "integrated": False,
             }
+            if request.action == "retry" and request.note:
+                tasks[task_id]["retry_note"] = request.note
+                tasks[task_id]["retry_from_attempt"] = int(previous.get("attempt", 1))
         elif request.action in {"integration_begin", "integration_end"}:
             task = tasks.get(request.task_id)
             if not isinstance(task, dict):
@@ -1394,6 +1400,20 @@ class WorkflowRuntime:
     def _continuation_context(
         self, workflow: WorkflowName, state: dict[str, Any], task: dict[str, Any]
     ) -> dict[str, Any] | None:
+        result: dict[str, Any] = {}
+        retry_note = task.get("retry_note")
+        retry_from_attempt = task.get("retry_from_attempt")
+        if (
+            isinstance(retry_note, str)
+            and retry_note
+            and isinstance(retry_from_attempt, int)
+            and not isinstance(retry_from_attempt, bool)
+            and retry_from_attempt > 0
+        ):
+            result["retry"] = {
+                "from_attempt": retry_from_attempt,
+                "note": retry_note,
+            }
         attempts = sorted(
             (
                 item
@@ -1408,8 +1428,9 @@ class WorkflowRuntime:
         for attempt in attempts:
             report = self._task_report(workflow, attempt.get("checkpoint"))
             if report is not None:
-                return {"attempt": attempt.get("attempt"), "report": report}
-        return None
+                result.update({"attempt": attempt.get("attempt"), "report": report})
+                return result
+        return result or None
 
     def _audit_task_history(
         self, state: dict[str, Any], assignment: dict[str, Any]
@@ -1542,7 +1563,14 @@ class WorkflowRuntime:
                 selected[found[0]] = found[1]
         python_environment = {
             key: environment[key]
-            for key in ("available", "source", "executable", "python")
+            for key in (
+                "available",
+                "source",
+                "executable",
+                "python",
+                "interpreter_prefix",
+                "stdlib_root",
+            )
             if key in environment
         }
         python_environment.update(

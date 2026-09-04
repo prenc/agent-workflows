@@ -1392,6 +1392,16 @@ class TestExtensionMcp:
             assert "server-owned" in document
             assert "never calculate" in document
 
+    def test_audit_guidance_makes_inventory_authoritative_for_host_facts(self) -> None:
+        supervisor = (EXTENSION / "skills/gh-audit-repo/SKILL.md").read_text(encoding="utf-8")
+        worker = (EXTENSION / "agents/gh-audit-repo-worker.md").read_text(encoding="utf-8")
+
+        for document in (supervisor, worker):
+            assert "authoritative" in document
+            assert "audit host" in document or "audit-host" in document
+            assert "deployment constraints" in document
+            assert "standard-library root" in document
+
     def test_worktree_environment_contract_is_consistent_across_agents(self) -> None:
         documents = [
             (ROOT / "user-policies/codex.md").read_text(encoding="utf-8"),
