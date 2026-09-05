@@ -94,9 +94,7 @@ class TestAuditBoundaryHook:
     def test_supervisor_can_read_public_reference(self) -> None:
         result = self.invoke(
             "read_file",
-            {
-                "file_path": str(EXTENSION / "references/github-runtime-policy.md"),
-            },
+            {"file_path": str(EXTENSION / "references/github-runtime-policy.md")},
         )
         assert result["permissionDecision"] == "allow"
 
@@ -260,6 +258,49 @@ class TestAuditBoundaryHook:
             },
         )
         assert result["permissionDecision"] == "allow"
+
+    def test_audit_publication_allows_required_implementation_citations(self) -> None:
+        issue = self.invoke(
+            "mcp__github__issue_write",
+            {
+                "method": "create",
+                "title": "Hook denies convention-required citations",
+                "body": (
+                    "Evidence: `src/github_workflows/github_cache.py:128` and "
+                    "`extensions/github-workflows/hooks/guard-audit-boundary.py:61`; "
+                    "the agent-workflows project name must stay publishable."
+                ),
+            },
+        )
+        assert issue["permissionDecision"] == "allow"
+
+        comment = self.invoke(
+            "mcp__github__add_issue_comment",
+            {
+                "issue_number": 28,
+                "comment": "Evidence: `src/github_workflows/github_cache.py:128`",
+            },
+        )
+        assert comment["permissionDecision"] == "allow"
+
+    def test_audit_publication_citations_do_not_weaken_boundary_denials(self) -> None:
+        absolute = self.invoke(
+            "mcp__github__issue_write",
+            {
+                "method": "create",
+                "title": "Concrete failure",
+                "body": f"Evidence: `{ROOT / 'src/github_workflows/runtime.py'}`",
+            },
+        )
+        assert absolute["permissionDecision"] == "deny"
+        assert "repository-relative" in absolute["permissionDecisionReason"]
+
+        read = self.invoke(
+            "read_file",
+            {"file_path": str(ROOT / "src/github_workflows/runtime.py")},
+        )
+        assert read["permissionDecision"] == "deny"
+        assert "public github_workflows MCP tools" in read["permissionDecisionReason"]
 
     def test_absolute_path_guard_is_limited_to_audit_publication(self) -> None:
         unrelated = self.invoke(
