@@ -126,8 +126,8 @@ def validated_run_id(value: str) -> str:
 
 
 def repo_dir(project_dir: Path, repo: str) -> Path:
-    normalized_repo(repo)
-    return project_dir.expanduser().resolve() / "github"
+    owner, name = normalized_repo(repo).split("/")
+    return project_dir.expanduser().resolve() / "github" / owner / name
 
 
 def secure_directory(path: Path) -> None:
@@ -305,6 +305,17 @@ def prepare_database(args: argparse.Namespace, kind: str) -> None:
     mode = "new"
     reuse_live = live.exists() and not args.rebuild
     if reuse_live:
+        stored_repo = None
+        try:
+            with connect(live) as current:
+                stored_repo = metadata(current).get("repository")
+        except (ValueError, sqlite3.DatabaseError):
+            stored_repo = None
+        if stored_repo is not None and stored_repo != normalized_repo(args.repo):
+            raise ValueError(
+                f"cache repository identity mismatch: the committed cache belongs to "
+                f"{stored_repo}, not {normalized_repo(args.repo)}; refusing to move it aside"
+            )
         try:
             with connect(live) as current:
                 previous = validate(current, args.repo, kind)
@@ -574,12 +585,14 @@ def query_records(args: argparse.Namespace) -> None:
         else:
             rows = connection.execute("SELECT * FROM records ORDER BY kind, number")
         selected: dict[tuple[str, int], sqlite3.Row] = {}
-        for kind, number in linked:
+        linked_selected: set[tuple[str, int]] = set()
+        for key in sorted(linked):
             row = connection.execute(
-                "SELECT * FROM records WHERE kind=? AND number=?", (kind, number)
+                "SELECT * FROM records WHERE kind=? AND number=?", key
             ).fetchone()
             if row:
-                selected[(kind, number)] = row
+                selected[key] = row
+                linked_selected.add(key)
         for row in rows:
             if args.kind and row["kind"] != args.kind:
                 continue
@@ -593,9 +606,12 @@ def query_records(args: argparse.Namespace) -> None:
         has_more = bool(args.limit and len(selected_records) > args.limit)
         if args.limit:
             selected_records = selected_records[: args.limit]
+        included = {(row["kind"], row["number"]) for row in selected_records}
+        linked_dropped = sum(1 for key in linked_selected if key not in included)
         result = {
             "cutoff": iso_utc(cutoff) if cutoff else None,
             "has_more": has_more,
+            "linked_dropped": linked_dropped,
             "records": [row_dict(row) for row in selected_records],
         }
     rendered = json.dumps(result, indent=2, sort_keys=True) + "\n"

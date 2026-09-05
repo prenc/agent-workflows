@@ -380,7 +380,7 @@ class TestRuntimeSafety:
             managed_worktree = runtime.workspace / ".worktrees" / "gh-audit-repo-aaaaaaa"
             state["audit_worktree"] = str(managed_worktree)
             workflow_run.write_state(runtime.current("gh-audit-repo"), state)
-            staging = runtime.project_dir / "github" / "staging"
+            staging = runtime.project_dir / "github" / "example" / "repo" / "staging"
             staging.mkdir(parents=True)
             transaction = staging / f"records-{state['run_id']}.sqlite3"
             transaction.write_text("stale", encoding="utf-8")
