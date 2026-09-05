@@ -484,6 +484,42 @@ class TestRuntimeSafety:
                 records=[{"kind": "issue", "number": number} for number in range(101)],
             )
 
+    def test_history_commit_missing_staging_fails_typed_without_creating_file(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-history-commit-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.history_manage(HistoryManageRequest(action="prepare"))
+            run_id = runtime.state("gh-audit-repo")["run_id"]
+            work_db = runtime.project_dir / "github" / "staging" / f"records-{run_id}.sqlite3"
+            assert work_db.is_file()
+            work_db.unlink()
+            with pytest.raises(ValueError, match="does not exist"):
+                runtime.history_manage(
+                    HistoryManageRequest(action="commit", full_history_complete=True)
+                )
+            assert not work_db.exists()
+            runtime.history_manage(HistoryManageRequest(action="prepare"))
+            assert work_db.is_file()
+
+    def test_history_ingest_payload_over_byte_cap_fails_typed(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-history-cap-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.history_manage(HistoryManageRequest(action="prepare"))
+            with pytest.raises(ValueError, match="exceeds"):
+                runtime.history_manage(
+                    HistoryManageRequest(
+                        action="ingest",
+                        records=[
+                            {
+                                "kind": "issue",
+                                "number": 1,
+                                "title": "x" * (11 * 1024 * 1024),
+                            }
+                        ],
+                    )
+                )
+
     def test_history_artifacts_are_bounded_qwen_tool_results(self) -> None:
         with tempfile.TemporaryDirectory(prefix="history-artifacts-") as directory:
             root = Path(directory)

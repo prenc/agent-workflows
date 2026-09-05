@@ -1849,6 +1849,7 @@ class WorkflowRuntime:
                         result = self._invoke(
                             github_cache.ingest_records,
                             **common,
+                            run_id=run_id,
                             db=work_db,
                             kind=kind,
                             input=source,
@@ -1865,14 +1866,14 @@ class WorkflowRuntime:
                     accepted=accepted,
                 )
             if request.action == "abort":
-                self._invoke(github_cache.abort_database, db=work_db)
+                self._invoke(github_cache.abort_database, **common, db=work_db)
                 history = {
                     **state.get("history", {}),
                     **cache_summary(live_db, "committed"),
                     "sync_status": "aborted",
                 }
                 return sync_receipt(history, "pending")
-            with github_cache.connect(work_db) as connection:
+            with github_cache.connect_readonly(work_db) as connection:
                 metadata = github_cache.validate(connection, repo, "records")["metadata"]
             full_history_complete = request.full_history_complete
             if full_history_complete is None:
