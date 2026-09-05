@@ -29,6 +29,7 @@ from .models import (
     InventoryRequest,
     KnowledgeFinding,
     KnowledgeRequest,
+    LinkedRecord,
     PhaseRecord,
     ProbeRequest,
     ProgramProbe,
@@ -668,7 +669,7 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
         kind: Literal["issue", "pull"] | None = None,
         state: Literal["open", "closed"] | None = None,
         cutoff: str | None = None,
-        linked: JsonArrayArgument[list[dict[str, Any]] | None] = None,
+        linked: JsonArrayArgument[list[LinkedRecord] | None] = None,
         limit: int | None = None,
     ) -> dict[str, Any]:
         """Search a bounded, selector-based GitHub history view."""
