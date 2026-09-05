@@ -153,6 +153,13 @@ class TestExtensionMcp:
                         assert properties[field]["description"].endswith(
                             f"Send a JSON {kind} value; do not JSON-encode it as a string."
                         )
+                query_schema = tools["history_query"].input_schema
+                linked_property = query_schema["properties"]["linked"]
+                linked_record = query_schema["$defs"]["LinkedRecord"]
+                assert linked_property["items"]["$ref"] == "#/$defs/LinkedRecord"
+                assert linked_record["required"] == ["kind", "number"]
+                assert linked_record["additionalProperties"] is False
+                assert linked_record["properties"]["kind"]["enum"] == ["issue", "pull"]
                 conditional_required = {
                     name: {
                         condition["if"]["properties"][discriminator]["const"]: set(
