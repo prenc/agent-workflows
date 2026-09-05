@@ -59,6 +59,44 @@ def test_dry_run_lists_only_required_changes(
     assert "Installation complete" not in output
 
 
+@pytest.mark.parametrize(
+    ("xdg_cache_home", "expected_cache"),
+    [
+        ("relative-cache", None),
+        ("", None),
+        ("~/skills-cache", "skills-cache"),
+    ],
+)
+def test_xdg_cache_home_never_yields_relative_checkout(
+    repository: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    xdg_cache_home: str,
+    expected_cache: str | None,
+) -> None:
+    home = tmp_path / "home"
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CACHE_HOME", xdg_cache_home)
+    monkeypatch.chdir(cwd)
+
+    if expected_cache is None:
+        with pytest.raises(ValueError, match="XDG_CACHE_HOME must be an absolute path"):
+            installation.Installer(arguments(), repository)
+        assert list(cwd.iterdir()) == []
+        return
+
+    installer = installation.Installer(arguments(), repository)
+
+    assert installer.cache == home / expected_cache
+    assert installer.cache.is_absolute()
+    installer.plan_polars()
+
+    assert "install the official Polars skill for Codex and Qwen" in installer.changes
+    assert not (cwd / "~").exists()
+
+
 def test_current_runtime_is_omitted_unless_verbose(
     repository: Path,
     monkeypatch: pytest.MonkeyPatch,
