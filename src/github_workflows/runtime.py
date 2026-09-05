@@ -398,18 +398,28 @@ class WorkflowRuntime:
         return actual.lower()
 
     def _discard_stale_run(
-        self, workflow: WorkflowName, *, retained_worktree: Path | None = None
+        self,
+        workflow: WorkflowName,
+        *,
+        retained_worktree: Path | None = None,
+        acknowledged_publication: bool = False,
     ) -> None:
         current = self.current(workflow)
         if not current.is_dir():
             return
         state = workflow_run.load_state(current)
-        if state.get("status") not in workflow_run.RESUMABLE:
-            return
         if workflow == "gh-audit-repo":
             history = state.get("history", {})
-            if isinstance(history, dict) and history.get("publication_pending"):
+            publication_pending = isinstance(history, dict) and history.get("publication_pending")
+            if publication_pending and not acknowledged_publication:
                 raise ValueError("pending publication requires resume")
+            if publication_pending:
+                workflow_run.append_journal(
+                    current,
+                    "publication_discarded",
+                    candidate_id=history.get("candidate_id"),
+                    operation=history.get("operation"),
+                )
             run_id = str(state.get("run_id", ""))
             if SAFE_ID.fullmatch(run_id):
                 staging = self.project_dir / "github" / "staging"
@@ -884,12 +894,17 @@ class WorkflowRuntime:
                 if request.workflow == "gh-audit-repo" and self.current(request.workflow).is_dir():
                     previous = workflow_run.load_state(self.current(request.workflow))
                     history = previous.get("history", {})
-                    if (
-                        previous.get("status") in workflow_run.RESUMABLE
-                        and isinstance(history, dict)
-                        and history.get("publication_pending")
-                    ):
-                        raise ValueError("pending publication requires resume")
+                    if isinstance(history, dict) and history.get("publication_pending"):
+                        if previous.get("status") in workflow_run.RESUMABLE:
+                            raise ValueError("pending publication requires resume")
+                        if not request.acknowledge_pending_publication:
+                            raise ValueError(
+                                "the previous terminal run has pending publication "
+                                f"(candidate {history.get('candidate_id')}, "
+                                f"operation {history.get('operation')}); "
+                                "pass acknowledge_pending_publication to discard the "
+                                "in-flight publication transaction and start a new run"
+                            )
                 inputs = {
                     "repository": request.repository,
                     "inputs": request.invocation(),
@@ -899,6 +914,7 @@ class WorkflowRuntime:
                     self._discard_stale_run(
                         request.workflow,
                         retained_worktree=Path(str(inputs["audit_worktree"])).resolve(),
+                        acknowledged_publication=request.acknowledge_pending_publication,
                     )
                 else:
                     self._discard_stale_run(request.workflow)
@@ -2214,13 +2230,22 @@ class WorkflowRuntime:
                     raise ValueError("pending publication has an unsupported operation")
                 if request.action == "finish" and not request.receipt:
                     raise ValueError("finished publication requires a non-empty receipt")
-                history.update(
-                    {
-                        "publication_pending": request.action == "uncertain",
-                        "outcome": request.action,
-                        "receipt": request.receipt,
-                    }
-                )
+                if request.action == "failed":
+                    history.update(
+                        {
+                            "publication_pending": False,
+                            "outcome": "failed",
+                            "error": request.error,
+                        }
+                    )
+                else:
+                    history.update(
+                        {
+                            "publication_pending": request.action == "uncertain",
+                            "outcome": request.action,
+                            "receipt": request.receipt,
+                        }
+                    )
                 history["operation"] = operation
                 history.pop("mutation", None)
                 if request.action == "finish":

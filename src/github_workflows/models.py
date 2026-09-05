@@ -103,6 +103,7 @@ class RunManageRequest(StrictRequest):
     separate: bool = False
     pending: list[str] = Field(default_factory=list)
     source_confirmed: bool = False
+    acknowledge_pending_publication: bool = False
     note: str | None = None
 
     @field_validator("n", mode="before")
@@ -145,6 +146,7 @@ class RunManageRequest(StrictRequest):
                 "dry_run",
                 "separate",
                 "source_confirmed",
+                "acknowledge_pending_publication",
             }
         elif self.action == "resume":
             allowed = {"n"}
@@ -168,6 +170,7 @@ class RunManageRequest(StrictRequest):
                     "refresh_history",
                     "regression_sweep",
                     "dry_run",
+                    "acknowledge_pending_publication",
                 },
                 "gh-curate-issues": {
                     "targets",
@@ -669,8 +672,14 @@ class PublishUncertainRequest(StrictRequest):
     receipt: dict[str, Any] = Field(default_factory=dict)
 
 
+class PublishFailedRequest(StrictRequest):
+    action: Literal["failed"]
+    candidate_id: str
+    error: str = Field(min_length=1)
+
+
 PublishAction = Annotated[
-    PublishBeginRequest | PublishFinishRequest | PublishUncertainRequest,
+    PublishBeginRequest | PublishFinishRequest | PublishUncertainRequest | PublishFailedRequest,
     Field(discriminator="action"),
 ]
 
