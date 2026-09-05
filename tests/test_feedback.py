@@ -719,6 +719,76 @@ def test_feedback_close_records_requested_disposition_and_note(cache: Path) -> N
     }
 
 
+@pytest.mark.parametrize(
+    ("disposition", "note"),
+    [
+        ("external", None),
+        ("addressed", "Second review note"),
+    ],
+)
+def test_feedback_close_rejects_conflicting_resolution_on_both_surfaces(
+    cache: Path, disposition: str, note: str | None
+) -> None:
+    result = append_feedback(message="Close once, reject conflicting re-closes")
+    feedback.resolve_records(
+        [{"ref": result["ref"], "disposition": "addressed", "note": "First review note"}]
+    )
+    path = feedback.storage_path()
+    stored = path.read_bytes()
+    original_closed_at = feedback.find(str(result["feedback_id"]))["closed_at"]
+
+    # Positional close rejects a conflicting disposition or note.
+    with pytest.raises(ValueError, match="different resolution; reopen it first"):
+        feedback.set_closed([result["ref"]], closed=True, disposition=disposition, note=note)
+    assert path.read_bytes() == stored
+
+    # The CLI positional surface reports the identical shared rule.
+    cli_command = ["feedback", "close", result["ref"], "--disposition", disposition]
+    if note is not None:
+        cli_command.extend(["--note", note])
+    with pytest.raises(ValueError, match="different resolution; reopen it first"):
+        run_feedback(build_parser().parse_args(cli_command))
+    assert path.read_bytes() == stored
+
+    # The --input surface rejects the same mutation with the identical rule.
+    input_item: dict[str, str] = {"ref": result["ref"], "disposition": disposition}
+    if note is not None:
+        input_item["note"] = note
+    with pytest.raises(ValueError, match="different resolution; reopen it first"):
+        feedback.resolve_records([input_item])
+    assert path.read_bytes() == stored
+
+    unchanged = feedback.find(str(result["feedback_id"]))
+    assert unchanged["status"] == "closed"
+    assert unchanged["resolution"] == {
+        "disposition": "addressed",
+        "note": "First review note",
+    }
+    assert unchanged["closed_at"] == original_closed_at
+
+    # Re-closing with the identical resolution remains a no-op and keeps closed_at.
+    assert (
+        feedback.set_closed(
+            [result["ref"]],
+            closed=True,
+            disposition="addressed",
+            note="First review note",
+        )
+        == []
+    )
+    assert feedback.find(str(result["feedback_id"]))["closed_at"] == original_closed_at
+
+    # The documented reopen-first flow recovers the conflicting close.
+    feedback.set_closed([result["ref"]], closed=False)
+    expected_resolution: dict[str, str] = {"disposition": disposition}
+    if note is not None:
+        expected_resolution["note"] = note
+    assert feedback.set_closed(
+        [result["ref"]], closed=True, disposition=disposition, note=note
+    ) == [result["feedback_id"]]
+    assert feedback.find(str(result["feedback_id"]))["resolution"] == expected_resolution
+
+
 def test_feedback_resolve_applies_mixed_dispositions_atomically(cache: Path) -> None:
     first = append_feedback(message="Local correction")
     second = append_feedback(message="Upstream limitation")
