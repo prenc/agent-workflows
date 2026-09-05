@@ -82,14 +82,9 @@ except ImportError as error:  # pragma: no cover - depends on the host Python bu
 
 
 RECORDS_SCHEMA_VERSION = 1
-AUDIT_SCHEMA_VERSION = 1
 RECORDS_DB = "records-v1.sqlite3"
-AUDIT_DB = "audit-history-v1.sqlite3"
 RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 TOKEN_RE = re.compile(r"[A-Za-z0-9_]{2,}")
-OBSERVATION_INPUT_BYTES = 10 * 1024 * 1024
-OBSERVATION_PHASES = {"structure", "discover", "verify"}
-AREA_RE = re.compile(r"area/[a-z0-9][a-z0-9._-]{0,127}")
 
 
 def utc_now() -> dt.datetime:
@@ -176,7 +171,7 @@ def initialize_common(
         "generation": "0",
         "last_sync_at": "",
     }
-    values["snapshot_sha" if kind == "audit-history" else "default_sha"] = ""
+    values["default_sha"] = ""
     connection.executemany(
         "INSERT OR IGNORE INTO metadata(key, value) VALUES (?, ?)", values.items()
     )
@@ -227,70 +222,35 @@ def initialize_records(connection: sqlite3.Connection, repo: str) -> None:
     connection.commit()
 
 
-def initialize_audit(connection: sqlite3.Connection, repo: str) -> None:
-    initialize_common(connection, repo, "audit-history", AUDIT_SCHEMA_VERSION)
-    connection.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS observations (
-            run_id TEXT NOT NULL,
-            profile_sha256 TEXT NOT NULL,
-            repo_sha TEXT NOT NULL,
-            area TEXT NOT NULL,
-            phase TEXT NOT NULL CHECK(phase IN ('structure', 'discover', 'verify')),
-            unit_key TEXT NOT NULL,
-            profile_json TEXT NOT NULL,
-            payload_json TEXT NOT NULL,
-            payload_sha256 TEXT NOT NULL,
-            complete INTEGER NOT NULL CHECK(complete IN (0, 1)),
-            has_gaps INTEGER NOT NULL CHECK(has_gaps IN (0, 1)),
-            created_at TEXT NOT NULL,
-            last_used_at TEXT NOT NULL,
-            PRIMARY KEY(run_id, phase, unit_key)
-        );
-        CREATE INDEX IF NOT EXISTS observations_repo_sha ON observations(repo_sha);
-        CREATE INDEX IF NOT EXISTS observations_area ON observations(area);
-        CREATE INDEX IF NOT EXISTS observations_profile ON observations(profile_sha256);
-        CREATE INDEX IF NOT EXISTS observations_last_used ON observations(last_used_at);
-        """
-    )
-    connection.commit()
-
-
 def validate(connection: sqlite3.Connection, repo: str, kind: str) -> dict[str, Any]:
     if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
         raise ValueError("SQLite integrity check failed")
     meta = metadata(connection)
-    expected_version = RECORDS_SCHEMA_VERSION if kind == "records" else AUDIT_SCHEMA_VERSION
-    if int(meta.get("schema_version", "-1")) != expected_version:
+    if int(meta.get("schema_version", "-1")) != RECORDS_SCHEMA_VERSION:
         raise ValueError("cache schema version is incompatible")
     if meta.get("repository") != normalized_repo(repo):
         raise ValueError("cache repository identity does not match")
-    expected_kind = "records" if kind == "records" else "audit-history"
-    if meta.get("database_kind") != expected_kind:
+    if meta.get("database_kind") != "records":
         raise ValueError("cache database kind does not match")
-    count_query = (
-        "SELECT COUNT(*) FROM records" if kind == "records" else "SELECT COUNT(*) FROM observations"
-    )
-    count = connection.execute(count_query).fetchone()[0]
+    count = connection.execute("SELECT COUNT(*) FROM records").fetchone()[0]
     return {"metadata": meta, "count": count}
 
 
 def live_path(directory: Path, kind: str) -> Path:
-    return directory / (RECORDS_DB if kind == "records" else AUDIT_DB)
+    return directory / RECORDS_DB
 
 
 def prepare_database(args: argparse.Namespace, kind: str) -> None:
     run_id = validated_run_id(args.run_id)
     directory = repo_dir(args.cache_root, args.repo)
     secure_directory(directory)
-    initializer = initialize_records if kind == "records" else initialize_audit
     live = live_path(directory, kind)
     if args.no_cache:
         temporary = Path(tempfile.mkdtemp(prefix=f"qwen-github-{kind}-", dir="/tmp"))
         os.chmod(temporary, 0o700)
         work = temporary / live.name
         with connect(work) as connection:
-            initializer(connection, args.repo)
+            initialize_records(connection, args.repo)
         secure_file(work)
         print(
             json.dumps({"persistent": False, "work_db": str(work), "base_generation": 0}, indent=2)
@@ -320,13 +280,12 @@ def prepare_database(args: argparse.Namespace, kind: str) -> None:
             mode = "recovery"
         else:
             shutil.copy2(live, work)
-            if kind == "records":
-                with connect(work) as connection, connection:
-                    compact_existing_records(connection)
+            with connect(work) as connection, connection:
+                compact_existing_records(connection)
             mode = "reuse"
     if not reuse_live:
         with connect(work) as connection:
-            initializer(connection, args.repo)
+            initialize_records(connection, args.repo)
     secure_file(work)
     print(
         json.dumps(
@@ -359,10 +318,6 @@ def names(value: Any) -> list[str]:
             if isinstance(candidate, str):
                 output.append(candidate)
     return output
-
-
-def json_list(value: Any) -> str:
-    return json.dumps(value if isinstance(value, list) else [], sort_keys=True)
 
 
 def normalize_record(
@@ -606,200 +561,6 @@ def query_records(args: argparse.Namespace) -> None:
         print(rendered, end="")
 
 
-def import_legacy(args: argparse.Namespace) -> None:
-    imported = 0
-    with connect(args.db) as target:
-        validate(target, args.repo, "records")
-        if args.legacy_db and args.legacy_db.exists():
-            with sqlite3.connect(args.legacy_db) as legacy:
-                legacy.row_factory = sqlite3.Row
-                for row in legacy.execute("SELECT * FROM records"):
-                    raw = dict(row)
-                    raw["labels"] = json.loads(raw.pop("labels_json") or "[]")
-                    raw["comments"] = json.loads(raw.pop("comments_json") or "[]")
-                    raw["relationships"] = json.loads(raw.pop("relationships_json") or "{}")
-                    item = normalize_record(
-                        raw,
-                        raw["kind"],
-                        "legacy-curation",
-                        raw.get("fetched_at") or iso_utc(utc_now()),
-                    )
-                    if not raw.get("full_content", 1):
-                        item["hydration"] = "summary"
-                    upsert_record(target, item)
-                    imported += 1
-        target.commit()
-    print(json.dumps({"imported": imported}))
-
-
-def canonical_profile(path: Path) -> tuple[dict[str, Any], str, str]:
-    profile = json.loads(path.read_text())
-    if not isinstance(profile, dict) or not isinstance(profile.get("repo_sha"), str):
-        raise ValueError("profile JSON must be an object containing repo_sha")
-    rendered = json.dumps(profile, sort_keys=True, separators=(",", ":"))
-    return profile, rendered, hashlib.sha256(rendered.encode()).hexdigest()
-
-
-def normalized_observation(value: Any, default_timestamp: str) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise ValueError("each observation must be a JSON object")
-    phase = value.get("phase")
-    area = value.get("area")
-    unit = value.get("unit")
-    payload = value.get("payload")
-    if phase not in OBSERVATION_PHASES:
-        raise ValueError(f"observation phase must be one of {sorted(OBSERVATION_PHASES)}")
-    if not isinstance(area, str) or not AREA_RE.fullmatch(area):
-        raise ValueError("observation area must use area/<slug>")
-    if not isinstance(unit, str) or not unit.strip():
-        raise ValueError("observation unit must be a non-empty string")
-    if not isinstance(payload, dict):
-        raise ValueError("observation payload must be a JSON object")
-    complete = value.get("complete", False)
-    has_gaps = value.get("has_gaps", False)
-    if not isinstance(complete, bool) or not isinstance(has_gaps, bool):
-        raise ValueError("observation complete and has_gaps values must be booleans")
-    timestamp = value.get("timestamp", default_timestamp)
-    if not isinstance(timestamp, str) or parse_time(timestamp) is None:
-        raise ValueError("observation timestamp must be an ISO-8601 string")
-    return {
-        "phase": phase,
-        "area": area,
-        "unit": unit,
-        "payload": payload,
-        "complete": complete,
-        "has_gaps": has_gaps,
-        "timestamp": timestamp,
-    }
-
-
-def write_observations(
-    connection: sqlite3.Connection,
-    run_id: str,
-    profile: dict[str, Any],
-    rendered_profile: str,
-    profile_hash: str,
-    observations: list[dict[str, Any]],
-) -> tuple[int, int]:
-    keys = [(item["phase"], item["unit"]) for item in observations]
-    if len(keys) != len(set(keys)):
-        raise ValueError("observation batch contains duplicate phase/unit keys")
-    existing = {
-        (row["phase"], row["unit_key"])
-        for row in connection.execute(
-            "SELECT phase, unit_key FROM observations WHERE run_id=?",
-            (run_id,),
-        )
-    }
-    for item in observations:
-        rendered_payload = json.dumps(item["payload"], sort_keys=True, separators=(",", ":"))
-        connection.execute(
-            "INSERT INTO observations(run_id, profile_sha256, repo_sha, area, phase, unit_key, profile_json, payload_json, "
-            "payload_sha256, complete, has_gaps, created_at, last_used_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(run_id, phase, unit_key) DO UPDATE SET profile_sha256=excluded.profile_sha256, "
-            "repo_sha=excluded.repo_sha, area=excluded.area, profile_json=excluded.profile_json, payload_json=excluded.payload_json, "
-            "payload_sha256=excluded.payload_sha256, complete=excluded.complete, has_gaps=excluded.has_gaps, "
-            "created_at=excluded.created_at, last_used_at=excluded.last_used_at",
-            (
-                run_id,
-                profile_hash,
-                profile["repo_sha"],
-                item["area"],
-                item["phase"],
-                item["unit"],
-                rendered_profile,
-                rendered_payload,
-                hashlib.sha256(rendered_payload.encode()).hexdigest(),
-                int(item["complete"]),
-                int(item["has_gaps"]),
-                item["timestamp"],
-                item["timestamp"],
-            ),
-        )
-    updated = sum(key in existing for key in keys)
-    return len(keys) - updated, updated
-
-
-def put_observations(args: argparse.Namespace) -> None:
-    if args.input.stat().st_size > OBSERVATION_INPUT_BYTES:
-        raise ValueError(f"observation input exceeds {OBSERVATION_INPUT_BYTES} bytes")
-    raw = json.loads(args.input.read_text())
-    if not isinstance(raw, list) or not raw:
-        raise ValueError("observation input must be a non-empty JSON array")
-    now = args.timestamp or iso_utc(utc_now())
-    observations = [normalized_observation(value, now) for value in raw]
-    run_id = validated_run_id(args.run_id)
-    profile, rendered_profile, profile_hash = canonical_profile(args.profile)
-    with connect(args.db) as connection:
-        validate(connection, args.repo, "audit")
-        inserted, updated = write_observations(
-            connection, run_id, profile, rendered_profile, profile_hash, observations
-        )
-        connection.commit()
-    print(
-        json.dumps(
-            {
-                "profile_sha256": profile_hash,
-                "inserted": inserted,
-                "updated": updated,
-                "observations": [
-                    {"area": item["area"], "phase": item["phase"], "unit": item["unit"]}
-                    for item in observations
-                ],
-            }
-        )
-    )
-
-
-def query_observations(args: argparse.Namespace) -> None:
-    clauses: list[str] = []
-    parameters: list[Any] = []
-    if args.area and not AREA_RE.fullmatch(args.area):
-        raise ValueError("observation area must use area/<slug>")
-    if args.run_id:
-        clauses.append("run_id=?")
-        parameters.append(validated_run_id(args.run_id))
-    if args.repo_sha:
-        clauses.append("repo_sha=?")
-        parameters.append(args.repo_sha)
-    if args.area:
-        clauses.append("area=?")
-        parameters.append(args.area)
-    if args.phase:
-        clauses.append("phase=?")
-        parameters.append(args.phase)
-    if args.unit:
-        clauses.append("unit_key=?")
-        parameters.append(args.unit)
-    sql = "SELECT * FROM observations"
-    if clauses:
-        sql += " WHERE " + " AND ".join(clauses)
-    sql += " ORDER BY created_at DESC, run_id, phase, unit_key"
-    if args.limit:
-        sql += " LIMIT ?"
-        parameters.append(args.limit)
-    with connect(args.db) as connection:
-        validate(connection, args.repo, "audit")
-        rows: list[dict[str, Any]] = []
-        touched: list[tuple[str, str, str]] = []
-        for row in connection.execute(sql, parameters):
-            item = dict(row)
-            touched.append((item["run_id"], item["phase"], item["unit_key"]))
-            item["payload"] = json.loads(item.pop("payload_json"))
-            item["complete"] = bool(item["complete"])
-            item["has_gaps"] = bool(item["has_gaps"])
-            item.pop("profile_json", None)
-            rows.append(item)
-        timestamp = iso_utc(utc_now())
-        connection.executemany(
-            "UPDATE observations SET last_used_at=? WHERE run_id=? AND phase=? AND unit_key=?",
-            [(timestamp, *key) for key in touched],
-        )
-        connection.commit()
-    print(json.dumps({"observations": rows}, indent=2))
-
-
 def runtime_info(args: argparse.Namespace) -> None:
     print(
         json.dumps(
@@ -813,32 +574,6 @@ def runtime_info(args: argparse.Namespace) -> None:
             sort_keys=True,
         )
     )
-
-
-def prune_audit(
-    connection: sqlite3.Connection, keep_shas: int, retention_days: int, now: dt.datetime
-) -> int:
-    newest = {
-        row["repo_sha"]
-        for row in connection.execute(
-            "SELECT repo_sha, MAX(created_at) AS newest FROM observations GROUP BY repo_sha ORDER BY newest DESC LIMIT ?",
-            (keep_shas,),
-        )
-    }
-    cutoff = now - dt.timedelta(days=retention_days)
-    removed = 0
-    for row in connection.execute(
-        "SELECT run_id, phase, unit_key, repo_sha, last_used_at FROM observations"
-    ):
-        used = parse_time(row["last_used_at"])
-        if row["repo_sha"] in newest or (used is not None and used >= cutoff):
-            continue
-        connection.execute(
-            "DELETE FROM observations WHERE run_id=? AND phase=? AND unit_key=?",
-            (row["run_id"], row["phase"], row["unit_key"]),
-        )
-        removed += 1
-    return removed
 
 
 def commit_database(args: argparse.Namespace, kind: str) -> None:
@@ -864,17 +599,12 @@ def commit_database(args: argparse.Namespace, kind: str) -> None:
         with connect(work) as connection:
             validate(connection, args.repo, kind)
             removed = 0
-            if kind == "audit":
-                removed = prune_audit(connection, args.keep_shas, args.retention_days, utc_now())
             updates = {
                 "generation": str(live_generation + 1),
                 "last_sync_at": args.synced_at,
             }
-            updates["snapshot_sha" if kind == "audit" else "default_sha"] = (
-                args.repo_sha if kind == "audit" else args.default_sha
-            )
-            if kind == "records":
-                updates["full_history_complete"] = "true" if args.full_history_complete else "false"
+            updates["default_sha"] = args.default_sha
+            updates["full_history_complete"] = "true" if args.full_history_complete else "false"
             connection.executemany(
                 "INSERT INTO metadata(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 updates.items(),
@@ -943,13 +673,8 @@ def add_commit(
     command.add_argument("--db", type=Path, required=True)
     command.add_argument("--base-generation", type=int, required=True)
     command.add_argument("--synced-at", required=True)
-    if kind == "records":
-        command.add_argument("--default-sha", required=True)
-        command.add_argument("--full-history-complete", action="store_true")
-    else:
-        command.add_argument("--repo-sha", required=True)
-        command.add_argument("--keep-shas", type=int, default=5)
-        command.add_argument("--retention-days", type=int, default=90)
+    command.add_argument("--default-sha", required=True)
+    command.add_argument("--full-history-complete", action="store_true")
     command.set_defaults(handler=lambda args: commit_database(args, kind))
 
 
