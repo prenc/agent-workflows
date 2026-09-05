@@ -122,6 +122,23 @@ status labels. Preserve unrelated labels after the canonical labels. GitHub's
 UI may render labels in a different order; workflows control only their request
 and report order.
 
+### Pull request taxonomy
+
+An implementation pull request carries the useful canonical taxonomy of the
+issues it currently covers. Include each distinct justified `area/*` and type
+label from those issues; unlike an issue, a PR may therefore have multiple area
+or type labels. Include exactly one priority label: the highest priority among
+the covered issues, ordered `high` over `medium` over `low`. Recompute that
+priority whenever issue coverage changes, and remove lower canonical priority
+labels from the PR.
+
+There is no fixed maximum label count, but labels must remain discriminating.
+Do not add every repository label, labels inferred only from nearby code, or
+duplicate concepts merely for completeness. Preserve genuinely unrelated
+labels already on the PR unless current evidence makes them incompatible. PR
+status labels follow their separate lifecycle and do not count as taxonomy
+labels.
+
 Pull requests use the issue-label API. With the GitHub MCP tools, read the
 current PR labels through `issue_read` method `get_labels`, then call
 `issue_write` method `update` with the PR number in `issue_number` and the
@@ -132,9 +149,11 @@ is the PR-label assignment interface.
 
 ## Label responsibility
 
-- The issue-curation workflow owns correction of canonical label definitions
-  and existing open-issue taxonomy and semantic status labels, including
-  evidence-backed `partial`. It never mutates `in-progress`.
+- The issue-curation workflow owns correction of canonical label definitions,
+  existing open-issue taxonomy and semantic status labels, and taxonomy labels
+  on pull requests linked to inspected issues. It derives PR taxonomy from all
+  covered issues, not merely the issue that caused the PR to be inspected. It
+  never mutates `in-progress`.
 - The `gh-audit-repo` workflow may create a missing canonical label required by
   a verified finding and may directly refine a matching open issue only when it
   has neither `in-progress` nor `partial`. It does not repair existing label
@@ -152,8 +171,9 @@ is the PR-label assignment interface.
   `in-progress` for its run and must release only its own claims. From verified
   implementation evidence it may maintain issue `partial` and PR
   `ready-to-merge`, including an unlinked PR whose objective and changes are
-  independently justified. Issue implementation and issue pickup may
-  mutate only the workflow-owned `in-progress` and `partial` states. Qwen issue implementation
+  independently justified. Issue implementation and issue pickup may also
+  reconcile their implementation PR's derived taxonomy while maintaining the
+  workflow-owned `in-progress` and `partial` states. Qwen issue implementation
   may remove `ready-to-merge` only when explicitly resuming changes and then
   applies PR `in-progress`. Codex issue pickup additionally owns applying and
   removing PR `ready-to-merge`. These workflows may create their owned exact

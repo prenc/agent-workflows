@@ -1398,6 +1398,30 @@ class TestExtensionMcp:
             term in issue_conventions
             for term in ("`issue_write`", "`issue_number`", "`get_labels`", "complete desired")
         )
+        assert "### Pull request taxonomy" in issue_conventions
+        assert re.search(r"multiple area\s+or type labels", issue_conventions)
+        assert "exactly one priority label" in issue_conventions
+        priority_positions = [
+            issue_conventions.index(f"`{name}`", 4000) for name in ("high", "medium", "low")
+        ]
+        assert priority_positions == sorted(priority_positions)
+        assert "no fixed maximum label count" in issue_conventions.lower()
+
+    def test_workflows_consistently_handle_derived_pr_taxonomy(self) -> None:
+        documents = {
+            "curator": EXTENSION / "skills/gh-curate-issues/SKILL.md",
+            "curator worker": EXTENSION / "agents/gh-curate-issues-worker.md",
+            "implementation": EXTENSION / "skills/gh-implement-issue/SKILL.md",
+            "pickup": ROOT / "codex/skills/gh-pickup-work/SKILL.md",
+            "reassessment": ROOT / "codex/skills/gh-reassess-work/SKILL.md",
+        }
+
+        for name, path in documents.items():
+            content = path.read_text(encoding="utf-8")
+            assert "highest" in content, name
+            assert "area" in content, name
+            assert "type" in content, name
+            assert "priority" in content, name
 
     def test_implementation_guidance_requires_evidence_based_validation_and_drafts(self) -> None:
         supervisor = (EXTENSION / "skills/gh-implement-issue/SKILL.md").read_text(encoding="utf-8")

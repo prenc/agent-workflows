@@ -89,11 +89,16 @@ Prepare the report from the curator's full point of view:
    bundle in full through MCP. Compare root cause, affected symbols as
    issue-record claims, failure mode, desired outcome, and required outcomes.
 3. Identify whether an open, closed, or merged PR covers all or part of the
-   accepted issue scope. Cite PR number, state, head/base, and immutable SHA
-   evidence available from GitHub records.
+   accepted issue scope. Cite PR number, state, head/base, immutable SHA,
+   current labels, and every issue that PR covers from the available GitHub
+   records.
 4. Assess exactly one canonical area, type, and priority plus evidence-backed
    semantic statuses. Preserve unrelated labels. Treat `in-progress` and
    `partial` as locks for text revision, splitting, and closure.
+   For every linked PR, propose the union of justified area and type labels
+   across all covered issues and exactly one priority—the highest of those
+   issues. Preserve unrelated and implementation-owned status labels; avoid
+   speculative or redundant labels.
 5. Assess the canonical title and body structure: Problem, optional Example,
    Evidence, Required outcome, and optional Scope boundaries. Provide a complete replacement
    title and body whenever normalization is warranted and the issue is
@@ -124,6 +129,7 @@ Snapshot: <updated_at, state, default-branch SHA, relevant immutable SHAs>
 Evidence source: worker-live-mcp
 Lock: unlocked | in-progress | partial | both
 Current relationships: <duplicates, related issues, and PR coverage>
+PR taxonomy: none | unchanged | <PR number, complete covered-issue set, exact add/remove proposal>
 Evidence: <records read and the facts they establish>
 Documentation research: <MCP queries and public URLs used, or none>
 Taxonomy: unchanged | <exact area/type/priority and status proposal>

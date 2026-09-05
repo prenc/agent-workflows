@@ -53,9 +53,14 @@ reviewed-execution boundary.
 - Verify the complete inherited diff and every issue's accepted scope
   independently, using Qwen markers and prior validation as supporting
   evidence.
-- Validate area/type/priority labels and report drift without normalizing them.
-  Maintain only `in-progress`, `partial`, and PR-only `ready-to-merge` under the
-  shared convention. Construct/report labels as area, type, priority, status.
+- Validate issue area/type/priority labels and report drift without normalizing
+  them. Reconcile the one implementation PR to every distinct justified area
+  and type label from its covered issues and exactly one priority label—the
+  highest among them (`high` over `medium` over `low`). Preserve unrelated
+  labels; omit speculative, adjacent, and redundant labels rather than treating
+  the absence of a numeric limit as a reason to over-label. Maintain
+  `in-progress`, `partial`, and PR-only `ready-to-merge` under the shared
+  convention. Construct/report labels as area, type, priority, status.
 - Never merge, close/reopen issues, apply terminal status labels, approve a
   review, mutate unrelated metadata, or expand into nearby cleanup.
 - Never access secrets or confidential data. Preserve scientific and research
@@ -323,7 +328,9 @@ line and default-branch target. Correct the PR body once when linkage is
 missing; a remaining failure blocks final publication.
 
 Confirm through MCP that the PR points to the pushed SHA. Never query CI or
-status rollups. A usable incomplete handoff stays draft: apply `partial` to the
+status rollups. Before publication, read the PR labels through the issue-label
+API, reconcile the derived taxonomy from the complete covered-issue set, and
+read it back. A usable incomplete handoff stays draft: apply `partial` to the
 PR and each issue whose accepted scope has usable pushed but incomplete work,
 and retain unchecked coverage in the PR body. Do not split the unit during
 publication.

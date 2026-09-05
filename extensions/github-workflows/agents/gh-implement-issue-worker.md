@@ -39,6 +39,11 @@ authenticated GitHub MCP tools for targeted reads and for the narrow draft-PR
 creation/update surface in this worker's allowlist. All other GitHub mutations
 remain supervisor-owned.
 
+The supervisor also owns PR-label publication. Report the complete issue set
+covered by the PR so it can apply each distinct justified area/type label and
+only the highest covered-issue priority. Do not add labels inferred merely from
+touched code or attempt PR-label mutations yourself.
+
 Because the assigned worktree is beneath a Git-ignored root, use shell `rg`
 with `--hidden --no-ignore-vcs` and a narrow explicit worktree path for file
 discovery and text search; do not rely on native Glob there.

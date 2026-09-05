@@ -216,7 +216,7 @@ boundaries. Apply focus as a question, not an assumed defect. Return:
 - coverage performed and any gap;
 - rejected leads with reasons;
 - for each new or update-existing candidate: disposition and matching issue
-  number/current labels when applicable, concise title, area/type/priority, confidence,
+  number/current labels and linked-PR labels when applicable, concise title, area/type/priority, confidence,
   root cause and impact, exact repository-relative evidence paths/symbols (never absolute
   host, worktree, home, temporary, or workflow-state paths), required outcomes,
   duplicate records examined,

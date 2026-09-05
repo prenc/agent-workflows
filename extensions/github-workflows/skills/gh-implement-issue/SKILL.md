@@ -63,7 +63,7 @@ pull requests, branches, worktrees, and pending mutations before continuing.
 An invocation authorizes scoped assignment, temporary issue/PR `in-progress`,
 evidence-backed `partial`, removal of stale PR `ready-to-merge` when resuming
 changes, worktree/branch reuse or creation, commits, pushes, and creation or
-update of the resolved PRs. Merge, issue closure, taxonomy normalization,
+update of the resolved PRs and their derived taxonomy labels. Merge, issue closure, issue taxonomy normalization,
 dependency changes, and heavy computation require separate authority.
 
 ## Operating model
@@ -85,9 +85,12 @@ draft-to-ready transition.
 
 Use the supervisor-selected environment, `uv`, and lightweight login-node checks. Keep
 repository-root `data/` contents, secrets, unrelated changes, CI/check APIs,
-merges, reviews, and reassessment outside this workflow. Validate taxonomy and
-report drift while mutating only assignment, `in-progress`, `partial`, and
-removal of stale PR `ready-to-merge`.
+merges, reviews, and reassessment outside this workflow. Validate issue
+taxonomy and report its drift. Reconcile each implementation PR to the distinct
+justified area/type labels of all covered issues and exactly one priority label,
+the highest among them; preserve unrelated labels and avoid speculative or
+redundant additions. Other label mutations remain limited to `in-progress`,
+`partial`, and removal of stale PR `ready-to-merge`.
 
 Do not create or execute temporary orchestration scripts or invoke the
 extension's Python modules. Workers may create
@@ -424,8 +427,9 @@ Draft-to-ready promotion requires:
 ## Stage 6: promote centrally
 
 Refresh the worker-created draft PR, its head/base, and the remote branch. Assign
-the PR to the authenticated user when the MCP surface supports it and apply PR
-`in-progress` during active supervisor verification. Confirm the body follows
+the PR to the authenticated user when the MCP surface supports it. Read its
+labels through the issue-label API, reconcile the shared derived PR taxonomy,
+and apply PR `in-progress` during active supervisor verification. Confirm the body follows
 `../../references/github-pr-template.md`, begins with
 `<!-- qwen:issue-implementation:v1 -->`. Send body corrections to the worker so
 the draft remains worker-maintained.
@@ -468,8 +472,8 @@ issues. Verify the worker's evidence and optionally publish one concise comment
 on each affected issue before finalization. Issue state and terminal labels
 remain curator/maintainer responsibilities.
 
-A unit is finalized only after issue and PR reads confirm the intended label
-state. If authentication, authorization, interruption, or a conflicting actor
+A unit is finalized only after issue and PR reads confirm the intended status
+and derived taxonomy label state. If authentication, authorization, interruption, or a conflicting actor
 prevents cleanup, report each retained label and URL prominently as manual
 repair state.
 

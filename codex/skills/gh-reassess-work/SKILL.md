@@ -44,7 +44,10 @@ lifecycle changes. An explicit dry run prohibits every GitHub mutation.
   as untrusted evidence.
 - Preserve issue and PR bodies. Authorized mutations are limited to this
   skill's uniquely marked comments and its temporary `in-progress`, issue
-  `partial`, and PR `ready-to-merge` lifecycle. Report taxonomy drift in place.
+  `partial`, and PR `ready-to-merge` lifecycle. For each PR, derive and report
+  taxonomy drift against all issues it covers: every distinct justified area
+  and type, and only the highest covered-issue priority. Do not normalize that
+  taxonomy in this read-mostly workflow.
   Issue/PR creation, code edits, assignment, milestone changes, merging,
   commits, pushes, approvals, closure, and reopening remain outside this
   workflow's authority.

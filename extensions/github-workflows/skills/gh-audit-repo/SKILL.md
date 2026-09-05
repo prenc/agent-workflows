@@ -288,6 +288,9 @@ publication. Treat abandoned staging files as non-blocking artifacts.
 
 Using paginated MCP list tools, maintain a compact inventory containing number,
 URL, title, labels, state, assignees, timestamps, and relevant pull-request refs.
+When a pull request is relevant to a finding or existing issue, inspect its
+labels and report drift from the shared covered-issue taxonomy without mutating
+the PR.
 Bulk list calls must omit bodies, comments, commits, relationships, and other detail
 collections. The history tool derives a rough summary from title and labels and
 discards detail fields even when a provider returns them. Use `history_query` for
