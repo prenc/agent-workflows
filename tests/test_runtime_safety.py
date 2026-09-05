@@ -1739,11 +1739,57 @@ class TestRuntimeSafety:
                 is False
             )
             assert runtime.state("gh-audit-repo")["shards"]["shard-core"]["status"] == "partial"
-            with pytest.raises(ValueError, match="task-owned"):
+            with pytest.raises(ValueError, match="shard paths does not match"):
                 runtime.audit_record(
                     AuditRecordRequest(
                         action="shard",
-                        shard={"id": "shard-core", "status": "complete"},
+                        shard={"id": "shard-core", "status": "skipped", "paths": []},
+                    )
+                )
+            runtime.audit_record(
+                AuditRecordRequest(
+                    action="shard",
+                    shard={"id": "shard-core", "status": "complete"},
+                )
+            )
+            shard = runtime.state("gh-audit-repo")["shards"]["shard-core"]
+            assert shard["status"] == "complete"
+            assert shard["area"] == "area/shared-core"
+            assert shard["paths"] == ["src/core.py"]
+
+    def test_shard_record_does_not_clobber_owned_shard_assignment(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-shard-record-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    task={
+                        "logical_id": "discover-core",
+                        "assignment": {
+                            "mode": "discover",
+                            "shard_id": "shard-core",
+                            "area": "area/shared-core",
+                            "paths": ["src/core.py", "src/core2.py"],
+                        },
+                    },
+                )
+            )
+            runtime.audit_record(
+                AuditRecordRequest(
+                    action="shard",
+                    shard={"id": "shard-core", "status": "running"},
+                )
+            )
+            shard = runtime.state("gh-audit-repo")["shards"]["shard-core"]
+            assert shard["area"] == "area/shared-core"
+            assert shard["paths"] == ["src/core.py", "src/core2.py"]
+            assert shard["status"] == "running"
+            with pytest.raises(ValueError, match="shard paths does not match"):
+                runtime.audit_record(
+                    AuditRecordRequest(
+                        action="shard",
+                        shard={"id": "shard-core", "status": "failed", "paths": ["src/core.py"]},
                     )
                 )
 
