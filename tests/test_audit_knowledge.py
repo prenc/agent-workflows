@@ -150,3 +150,14 @@ class TestAuditKnowledge:
             check=False,
         )
         assert failed.returncode == 2
+
+    def test_missing_or_non_string_area_identifier_is_rejected(self) -> None:
+        for areas in (
+            [{}],
+            [{"area": 5, "description": "Core behavior.", "paths": ["src/core"]}],
+        ):
+            self.areas.write_text(json.dumps({"areas": areas}))
+            failed = self.call(
+                "reconcile", "--areas", str(self.areas), "--repo-sha", "sha1", check=False
+            )
+            assert failed.returncode == 2
