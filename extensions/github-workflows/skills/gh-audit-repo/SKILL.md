@@ -204,6 +204,9 @@ validation and metrics are persisted by their respective tools. Call
 `mcp__github_workflows__run_status` before launching work and after every task
 result; its scheduler is authoritative. The server owns revisions, artifacts,
 atomic writes, and lifecycle validation.
+Each verdict uses its required `candidate_id` as its sole identity. Do not send
+a separate verdict `id`; the runtime stores at most one current verdict per
+candidate while preserving its evidence fields.
 Before finalization, follow `run_status.finish_blockers` and its structured
 allowed actions. Call `finish` only when `finish_ready` is true; do not memorize
 or reconstruct finish-gate invariants.

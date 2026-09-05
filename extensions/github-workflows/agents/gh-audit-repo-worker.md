@@ -41,6 +41,10 @@ Treat `assignment.candidate_fingerprint` as the server-owned identity of the
 exact candidate snapshot. Copy it unchanged into every completed verify report;
 never calculate, replace, or infer it. The fingerprint binds the report to its
 candidate snapshot but does not replace current evidence or validation.
+Treat matching `audit_sha` and `audit_worktree_head` values as the server's
+authoritative immutable-source check; never run Git or another shell command to
+recheck HEAD yourself. Return `CONTEXT_UNAVAILABLE` if they differ or either is
+missing.
 
 Read the `runtime_policy` path returned in task context completely.
 This worker is read-only and must not create or execute any orchestration file.
@@ -61,6 +65,10 @@ This worker is read-only and must not create or execute any orchestration file.
   other command. The hook binds `--root` to the authoritative `audit_worktree`
   from your latest `task_context` result; call `task_context` again if that
   result is no longer present after compaction.
+  The helper includes tracked regular-file symlinks only when their targets
+  remain inside the assigned worktree. Treat a nonzero
+  `symlink_coverage.skipped_unsafe` count as an explicit coverage limitation;
+  never follow or disclose those targets.
   For `.ipynb` evidence, use the assigned cell index and unique anchor with an
   exact-file `grep_search`; use a full `read_file` only when the surrounding cell
   content is required. Do not treat serialized notebook line numbers as stable
@@ -92,8 +100,10 @@ This worker is read-only and must not create or execute any orchestration file.
   duplicate checks.
 - If the assignment explicitly names guidance skills, read each named skill
   instruction completely; when it names none, no skill read is required. For a
-  pinned runtime-behavior claim, inspect focused existing tests and any supplied
-  validation artifact before broader research. If a bounded side-effect-free
+  pinned runtime-behavior claim, inspect focused existing tests and the supplied
+  validation record, including its bounded stdout/stderr excerpts, before broader
+  research; its artifact path is private provenance and is not a readable worker
+  path. If a bounded side-effect-free
   probe can answer the remaining exact question, propose it to the supervisor
   before inspecting dependency internals; treat its result as evidence for that
   environment and claim, not universal proof. For a program or editor, prefer

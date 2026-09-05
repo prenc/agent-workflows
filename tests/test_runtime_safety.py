@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -113,6 +114,7 @@ class TestRuntimeSafety:
             readonly_search = Path(context["references"]["readonly_search"])
             assert readonly_search.name == "readonly-search.py"
             assert readonly_search.is_file()
+            assert context["audit_worktree_head"] == context["audit_sha"]
 
             assert context["validation"] == {
                 "candidate_id": "candidate-timeout",
@@ -124,6 +126,13 @@ class TestRuntimeSafety:
                         "candidate_id": "candidate-timeout",
                         "status": "timed-out",
                         "artifact": "validation/probe-timeout/result.json",
+                        "returncode": -15,
+                        "timed_out": True,
+                        "worktree_unchanged": True,
+                        "stdout_excerpt": "partial output",
+                        "stderr_excerpt": "",
+                        "stdout_truncated": False,
+                        "stderr_truncated": False,
                     }
                 ],
             }
@@ -142,19 +151,216 @@ class TestRuntimeSafety:
     ) -> None:
         assert WorkflowRuntime._probe_validation_status(result) == expected
 
+    def test_audit_task_context_rejects_worktree_head_drift(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-head-drift-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.history_manage(HistoryManageRequest(action="prepare"))
+            runtime.history_manage(
+                HistoryManageRequest(action="commit", full_history_complete=True)
+            )
+            planned = runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    task={"logical_id": "discover-head", "assignment": {"mode": "discover"}},
+                )
+            )
+            subprocess.run(
+                ["git", "commit", "--allow-empty", "-q", "-m", "Drift"],
+                cwd=runtime.workspace,
+                check=True,
+            )
+
+            with pytest.raises(ValueError, match="HEAD no longer matches audit SHA"):
+                runtime.task_context(planned["task_ref"])
+
+        failed = subprocess.CompletedProcess([], 128, stdout="", stderr="missing")
+        with mock.patch("github_workflows.runtime.subprocess.run", return_value=failed):
+            with pytest.raises(ValueError, match="HEAD could not be verified"):
+                WorkflowRuntime._verified_audit_worktree_head(
+                    {"audit_worktree": "/missing", "sha": "a" * 40}
+                )
+
+    def test_verify_context_persists_bounded_probe_evidence(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-probe-context-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.history_manage(HistoryManageRequest(action="prepare"))
+            runtime.history_manage(
+                HistoryManageRequest(action="commit", full_history_complete=True)
+            )
+            runtime.audit_record(
+                AuditRecordRequest(
+                    action="candidate",
+                    candidate={"id": "candidate-output", "status": "discovered"},
+                )
+            )
+
+            def completed(args: Any) -> int:
+                artifact_dir = args.run_dir / "validation" / args.probe_id
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                artifact = {
+                    "probe_id": args.probe_id,
+                    "returncode": 0,
+                    "timed_out": False,
+                    "worktree_unchanged": True,
+                    "stdout_excerpt": "x" * 3000,
+                    "stderr_excerpt": "y" * 3000,
+                }
+                (artifact_dir / "result.json").write_text(json.dumps(artifact))
+                print(json.dumps({"returncode": 0, "timed_out": False}))
+                return 0
+
+            with mock.patch(
+                "github_workflows.runtime.audit_probe.run_probe", side_effect=completed
+            ):
+                receipt = runtime.audit_probe(
+                    ProbeRequest(
+                        kind="python",
+                        probe_id="probe-output",
+                        candidate_id="candidate-output",
+                        code="pass",
+                    )
+                )
+            planned = runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    task={
+                        "logical_id": "verify-output",
+                        "assignment": {
+                            "mode": "verify",
+                            "candidate": {"id": "candidate-output"},
+                        },
+                    },
+                )
+            )
+
+            record = runtime.task_context(planned["task_ref"])["validation"]["records"][0]
+
+            assert len(receipt["stdout_excerpt"]) == 3000
+            assert len(record["stdout_excerpt"]) == 2048
+            assert len(record["stderr_excerpt"]) == 2048
+            assert record["stdout_truncated"] is True
+            assert record["stderr_truncated"] is True
+
+    def test_verdict_uses_candidate_id_as_its_only_identity(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-verdict-identity-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.audit_record(
+                AuditRecordRequest(
+                    action="candidate",
+                    candidate={"id": "candidate-verdict", "status": "verification-pending"},
+                )
+            )
+
+            created = runtime.audit_record(
+                AuditRecordRequest(
+                    action="verdict",
+                    verdict={"candidate_id": "candidate-verdict", "conclusion": "confirmed"},
+                )
+            )
+
+            assert created["operation"] == "created"
+            assert runtime.state("gh-audit-repo")["verdicts"] == {
+                "candidate-verdict": {
+                    "candidate_id": "candidate-verdict",
+                    "conclusion": "confirmed",
+                }
+            }
+            updated = runtime.audit_record(
+                AuditRecordRequest(
+                    action="verdict",
+                    verdict={"candidate_id": "candidate-verdict", "conclusion": "rejected"},
+                )
+            )
+            assert updated["operation"] == "updated"
+            assert (
+                runtime.state("gh-audit-repo")["verdicts"]["candidate-verdict"]["conclusion"]
+                == "rejected"
+            )
+            with pytest.raises(ValidationError, match="id is not accepted"):
+                AuditRecordRequest.model_validate(
+                    {
+                        "action": "verdict",
+                        "verdict": {"id": "legacy", "candidate_id": "candidate-verdict"},
+                    }
+                )
+            with pytest.raises(ValueError, match="unknown candidate"):
+                runtime.audit_record(
+                    AuditRecordRequest(
+                        action="verdict",
+                        verdict={"candidate_id": "missing"},
+                    )
+                )
+
+    def test_verdict_migration_is_reported_as_an_update(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-verdict-migration-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.audit_record(
+                AuditRecordRequest(
+                    action="candidate",
+                    candidate={"id": "candidate-verdict", "status": "verification-pending"},
+                )
+            )
+            state = runtime.state("gh-audit-repo")
+            state["verdicts"] = {
+                "legacy-verdict": {
+                    "id": "legacy-verdict",
+                    "candidate_id": "candidate-verdict",
+                    "conclusion": "rejected",
+                }
+            }
+            workflow_run.write_state(runtime.current("gh-audit-repo"), state)
+
+            result = runtime.audit_record(
+                AuditRecordRequest(
+                    action="verdict",
+                    verdict={"candidate_id": "candidate-verdict", "conclusion": "confirmed"},
+                )
+            )
+
+            assert result["operation"] == "updated"
+            assert runtime.state("gh-audit-repo")["verdicts"] == {
+                "candidate-verdict": {
+                    "candidate_id": "candidate-verdict",
+                    "conclusion": "confirmed",
+                }
+            }
+
     def make_runtime(self, root: Path) -> WorkflowRuntime:
         workspace = root / "repo"
         workspace.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=workspace, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.invalid"],
+            cwd=workspace,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "commit", "--allow-empty", "-q", "-m", "Initial"],
+            cwd=workspace,
+            check=True,
+        )
         return WorkflowRuntime(workspace, root / "qwen-project")
 
     def initialize_audit(self, runtime: WorkflowRuntime) -> None:
+        sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=runtime.workspace,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
         inputs = {
             "repository": "example/repo",
             "inputs": {"n": 1},
             "audit_worktree": str(runtime.workspace),
             "primary_worktree": str(runtime.workspace),
             "branch": "main",
-            "sha": "a" * 40,
+            "sha": sha,
             "source_confirmed": True,
             "confirmation_required": False,
             "excluded_dirty_state": {"dirty": False},
@@ -1178,7 +1384,7 @@ class TestRuntimeSafety:
                 "record_count": 3,
                 "complete": True,
             }
-            assert context["history"]["selection"]["record_count"] == 2
+            assert context["history"]["selection"]["record_count"] == 3
             assert context["history"]["selection"]["has_more"] is False
             assert [
                 (record["kind"], record["number"], record["title"])
@@ -1186,6 +1392,7 @@ class TestRuntimeSafety:
             ] == [
                 ("issue", 2, "Earlier parser defect"),
                 ("issue", 1, "Shared core cache grows"),
+                ("pull", 3, "Unrelated documentation"),
             ]
 
     def test_audit_task_context_reports_an_exact_history_window(self) -> None:

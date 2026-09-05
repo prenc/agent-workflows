@@ -7,13 +7,13 @@ import re
 from copy import deepcopy
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver.context import Context
 from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 from mcp.types import ToolAnnotations
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 
 from . import feedback
 from .models import (
@@ -49,6 +49,15 @@ APPEND_WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempo
 CONTROL_WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True)
 LOGGER = logging.getLogger(__name__)
 SDK_PREFIX = re.compile(r"^Error executing tool [^:]+:\s*")
+
+type JsonObjectArgument[T] = Annotated[
+    T,
+    Field(description="Send a JSON object value; do not JSON-encode it as a string."),
+]
+type JsonArrayArgument[T] = Annotated[
+    T,
+    Field(description="Send a JSON array value; do not JSON-encode it as a string."),
+]
 
 ACTION_REQUIREMENTS: dict[str, tuple[str, dict[str, tuple[str, ...]]]] = {
     "run_manage": ("action", {"start": ("repository",)}),
@@ -260,39 +269,71 @@ def _action_requirement(
     }
 
 
+def _direct_structured_schema(
+    schema: dict[str, Any], definitions: dict[str, Any]
+) -> dict[str, Any] | None:
+    candidates = [schema]
+    selected: dict[str, Any] | None = None
+    kind: Literal["object", "array"] | None = None
+    description = schema.get("description")
+    visited_references: set[str] = set()
+    while candidates:
+        candidate = candidates.pop(0)
+        if description is None:
+            description = candidate.get("description")
+        nested = candidate.get("anyOf")
+        if isinstance(nested, list):
+            candidates.extend(item for item in nested if isinstance(item, dict))
+            continue
+        candidate_kind = candidate.get("type")
+        if candidate_kind in {"object", "array"}:
+            selected = deepcopy(candidate)
+            kind = candidate_kind
+            break
+        reference = candidate.get("$ref")
+        if (
+            isinstance(reference, str)
+            and reference.startswith("#/$defs/")
+            and reference not in visited_references
+        ):
+            visited_references.add(reference)
+            resolved = definitions.get(reference.removeprefix("#/$defs/"))
+            if isinstance(resolved, dict):
+                candidates.append(resolved)
+    if selected is None or kind is None:
+        return None
+    requirement = f"Send a JSON {kind} value; do not JSON-encode it as a string."
+    selected["description"] = (
+        description
+        if isinstance(description, str) and requirement in description
+        else f"{description} {requirement}"
+        if description
+        else requirement
+    )
+    return selected
+
+
 def _public_input_schema(name: str, schema: dict[str, Any]) -> dict[str, Any]:
     """Add compact client-side checks for statically knowable request mistakes."""
     result = deepcopy(schema)
     result["additionalProperties"] = False
+    properties = result.get("properties", {})
+    definitions = result.get("$defs", {})
+    for field, property_schema in list(properties.items()):
+        direct = _direct_structured_schema(property_schema, definitions)
+        if direct is not None:
+            properties[field] = direct
     if name == "run_manage":
-        properties = result.get("properties", {})
         properties["targets"]["description"] = (
             "Requested issue or pull-request references; required and non-empty when starting "
-            "gh-implement-issue."
+            "gh-implement-issue. Send a JSON array value; do not JSON-encode it as a string."
         )
-        targets_array = next(
-            (
-                variant
-                for variant in properties["targets"].get("anyOf", [])
-                if variant.get("type") == "array"
-            ),
-            properties["targets"],
-        )
-        targets_array.setdefault("items", {})["pattern"] = r"\S"
+        properties["targets"].setdefault("items", {})["pattern"] = r"\S"
         properties["pending"]["description"] = (
             "External mutations awaiting read-back, rollback, or reconciliation; accepted only "
-            "by generic workflow checkpoints."
+            "by generic workflow checkpoints. Send a JSON array value; do not JSON-encode it "
+            "as a string."
         )
-    if name == "task_manage":
-        report = result.get("properties", {}).get("report", {})
-        object_schema = next(
-            (variant for variant in report.get("anyOf", []) if variant.get("type") == "object"),
-            {"type": "object", "additionalProperties": True},
-        )
-        result["properties"]["report"] = {
-            **object_schema,
-            "description": "Structured report object; do not JSON-encode it as a string.",
-        }
     conditions = result.setdefault("allOf", [])
     contract = ACTION_REQUIREMENTS.get(name)
     if contract is not None:
@@ -520,13 +561,13 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
         workflow: WorkflowName,
         repository: str | None = None,
         n: int | None = None,
-        targets: list[str] | None = None,
+        targets: JsonArrayArgument[list[str] | None] = None,
         instructions: str | None = None,
         refresh_history: bool | None = None,
         regression_sweep: bool | None = None,
         dry_run: bool | None = None,
         separate: bool | None = None,
-        pending: list[str] | None = None,
+        pending: JsonArrayArgument[list[str] | None] = None,
         source_confirmed: bool | None = None,
         note: str | None = None,
     ) -> dict[str, Any]:
@@ -553,8 +594,8 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
         ],
         workflow: WorkflowName = "gh-audit-repo",
         task_id: str | None = None,
-        task: TaskPlan | None = None,
-        report: dict[str, Any] | None = None,
+        task: JsonObjectArgument[TaskPlan | None] = None,
+        report: JsonObjectArgument[dict[str, Any] | None] = None,
         note: str | None = None,
     ) -> dict[str, Any]:
         """Plan a task or transition it; checkpoint and complete accept structured reports."""
@@ -569,8 +610,8 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
     def history_manage(
         action: Literal["status", "prepare", "ingest", "commit", "abort"],
         workflow: WorkflowName = "gh-audit-repo",
-        records: list[HistoryRecord] | None = None,
-        artifacts: list[HistoryArtifact] | None = None,
+        records: JsonArrayArgument[list[HistoryRecord] | None] = None,
+        artifacts: JsonArrayArgument[list[HistoryArtifact] | None] = None,
         source: str | None = None,
         fetched_at: str | None = None,
         full_history_complete: bool | None = None,
@@ -585,7 +626,7 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
         kind: Literal["issue", "pull"] | None = None,
         state: Literal["open", "closed"] | None = None,
         cutoff: str | None = None,
-        linked: list[dict[str, Any]] | None = None,
+        linked: JsonArrayArgument[list[dict[str, Any]] | None] = None,
         limit: int | None = None,
     ) -> dict[str, Any]:
         """Search a bounded, selector-based GitHub history view."""
@@ -596,10 +637,10 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
         action: Literal[
             "initialize", "refresh", "status", "program", "record_declared", "record_context"
         ],
-        programs: list[ProgramProbe] | None = None,
+        programs: JsonArrayArgument[list[ProgramProbe] | None] = None,
         request_id: str | None = None,
-        facts: dict[str, Any] | None = None,
-        fact: InventoryContextFact | None = None,
+        facts: JsonObjectArgument[dict[str, Any] | None] = None,
+        fact: JsonObjectArgument[InventoryContextFact | None] = None,
     ) -> dict[str, Any]:
         """Manage audit inventory; pass program probes together in `programs`."""
         return _request_call(runtime.audit_inventory, InventoryRequest, **locals())
@@ -608,9 +649,9 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
     def audit_knowledge(
         action: Literal["reconcile", "update", "context", "show"],
         area: str | None = None,
-        areas: list[AreaDefinition] | None = None,
-        findings: list[KnowledgeFinding] | None = None,
-        versions: dict[str, str] | None = None,
+        areas: JsonArrayArgument[list[AreaDefinition] | None] = None,
+        findings: JsonArrayArgument[list[KnowledgeFinding] | None] = None,
+        versions: JsonObjectArgument[dict[str, str] | None] = None,
     ) -> dict[str, Any]:
         """Manage area knowledge with server-derived identities and fingerprints."""
         return _request_call(runtime.audit_knowledge, KnowledgeRequest, **locals())
@@ -620,7 +661,7 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
         kind: Literal["pytest", "python"],
         probe_id: str,
         candidate_id: str,
-        selectors: list[str] | None = None,
+        selectors: JsonArrayArgument[list[str] | None] = None,
         code: str | None = None,
     ) -> dict[str, Any]:
         """Run and record one candidate probe, returning bounded output directly."""
@@ -639,14 +680,14 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
             "supervisor_start",
             "supervisor_finish",
         ],
-        phase: PhaseRecord | None = None,
-        shard: ShardRecordValue | None = None,
-        candidate: CandidateRecordValue | None = None,
-        verdict: VerdictRecordValue | None = None,
+        phase: JsonObjectArgument[PhaseRecord | None] = None,
+        shard: JsonObjectArgument[ShardRecordValue | None] = None,
+        candidate: JsonObjectArgument[CandidateRecordValue | None] = None,
+        verdict: JsonObjectArgument[VerdictRecordValue | None] = None,
         limitation: str | None = None,
-        pending: list[str] | None = None,
-        head_drift: dict[str, Any] | None = None,
-        activity: SupervisorActivityValue | None = None,
+        pending: JsonArrayArgument[list[str] | None] = None,
+        head_drift: JsonObjectArgument[dict[str, Any] | None] = None,
+        activity: JsonObjectArgument[SupervisorActivityValue | None] = None,
     ) -> dict[str, Any]:
         """Record one typed audit fact or supervisor activity."""
         return _request_call(runtime.audit_record, AuditRecordRequest, **locals())
@@ -656,7 +697,7 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
         action: Literal["begin", "finish", "uncertain"],
         candidate_id: str,
         operation: Literal["create", "update", "no-op", "close", "dry-run"] | None = None,
-        receipt: dict[str, Any] | None = None,
+        receipt: JsonObjectArgument[dict[str, Any] | None] = None,
     ) -> dict[str, Any]:
         """Begin publication or finish it atomically with its receipt and disposition."""
         return _request_call(runtime.audit_publish, PublishRequest, **locals())

@@ -104,12 +104,8 @@ class TestExtensionMcp:
                 assert "candidate_id" in tools["audit_probe"].input_schema["required"]
                 run_properties = tools["run_manage"].input_schema["properties"]
                 assert "required and non-empty" in run_properties["targets"]["description"]
-                targets_array = next(
-                    variant
-                    for variant in run_properties["targets"]["anyOf"]
-                    if variant.get("type") == "array"
-                )
-                assert targets_array["items"]["pattern"] == r"\S"
+                assert run_properties["targets"]["type"] == "array"
+                assert run_properties["targets"]["items"]["pattern"] == r"\S"
                 assert "External mutations" in run_properties["pending"]["description"]
                 history_properties = tools["history_manage"].input_schema["properties"]
                 assert "records" in history_properties
@@ -120,6 +116,43 @@ class TestExtensionMcp:
                 audit_record_properties = tools["audit_record"].input_schema["properties"]
                 assert "candidate" in audit_record_properties
                 assert "phase" in audit_record_properties
+                assert audit_record_properties["activity"]["properties"]["kind"]["description"]
+                assert audit_record_properties["activity"]["properties"]["unit"]["description"]
+                structured_arguments = {
+                    "run_manage": {"targets": "array", "pending": "array"},
+                    "task_manage": {"task": "object", "report": "object"},
+                    "history_manage": {"records": "array", "artifacts": "array"},
+                    "history_query": {"linked": "array"},
+                    "audit_inventory": {
+                        "programs": "array",
+                        "facts": "object",
+                        "fact": "object",
+                    },
+                    "audit_knowledge": {
+                        "areas": "array",
+                        "findings": "array",
+                        "versions": "object",
+                    },
+                    "audit_probe": {"selectors": "array"},
+                    "audit_record": {
+                        "phase": "object",
+                        "shard": "object",
+                        "candidate": "object",
+                        "verdict": "object",
+                        "pending": "array",
+                        "head_drift": "object",
+                        "activity": "object",
+                    },
+                    "audit_publish": {"receipt": "object"},
+                }
+                for tool_name, fields in structured_arguments.items():
+                    properties = tools[tool_name].input_schema["properties"]
+                    for field, kind in fields.items():
+                        assert properties[field]["type"] == kind
+                        assert "anyOf" not in properties[field]
+                        assert properties[field]["description"].endswith(
+                            f"Send a JSON {kind} value; do not JSON-encode it as a string."
+                        )
                 conditional_required = {
                     name: {
                         condition["if"]["properties"][discriminator]["const"]: set(
@@ -1509,6 +1542,18 @@ class TestExtensionMcp:
         assert "audit_worktree" in worker
         assert "authoritative" in policy
         assert "audit worktree" in policy
+        assert "symlink_coverage.skipped_unsafe" in worker
+        assert "never followed or disclosed" in policy
+
+    def test_audit_context_guidance_uses_server_evidence_and_candidate_verdict_identity(
+        self,
+    ) -> None:
+        supervisor = (EXTENSION / "skills/gh-audit-repo/SKILL.md").read_text(encoding="utf-8")
+        worker = (EXTENSION / "agents/gh-audit-repo-worker.md").read_text(encoding="utf-8")
+
+        assert "`candidate_id` as its sole identity" in supervisor
+        assert "matching `audit_sha` and `audit_worktree_head`" in worker
+        assert "bounded stdout/stderr excerpts" in worker
 
     @pytest.mark.parametrize(
         "filename",

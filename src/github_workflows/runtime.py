@@ -45,6 +45,7 @@ SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 HISTORY_ARTIFACT_BYTES = 5 * 1024 * 1024
 HISTORY_ARTIFACT_TOTAL_BYTES = 25 * 1024 * 1024
 TASK_HISTORY_LIMIT = 40
+TASK_VALIDATION_EXCERPT_BYTES = 2 * 1024
 TASK_HISTORY_FIELDS = (
     "kind",
     "number",
@@ -55,7 +56,20 @@ TASK_HISTORY_FIELDS = (
     "labels",
 )
 TASK_METADATA_FIELDS = ("id", "logical_id", "role", "unit", "attempt", "status", "required")
-TASK_VALIDATION_FIELDS = ("id", "probe_id", "candidate_id", "status", "artifact")
+TASK_VALIDATION_FIELDS = (
+    "id",
+    "probe_id",
+    "candidate_id",
+    "status",
+    "artifact",
+    "returncode",
+    "timed_out",
+    "worktree_unchanged",
+    "stdout_excerpt",
+    "stderr_excerpt",
+    "stdout_truncated",
+    "stderr_truncated",
+)
 CANDIDATE_FINGERPRINT_FIELD = "candidate_fingerprint"
 WORKFLOW_REF_NAMES: dict[WorkflowName, str] = {
     "gh-audit-repo": "audit",
@@ -363,6 +377,25 @@ class WorkflowRuntime:
         if not isinstance(worktree, str):
             raise ValueError("current audit state does not contain an audit worktree")
         return state, Path(worktree).resolve(), self.current("gh-audit-repo")
+
+    @staticmethod
+    def _verified_audit_worktree_head(state: dict[str, Any]) -> str:
+        worktree = state.get("audit_worktree")
+        expected = state.get("sha")
+        if not isinstance(worktree, str) or not isinstance(expected, str):
+            raise ValueError("audit worker context requires an audit worktree and SHA")
+        result = subprocess.run(
+            ["git", "-C", worktree, "rev-parse", "--verify", "HEAD^{commit}"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        actual = result.stdout.strip()
+        if result.returncode != 0 or not re.fullmatch(r"[0-9a-fA-F]{40}", actual):
+            raise ValueError("audit worktree HEAD could not be verified")
+        if actual.lower() != expected.lower():
+            raise ValueError("audit worktree HEAD no longer matches audit SHA")
+        return actual.lower()
 
     def _discard_stale_run(
         self, workflow: WorkflowName, *, retained_worktree: Path | None = None
@@ -1467,9 +1500,10 @@ class WorkflowRuntime:
             )
             if value
         )
-        if links or terms:
+
+        def query(query_terms: str) -> dict[str, Any]:
             with self._json_file(links) as linked:
-                queried = self._invoke(
+                return self._invoke(
                     github_cache.query_records,
                     repo=repo,
                     project_dir=self.project_dir,
@@ -1477,14 +1511,16 @@ class WorkflowRuntime:
                     db=database,
                     cutoff=None,
                     linked=linked if links else None,
-                    terms=terms,
+                    terms=query_terms,
                     terms_file=None,
                     kind=None,
                     state="open",
                     limit=TASK_HISTORY_LIMIT,
                     output=None,
                 )
-            records = [
+
+        def projected(queried: dict[str, Any]) -> list[dict[str, Any]]:
+            return [
                 {
                     key: record[key]
                     for key in TASK_HISTORY_FIELDS
@@ -1493,6 +1529,10 @@ class WorkflowRuntime:
                 for record in queried.get("records", [])
                 if isinstance(record, dict)
             ]
+
+        relevant = query(terms) if links or terms else {"records": [], "has_more": False}
+        records = projected(relevant)
+        if links:
             by_key = {
                 (record.get("kind"), record.get("number")): record
                 for record in records
@@ -1509,9 +1549,19 @@ class WorkflowRuntime:
                 for record in records
                 if (record.get("kind"), record.get("number")) not in linked_keys
             ]
-        else:
-            records = []
-            queried = {"has_more": False}
+        fallback = query("")
+        selected_keys = {(record.get("kind"), record.get("number")) for record in records}
+        records.extend(
+            record
+            for record in projected(fallback)
+            if (record.get("kind"), record.get("number")) not in selected_keys
+        )
+        has_more = (
+            bool(relevant.get("has_more"))
+            or bool(fallback.get("has_more"))
+            or len(records) > TASK_HISTORY_LIMIT
+        )
+        records = records[:TASK_HISTORY_LIMIT]
         return {
             "cache": {
                 "generation": history.get("generation"),
@@ -1521,7 +1571,7 @@ class WorkflowRuntime:
             "selection": {
                 "record_count": len(records),
                 "limit": TASK_HISTORY_LIMIT,
-                "has_more": bool(queried.get("has_more")),
+                "has_more": has_more,
                 "records": records,
             },
         }
@@ -1683,6 +1733,7 @@ class WorkflowRuntime:
         if continuation is not None:
             result["continuation"] = continuation
         if workflow == "gh-audit-repo":
+            result["audit_worktree_head"] = self._verified_audit_worktree_head(state)
             result["history"] = self._audit_task_history(state, assignment)
             validation = self._worker_validation(state, assignment)
             if validation is not None:
@@ -2009,6 +2060,19 @@ class WorkflowRuntime:
             if not isinstance(artifact, dict) or artifact.get("probe_id") != request.probe_id:
                 raise ValueError("probe result artifact has an invalid identity")
             status = self._probe_validation_status(artifact)
+
+            def bounded(name: str, limit: int) -> tuple[str, bool]:
+                value = artifact.get(name, "")
+                text = value if isinstance(value, str) else ""
+                truncated = bool(artifact.get(f"{name.removesuffix('_excerpt')}_truncated"))
+                return text[:limit], truncated or len(text) > limit
+
+            persisted_stdout, persisted_stdout_truncated = bounded(
+                "stdout_excerpt", TASK_VALIDATION_EXCERPT_BYTES
+            )
+            persisted_stderr, persisted_stderr_truncated = bounded(
+                "stderr_excerpt", TASK_VALIDATION_EXCERPT_BYTES
+            )
             self._event(
                 {
                     "type": "candidate-upsert",
@@ -2028,19 +2092,18 @@ class WorkflowRuntime:
                         "candidate_id": request.candidate_id,
                         "status": status,
                         "artifact": artifact_ref,
+                        "returncode": artifact.get("returncode"),
+                        "timed_out": bool(artifact.get("timed_out")),
+                        "worktree_unchanged": bool(artifact.get("worktree_unchanged")),
+                        "stdout_excerpt": persisted_stdout,
+                        "stderr_excerpt": persisted_stderr,
+                        "stdout_truncated": persisted_stdout_truncated,
+                        "stderr_truncated": persisted_stderr_truncated,
                     },
                 }
             )
-
-            def bounded(name: str) -> tuple[str, bool]:
-                value = artifact.get(name, "")
-                text = value if isinstance(value, str) else ""
-                limit = 8 * 1024
-                truncated = bool(artifact.get(f"{name.removesuffix('_excerpt')}_truncated"))
-                return text[:limit], truncated or len(text) > limit
-
-            stdout, stdout_truncated = bounded("stdout_excerpt")
-            stderr, stderr_truncated = bounded("stderr_excerpt")
+            stdout, stdout_truncated = bounded("stdout_excerpt", 8 * 1024)
+            stderr, stderr_truncated = bounded("stderr_excerpt", 8 * 1024)
             return {
                 "probe_id": request.probe_id,
                 "candidate_id": request.candidate_id,
@@ -2078,7 +2141,16 @@ class WorkflowRuntime:
             collection = {"shard": "shards", "candidate": "candidates", "verdict": "verdicts"}[
                 field
             ]
-            operation = "updated" if value["id"] in before.get(collection, {}) else "created"
+            identity = value["candidate_id"] if field == "verdict" else value["id"]
+            registry = before.get(collection, {})
+            existed = identity in registry or (
+                field == "verdict"
+                and any(
+                    isinstance(record, dict) and record.get("candidate_id") == identity
+                    for record in registry.values()
+                )
+            )
+            operation = "updated" if existed else "created"
         elif request.action == "phase":
             phase = request.phase
             phase_value = phase.model_dump(mode="json", exclude={"name"}, exclude_none=True)

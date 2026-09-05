@@ -758,13 +758,31 @@ def audit_event(args: argparse.Namespace) -> None:
         value = payload.get(field)
         if not isinstance(value, dict):
             raise ValueError(f"{event_type} requires a {field} object")
-        unit_id = require_string(value.get("id"), f"{field} id")
+        identity_field = "candidate_id" if event_type == "verdict-record" else "id"
+        unit_id = require_string(value.get(identity_field), f"{field} {identity_field}")
         target = {
             "candidate-upsert": "candidates",
             "validation-record": "validations",
             "verdict-record": "verdicts",
         }[event_type]
-        existing = state[target].get(unit_id, {})
+        if event_type == "verdict-record":
+            registry = state[target]
+            legacy_keys = [
+                key
+                for key, record in registry.items()
+                if key != unit_id
+                and isinstance(record, dict)
+                and record.get("candidate_id") == unit_id
+            ]
+            matching_keys = [*legacy_keys, *([unit_id] if unit_id in registry else [])]
+            existing: dict[str, Any] = {}
+            for key in matching_keys:
+                record = registry.pop(key)
+                if isinstance(record, dict):
+                    existing.update(record)
+            existing.pop("id", None)
+        else:
+            existing = state[target].get(unit_id, {})
         if event_type == "candidate-upsert":
             status = value.get("status", existing.get("status"))
             if status not in AUDIT_CANDIDATE_STATUSES:
@@ -796,8 +814,9 @@ def audit_event(args: argparse.Namespace) -> None:
             value = {**value, "artifact": artifact_ref.as_posix()}
         if event_type == "verdict-record" and unit_id not in state["candidates"]:
             raise ValueError("verdict record refers to an unknown candidate")
-        state[target][unit_id] = {**existing, **value, "id": unit_id}
-        detail = {f"{field}_id": unit_id}
+        identity = {identity_field: unit_id}
+        state[target][unit_id] = {**existing, **value, **identity}
+        detail = {identity_field if field == "verdict" else f"{field}_id": unit_id}
     elif event_type == "mutation-record":
         mutation = payload.get("mutation")
         if not isinstance(mutation, dict):

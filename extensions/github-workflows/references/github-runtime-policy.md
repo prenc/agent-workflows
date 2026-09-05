@@ -55,6 +55,9 @@ supervisors and workers.
   enforces private-path exclusions and containment, and returns bounded JSON.
   The pre-tool hook also requires `--root` to exactly match the authoritative
   audit worktree in the worker's latest `task_context` tool result.
+  Tracked regular-file symlinks are searched only when their resolved targets
+  remain within that worktree; unsafe or directory targets are counted but
+  never followed or disclosed.
   Its shell exception does not permit direct `rg`, operators, substitutions,
   environment expansion, or any other command.
 - Database creation, queries, and mutation must use the reviewed database

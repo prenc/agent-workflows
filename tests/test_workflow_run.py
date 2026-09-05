@@ -241,6 +241,45 @@ class TestWorkflowRun:
         )
         assert set(state["candidates"]) == {"C-1", "C-2"}
 
+    def test_verdict_write_migrates_legacy_candidate_entry(self) -> None:
+        self.initialize()
+        candidate = self.audit_event(
+            1,
+            {
+                "type": "candidate-upsert",
+                "candidate": {"id": "C-1", "status": "verification-pending"},
+            },
+        )
+        revision = json.loads(candidate.stdout)["revision"]
+        current = self.project_dir / "workflows/gh-audit-repo/current"
+        state = json.loads((current / "state.json").read_text())
+        state["verdicts"] = {
+            "legacy-verdict": {
+                "id": "legacy-verdict",
+                "candidate_id": "C-1",
+                "conclusion": "rejected",
+                "evidence": "preserved",
+            }
+        }
+        (current / "state.json").write_text(json.dumps(state) + "\n")
+
+        self.audit_event(
+            revision,
+            {
+                "type": "verdict-record",
+                "verdict": {"candidate_id": "C-1", "conclusion": "confirmed"},
+            },
+        )
+
+        migrated = json.loads((current / "state.json").read_text())["verdicts"]
+        assert migrated == {
+            "C-1": {
+                "candidate_id": "C-1",
+                "conclusion": "confirmed",
+                "evidence": "preserved",
+            }
+        }
+
     def test_audit_finalization_rejects_nonterminal_task(self) -> None:
         self.initialize()
         result = self.audit_event(

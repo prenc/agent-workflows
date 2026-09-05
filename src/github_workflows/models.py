@@ -565,8 +565,15 @@ class CandidateRecordValue(IdentifiedAuditValue):
     status: CandidateStatus | None = None
 
 
-class VerdictRecordValue(IdentifiedAuditValue):
-    candidate_id: str | None = None
+class VerdictRecordValue(ExtensibleRecord):
+    candidate_id: str = Field(min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_redundant_id(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "id" in value:
+            raise ValueError("verdict uses candidate_id as its sole identity; id is not accepted")
+        return value
 
 
 class AuditPhaseRequest(StrictRequest):
@@ -605,8 +612,16 @@ class AuditObjectRequest(StrictRequest):
 
 
 class SupervisorActivityValue(StrictRequest):
-    kind: str = Field(min_length=1)
-    unit: str | None = None
+    """One exclusive material activity performed by the audit supervisor."""
+
+    kind: str = Field(
+        min_length=1,
+        description="Stable short name for the supervisor activity being started.",
+    )
+    unit: str | None = Field(
+        default=None,
+        description="Optional audit unit owned by this supervisor activity.",
+    )
 
 
 class AuditSupervisorStartRequest(StrictRequest):
