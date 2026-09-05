@@ -412,8 +412,14 @@ class WorkflowRuntime:
                 raise ValueError("pending publication requires resume")
             run_id = str(state.get("run_id", ""))
             if SAFE_ID.fullmatch(run_id):
-                staging = self.project_dir / "github" / "staging"
-                (staging / f"records-{run_id}.sqlite3").unlink(missing_ok=True)
+                repo = state.get("repository")
+                if isinstance(repo, str) and repo:
+                    try:
+                        staging = github_cache.repo_dir(self.project_dir, repo) / "staging"
+                    except ValueError:
+                        staging = None
+                    if staging is not None:
+                        (staging / f"records-{run_id}.sqlite3").unlink(missing_ok=True)
             raw_worktree = state.get("audit_worktree")
             if isinstance(raw_worktree, str):
                 worktree = Path(raw_worktree).resolve()

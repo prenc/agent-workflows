@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -18,8 +20,22 @@ class TestGithubCache:
     def teardown_method(self) -> None:
         self.temp.cleanup()
 
-    def call(self, *args: str, check: bool = True):
-        return subprocess.run([str(SCRIPT), *args], check=check, capture_output=True, text=True)
+    def live_db(self, repo: str = REPO) -> Path:
+        owner, name = repo.split("/")
+        return self.project_dir / "github" / owner / name / "records-v1.sqlite3"
+
+    def call(
+        self, *args: str, check: bool = True, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        if env is None:
+            return subprocess.run([str(SCRIPT), *args], check=check, capture_output=True, text=True)
+        return subprocess.run(
+            [str(SCRIPT), *args],
+            check=check,
+            capture_output=True,
+            text=True,
+            env=os.environ | env,
+        )
 
     def parsed(self, *args: str) -> dict:
         return json.loads(self.call(*args).stdout)
@@ -73,7 +89,7 @@ class TestGithubCache:
             "abc",
             "--full-history-complete",
         )
-        expected = self.project_dir / "github" / "records-v1.sqlite3"
+        expected = self.live_db()
         assert Path(committed["committed"]) == expected
         queried = self.parsed(
             "query-records", *self.common(), "--db", str(expected), "--terms", "Parser"
@@ -140,7 +156,7 @@ class TestGithubCache:
             "--default-sha",
             "abc",
         )
-        live = self.project_dir / "github" / "records-v1.sqlite3"
+        live = self.live_db()
         with sqlite3.connect(live) as connection:
             connection.execute(
                 """INSERT INTO records (
@@ -171,3 +187,184 @@ class TestGithubCache:
         failed = self.call("status", "--repo", REPO, check=False)
         assert failed.returncode == 2
         assert "QWEN_CODE_PROJECT_DIR" in failed.stderr
+
+    def test_prepare_for_other_repository_leaves_committed_cache_intact(self) -> None:
+        prepared = self.parsed("prepare-records", *self.common(), "--run-id", "first")
+        payload = Path(self.temp.name) / "records.json"
+        payload.write_text(
+            json.dumps({"records": [{"number": 1, "state": "open", "title": "Committed record"}]})
+        )
+        self.parsed(
+            "ingest-records",
+            *self.common(),
+            "--db",
+            prepared["work_db"],
+            "--kind",
+            "issue",
+            "--input",
+            str(payload),
+            "--source",
+            "test",
+        )
+        committed = self.parsed(
+            "commit-records",
+            *self.common(),
+            "--run-id",
+            "first",
+            "--db",
+            prepared["work_db"],
+            "--base-generation",
+            "0",
+            "--synced-at",
+            "2026-08-30T00:00:00Z",
+            "--default-sha",
+            "abc",
+        )
+        live_a = Path(committed["committed"])
+        assert live_a == self.live_db()
+        with sqlite3.connect(live_a) as connection:
+            before = (
+                connection.execute("SELECT value FROM metadata WHERE key='generation'").fetchone()[
+                    0
+                ],
+                connection.execute("SELECT COUNT(*) FROM records").fetchone()[0],
+            )
+        other = "example/other-repo"
+        prepared_b = self.parsed(
+            "prepare-records",
+            "--repo",
+            other,
+            "--project-dir",
+            str(self.project_dir),
+            "--run-id",
+            "second",
+        )
+        assert live_a.is_file()
+        with sqlite3.connect(live_a) as connection:
+            after = (
+                connection.execute("SELECT value FROM metadata WHERE key='generation'").fetchone()[
+                    0
+                ],
+                connection.execute("SELECT COUNT(*) FROM records").fetchone()[0],
+            )
+        assert before == after
+        assert not list(self.project_dir.glob("github/**/*.invalid-*"))
+        assert Path(prepared_b["live_db"]) == self.live_db(other)
+        assert Path(prepared_b["work_db"]).parent == self.live_db(other).parent / "staging"
+
+    def test_prepare_with_foreign_cache_in_place_fails_cleanly(self) -> None:
+        other = "example/other-repo"
+        other_common = ["--repo", other, "--project-dir", str(self.project_dir)]
+        prepared = self.parsed("prepare-records", *other_common, "--run-id", "other")
+        committed = self.parsed(
+            "commit-records",
+            *other_common,
+            "--run-id",
+            "other",
+            "--db",
+            prepared["work_db"],
+            "--base-generation",
+            "0",
+            "--synced-at",
+            "2026-08-30T00:00:00Z",
+            "--default-sha",
+            "abc",
+        )
+        live_a = self.live_db()
+        live_a.parent.mkdir(parents=True)
+        shutil.move(committed["committed"], str(live_a))
+        failed = self.call("prepare-records", *self.common(), "--run-id", "next", check=False)
+        assert failed.returncode == 2
+        assert "identity" in failed.stderr
+        assert live_a.is_file()
+        assert not list(self.project_dir.glob("github/**/*.invalid-*"))
+
+    def test_linked_records_beyond_limit_are_deterministic_across_processes(self) -> None:
+        prepared = self.parsed("prepare-records", *self.common(), "--run-id", "first")
+        issues = Path(self.temp.name) / "issues.json"
+        issues.write_text(
+            json.dumps(
+                {
+                    "records": [
+                        {"number": n, "state": "open", "title": f"Issue {n}"} for n in range(1, 16)
+                    ]
+                }
+            )
+        )
+        pulls = Path(self.temp.name) / "pulls.json"
+        pulls.write_text(
+            json.dumps(
+                {
+                    "records": [
+                        {"number": n, "state": "open", "title": f"Pull {n}"} for n in range(1, 16)
+                    ]
+                }
+            )
+        )
+        self.parsed(
+            "ingest-records",
+            *self.common(),
+            "--db",
+            prepared["work_db"],
+            "--kind",
+            "issue",
+            "--input",
+            str(issues),
+            "--source",
+            "test",
+        )
+        self.parsed(
+            "ingest-records",
+            *self.common(),
+            "--db",
+            prepared["work_db"],
+            "--kind",
+            "pull",
+            "--input",
+            str(pulls),
+            "--source",
+            "test",
+        )
+        committed = self.parsed(
+            "commit-records",
+            *self.common(),
+            "--run-id",
+            "first",
+            "--db",
+            prepared["work_db"],
+            "--base-generation",
+            "0",
+            "--synced-at",
+            "2026-08-30T00:00:00Z",
+            "--default-sha",
+            "abc",
+        )
+        live = Path(committed["committed"])
+        linked_file = Path(self.temp.name) / "linked.json"
+        linked_file.write_text(
+            json.dumps(
+                [{"kind": "issue", "number": n} for n in range(1, 16)]
+                + [{"kind": "pull", "number": n} for n in range(1, 16)]
+            )
+        )
+        outputs = []
+        for seed in ("0", "1"):
+            result = self.call(
+                "query-records",
+                *self.common(),
+                "--db",
+                str(live),
+                "--linked",
+                str(linked_file),
+                "--limit",
+                "25",
+                env={"PYTHONHASHSEED": seed},
+            )
+            outputs.append(json.loads(result.stdout))
+        assert outputs[0] == outputs[1]
+        records = outputs[0]["records"]
+        assert [(record["kind"], record["number"]) for record in records] == (
+            [("issue", n) for n in range(1, 16)] + [("pull", n) for n in range(1, 11)]
+        )
+        assert outputs[0]["has_more"] is True
+        assert outputs[0]["linked_dropped"] == 5
