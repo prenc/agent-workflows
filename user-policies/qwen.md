@@ -2,37 +2,41 @@
 
 ## Project Tools and Python
 
-Determine the project language and supported commands from its repository instructions and root configuration. Do not infer that a project is Python merely because a `.venv` directory exists. Use the project's native toolchain for non-Python projects.
+Determine the language and commands from repository instructions and root configuration; a `.venv` alone does not make a project Python. Use the native toolchain for non-Python projects.
 
 For Python projects, use `uv` for dependency management and the project-root `.venv`. Do not create another environment unless asked. If a dependency is missing, report it and suggest the appropriate repository or `uv` command.
 
-When the project root contains `.venv` and `uv` is installed, invoke Python commands and project executables through `uv run --no-sync` so uv uses the existing root environment without changing it. This includes test and validation commands, for example `uv run --no-sync pytest` and `uv run --no-sync pre-commit run --all-files`. Prefer a documented Make target or repository command when it owns the operation; run `UV_NO_SYNC=1 make test` directly rather than wrapping Make itself with `uv run`.
+With a root `.venv` and `uv`, run Python commands and project executables via `uv run --no-sync`. Prefer documented repository wrappers; set `UV_NO_SYNC=1` for wrappers such as Make that may invoke uv. Never combine that environment variable with `uv run --no-sync`.
 
 If either `.venv` or `uv` is unavailable, follow the repository instructions and use the available project or system command without creating an environment solely to run it.
 
+## Documentation Audience
+
+Keep READMEs and user documentation focused on purpose, installation, public interfaces, examples, and operation. Put agent-only development policy in the applicable `AGENTS.md`; keep specialized procedures in their skills instead of duplicating them.
+
 ## Repository Search
 
-When shell access is available, use ripgrep as the default repository search tool. Search text with `rg -n "pattern" [path]` and discover files with `rg --files [path]`. Narrow broad searches with explicit paths, `-g` inclusion globs, and `-g '!pattern'` exclusions; use `-C` or `-A` only when surrounding context is useful. Prefer these commands over shell `grep`, content searches with `find`, or custom Python search code.
+With shell access, use ripgrep: `rg -n "pattern" [path]` for text and `rg --files [path]` for files. Prefer explicit paths and `-g` globs over `grep`, `find` content searches, or custom Python. Request context, case folding, filenames, or counts only when needed.
 
-Keep search output focused. Use `-i` only for intentionally case-insensitive searches, `-l` when only matching filenames are needed, and `-c` when only counts are needed. When intentionally searching a known Git-ignored root such as an assigned `.worktrees/` checkout or `.venv/`, use `rg --files --hidden --no-ignore-vcs <explicit-root>` for file discovery and `rg -n --hidden --no-ignore-vcs "pattern" <explicit-root>` for text. Scope these searches narrowly and continue to obey every confidential-file and secret restriction.
+For an explicitly assigned Git-ignored root such as a `.worktrees/` checkout or `.venv/`, add `--hidden --no-ignore-vcs`, keep the root narrow, and continue to obey confidential-file and secret restrictions.
 
-Until Qwen's native Glob tool supports per-call Git-ignore control, do not use it with a search root inside a Git-ignored directory. It filters results relative to the original project root even when that ignored root was supplied explicitly, so an empty result can be false. When shell access is unavailable, use `grep_search` and exact `read_file` calls instead. Treat any suspicious empty search as inconclusive until checked through a known in-scope path; never use it alone as evidence that a file or directory is absent.
+Do not use Qwen Glob inside Git-ignored roots until it supports per-call ignore control; its empty result can be false. Without shell access, use `grep_search` and exact `read_file` calls. Treat suspicious empty results as inconclusive until verified through a known in-scope path.
 
 ## Validation
 
-During implementation, run the fastest coherent lightweight checks for the behavior being changed. Use focused tests before broader validation and keep output concise unless diagnosing a failure. Running lightweight tests, formatters, linters, and pre-commit hooks is authorized when they are part of the repository's documented workflow. Report unavailable tools or skipped coverage instead of silently installing dependencies or claiming validation that did not run.
+Run the fastest coherent checks during implementation: focused tests before broader validation, with concise output unless diagnosing. Repository-standard tests, formatters, linters, and hooks are authorized. Report unavailable tools or skipped coverage; do not install dependencies silently or claim unrun checks.
 
-When a repository configures pre-commit, run it once after implementation and affected tests with `uv run --no-sync pre-commit run --all-files` in Python projects. Inspect hook changes, rerun affected tests when warranted, and finish with a passing full pre-commit run. Use the configured pre-commit hooks for Ruff instead of invoking Ruff directly.
+After implementation and affected tests, run configured pre-commit hooks once across all files. Inspect hook changes, rerun affected tests when warranted, and finish with a passing run. Use the hooks for Ruff instead of invoking it directly.
 
 If an asynchronous or process-based test appears to stall only in the sandbox, rerun that same focused test outside the sandbox before treating the stall as a product failure.
 
 ## Test Design
 
-Organize tests by coherent product or subsystem responsibility. Add regressions to the group that owns the behavior, use one or two explicit test files only for a genuinely narrow check, and run the broader responsibility group afterward. For pytest, use `-q` or `--tb=line` by default and increase verbosity only to diagnose a failure.
+Organize tests by product or subsystem responsibility. Put regressions with the owning group; use isolated files only for genuinely narrow checks, then run the broader group. For pytest, default to `-q` or `--tb=line`.
 
 Use doctests sparingly for small, public, deterministic examples. Keep error cases, edge cases, regressions, parametrized behavior, orchestration, and integration coverage in the project's normal test framework.
 
-Test consumed behavior, schemas, required and optional fields, validation outcomes, state transitions, and rendered structure. Exact prose or default configuration values belong in assertions only when they are compatibility contracts. Avoid duplicate assertions that protect the same behavior.
+Test consumed behavior, schemas, validation, state transitions, and rendered structure. Assert exact prose or defaults only when they are compatibility contracts, and avoid duplicate protection.
 
 ## Parallel Requests and Progress
 
@@ -45,16 +49,6 @@ When implementing an agent, keep durable task policy, constraints, sequencing, a
 Use the provider's native chat template and preserve structured message history. Every assistant tool call must precede its matching tool result, and a workflow may finish only after every tool call has a result. Represent results as tool-role messages tied to their call IDs; keep them out of ordinary assistant prose and do not manually construct provider-specific wrappers.
 
 When compacting history, preserve assistant messages, tool names, call IDs, and arguments exactly. Mask only explicitly configured fields in copied tool-result payloads. Preserve the pending result, the latest accepted state change, and the latest relevant rejection or no-op. Keep original trace and audit records unchanged.
-
-## Git Worktrees
-
-Place Git worktrees under `<project>/.worktrees/<name>` and ensure `.worktrees/` is ignored by the main worktree. For a Python worktree, the agent controlling the worktree must choose and record one environment mode before delegating work:
-
-- Use `shared` for source-only work with unchanged dependency, packaging, entry-point, compiled-extension, and import-layout inputs. Link `.venv` to the main project's `.venv`, derive project-relative `PYTHONPATH` roots from repository configuration, and prefix every command with `UV_NO_SYNC=1` and that `PYTHONPATH`. This includes Make targets so nested `uv` calls inherit the protection. Never run an installer or environment-mutating command in this mode.
-- Use `isolated` whenever those conditions do not hold or shared mode proves insufficient. The controlling agent first checks a tracked `uv.lock` non-mutatingly and blocks on unauthorized staleness. It verifies and unlinks only a `.venv` symlink targeting the main environment before resolving the lock, creating the worktree-local `.venv`, and populating it with a frozen offline `uv sync` using the repository's documented groups or extras. It never provisions through a symlink. Workers still use `UV_NO_SYNC=1`; they report dependency-input changes for controller refresh rather than changing the environment themselves.
-- Use `native` for non-Python projects and do not create or link `.venv`.
-
-Respect the repository's lockfile convention: retain tracked locks, keep ignored locks local, and keep an otherwise unwanted generated lock in a private cache beside the managed worktree root rather than adding it to the change. Reuse one resolved lock only for worktrees whose dependency inputs are directly confirmed identical. Resolve and synchronize offline first; ask before network access. A stale tracked lock requires scope or user authority to update. On interrupted provisioning, restore the prior lock and verified `.venv` link state without following or deleting an unexpected symlink target.
 
 ## GitHub Interaction
 

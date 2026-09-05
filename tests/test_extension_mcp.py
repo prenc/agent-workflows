@@ -1464,35 +1464,44 @@ class TestExtensionMcp:
         )
 
     def test_worktree_environment_contract_is_consistent_across_agents(self) -> None:
-        documents = [
-            (ROOT / "user-policies/codex.md").read_text(encoding="utf-8"),
-            (ROOT / "user-policies/qwen.md").read_text(encoding="utf-8"),
+        workflow_documents = [
             (ROOT / "codex/skills/gh-pickup-work/SKILL.md").read_text(encoding="utf-8"),
             (EXTENSION / "references/github-runtime-policy.md").read_text(encoding="utf-8"),
             (EXTENSION / "skills/gh-implement-issue/SKILL.md").read_text(encoding="utf-8"),
             (EXTENSION / "agents/gh-implement-issue-worker.md").read_text(encoding="utf-8"),
         ]
 
-        for document in documents:
+        for document in workflow_documents:
             assert all(
                 contract in document
-                for contract in ("shared", "isolated", "UV_NO_SYNC", "PYTHONPATH")
+                for contract in (
+                    "shared",
+                    "isolated",
+                    "UV_NO_SYNC",
+                    "PYTHONPATH",
+                )
             )
+            assert "$PWD" not in document
+            assert "PYTHONPATH=src" not in document
+            assert all(term in document for term in ("assigned worktree", "absolute"))
 
-        supervisor_documents = documents[:5]
+        assert all("uv run --no-sync" not in document for document in workflow_documents)
+        assert all("UV_NO_SYNC=1" in document for document in workflow_documents)
+
+        supervisor_documents = workflow_documents[:3]
         for document in supervisor_documents:
             assert all(
                 contract in document
                 for contract in ("uv.lock", "offline", "frozen", "tracked", "ignored")
             )
 
-        for document in documents[2:5]:
+        for document in supervisor_documents:
             normalized = document.lower()
             assert all(
                 contract in normalized for contract in ("uv lock --check", "unlink", "symlink")
             )
 
-        runtime_policy = documents[3]
+        runtime_policy = workflow_documents[1]
         assert all(
             contract in runtime_policy
             for contract in (

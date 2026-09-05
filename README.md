@@ -31,26 +31,6 @@ installation, and `--verbose` to include unchanged integrations. The default
 `--machine-role local` omits cluster-specific compute instructions; use
 `--machine-role remote` when installing on a shared remote or HPC machine.
 
-For development setup, including the Git pre-commit hook:
-
-```sh
-uv run agent-workflows install --dev
-```
-
-After changing extension code, run `/reload-plugins` in Qwen. An unfinished
-workflow whose helper bundle changed must be aborted and restarted. Persistent
-history and knowledge under `QWEN_CODE_PROJECT_DIR` remain reusable.
-
-## Development
-
-```sh
-uv venv
-uv pip install --python .venv/bin/python -e '.[dev]'
-uv run pytest
-uv run pre-commit run --all-files
-uv build
-```
-
 Manual workflow recovery is available through `agent-workflows workflow --help`. Qwen starts the MCP server through the private `agent-workflows mcp`
 subcommand declared in `qwen-extension.json`.
 

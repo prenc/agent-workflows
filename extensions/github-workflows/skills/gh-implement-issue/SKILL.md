@@ -317,9 +317,11 @@ Put `execution_environment` in every assignment. It contains `mode: native`,
 existing project-relative source roots. Do not put absolute paths, lock
 contents, or environment details the worker can derive from the mode in the
 assignment. Record mode, lock ownership, and selected sync groups in the
-supervisor ledger. Every Python validation command must run with
-`UV_NO_SYNC=1`; shared mode also sets the assigned `PYTHONPATH`, including on a
-top-level Make command so nested uv calls inherit it.
+supervisor ledger. Every worker Python command sets `UV_NO_SYNC=1` so child uv
+processes inherit it; direct uv commands use `uv run` without `--no-sync`.
+In shared mode, the worker expands each assigned project-relative root against
+the verified assigned worktree and sets the resulting absolute `PYTHONPATH`;
+isolated mode has no `PYTHONPATH` override.
 
 Register the complete round assignment with
 `mcp__github_workflows__task_manage` using action `plan` and a typed `task`.
@@ -388,7 +390,7 @@ Draft-to-ready promotion requires:
 
 - every required outcome for every covered issue is complete;
 - focused tests and the repository's pre-commit command pass under the assigned
-  environment with `UV_NO_SYNC=1`;
+  environment using the appropriate no-sync form;
 - the complete diff is cohesive and contains no unrelated or sensitive work;
 - no unresolved authority-sensitive decision remains;
 - the worktree has no active Git operation.

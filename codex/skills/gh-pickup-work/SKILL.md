@@ -216,9 +216,12 @@ implementation. Use `native` for non-Python projects. Use `shared` only for
 source-only Python work with unchanged dependency, packaging, entry-point,
 compiled-extension, and import-layout inputs and unambiguous project-relative
 source roots. Link `.venv` to the verified main project environment; never
-overwrite an unexpected path or follow its target. Prefix every command with
-`UV_NO_SYNC=1` and the derived `PYTHONPATH`, including Make targets, and never
-run an environment writer in shared mode.
+overwrite an unexpected path or follow its target. Keep source roots
+project-relative in records, but expand them against the verified assigned
+worktree and set the resulting absolute `PYTHONPATH` with `UV_NO_SYNC=1` on
+every implementation and validation command. Invoke direct uv commands as
+`uv run`, without `--no-sync`, and never run an environment writer in shared
+mode.
 
 Otherwise stop concurrent work and use `isolated`. Classify `uv.lock` first and
 non-mutatingly run `uv lock --check --offline --no-python-downloads` for a
@@ -233,8 +236,10 @@ generated lock in a private `0700` cache beside the managed worktree root rather
 than adding it to the change; reject symlinks and foreign ownership.
 Reuse a lock only across directly identical dependency inputs. Restore the
 prior lock and verified link state after a failed provision, and ask before
-network access. After provisioning, use `UV_NO_SYNC=1`; refresh the lock and
-environment yourself before validation whenever dependency inputs change.
+network access. After provisioning, set `UV_NO_SYNC=1` on every implementation
+and validation command, use direct uv commands as `uv run` without
+`--no-sync`, and do not set `PYTHONPATH`. Refresh the lock and environment
+yourself before validation whenever dependency inputs change.
 
 Fetch the exact latest base and selected remote head. Record the remote head
 SHA as the future lease. Create scratch branches from the exact latest base.
@@ -271,9 +276,11 @@ discarding it. Never publish a reassessment comment.
 
 Implement the smallest cohesive change satisfying every selected issue. Track
 coverage per issue throughout the work. Add focused tests where practical. Run
-the fastest relevant checks under the recorded environment and always set
-`UV_NO_SYNC=1` for Python work. Shared mode also sets the derived `PYTHONPATH`
-on every command; isolated mode relies on its worktree-local editable install.
+the fastest relevant checks under the recorded environment. Set
+`UV_NO_SYNC=1` on every Python command so child processes inherit it; invoke
+direct uv commands as `uv run` without `--no-sync`. Shared mode also sets the
+absolute `PYTHONPATH` derived from the assigned worktree and recorded relative
+roots; isolated mode relies on its worktree-local editable install.
 Run the repository's pre-commit command under the same environment when the
 project uses pre-commit.
 
