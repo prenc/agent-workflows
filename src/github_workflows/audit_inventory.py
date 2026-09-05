@@ -337,6 +337,7 @@ def probe_program(
             try:
                 result = subprocess.run(
                     sandbox_command(worktree, [str(executable), *arguments], readonly_root),
+                    check=False,
                     capture_output=True,
                     timeout=WALL_SECONDS,
                     env=environment,

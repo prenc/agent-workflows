@@ -222,7 +222,7 @@ def main() -> int:
                 print(json.dumps(decision("deny", DENIAL)))
                 return 0
         print(json.dumps(decision("allow")))
-    except Exception:
+    except Exception:  # noqa: BLE001 - boundary hooks must fail safely on malformed input
         if (
             isinstance(payload, dict)
             and payload.get("agent_type") == "gh-audit-repo-worker"

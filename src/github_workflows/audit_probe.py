@@ -149,6 +149,7 @@ def module_available(python: Path, module: str) -> bool:
             "-c",
             f"import importlib.util; raise SystemExit(importlib.util.find_spec({module!r}) is None)",
         ],
+        check=False,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         timeout=10,

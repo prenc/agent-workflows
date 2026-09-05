@@ -268,8 +268,10 @@ def validate(connection: sqlite3.Connection, repo: str, kind: str) -> dict[str, 
     expected_kind = "records" if kind == "records" else "audit-history"
     if meta.get("database_kind") != expected_kind:
         raise ValueError("cache database kind does not match")
-    table = "records" if kind == "records" else "observations"
-    count = connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+    count_query = (
+        "SELECT COUNT(*) FROM records" if kind == "records" else "SELECT COUNT(*) FROM observations"
+    )
+    count = connection.execute(count_query).fetchone()[0]
     return {"metadata": meta, "count": count}
 
 
@@ -450,7 +452,7 @@ def upsert_record(connection: sqlite3.Connection, item: dict[str, Any]) -> None:
         f"{column}=excluded.{column}" for column in columns if column not in {"kind", "number"}
     )
     connection.execute(
-        f"INSERT INTO records ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)}) "
+        f"INSERT INTO records ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)}) "  # noqa: S608 - columns come from normalized records
         f"ON CONFLICT(kind, number) DO UPDATE SET {assignments}",
         [item[column] for column in columns],
     )

@@ -150,6 +150,7 @@ class TestAuditMetrics:
                 "--run-dir",
                 str(other),
             ],
+            check=False,
             capture_output=True,
             text=True,
         )

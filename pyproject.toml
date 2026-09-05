@@ -42,12 +42,41 @@ line-length = 100
 
 [tool.ruff.lint]
 select = [
-    "B", "C4", "E", "F", "I", "PIE", "PT", "RUF", "UP", "W",
+    "A",       # flake8-builtins
+    "ASYNC",   # flake8-async
+    "B",       # flake8-bugbear
+    "BLE",     # flake8-blind-except
+    "C4",      # flake8-comprehensions
+    "DTZ",     # flake8-datetimez
+    "E",       # pycodestyle errors
+    "F",       # pyflakes
+    "G",       # flake8-logging-format
+    "I",       # isort
+    "LOG",     # flake8-logging
+    "N",       # pep8-naming
+    "PGH",     # pygrep-hooks
+    "PIE",     # flake8-pie
+    "PLE",     # pylint errors
+    "PLW1510", # subprocess.run without check
+    "PT",      # flake8-pytest-style
+    "RUF",     # Ruff-specific rules
+    "S",       # flake8-bandit
+    "TRY400",  # error-instead-of-exception
+    "UP",      # pyupgrade
+    "W",       # pycodestyle warnings
 ]
-ignore = ["E501", "UP022"]
+ignore = [
+    "E501",
+    "S603", # subprocess execution is a core, separately validated workflow capability
+    "S607", # workflow tools intentionally resolve trusted executables from PATH
+    "UP022",
+]
 
 [tool.ruff.lint.isort]
 known-first-party = ["github_workflows"]
 
 [tool.ruff.lint.per-file-ignores]
+"extensions/github-workflows/hooks/*.py" = ["S101", "S105"]
 "src/github_workflows/*.py" = ["B904"]
+"src/github_workflows/github_cache.py" = ["S108", "S606"]
+"tests/**/*.py" = ["ASYNC240", "S101", "S108"]
