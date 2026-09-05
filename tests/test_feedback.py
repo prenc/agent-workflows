@@ -798,11 +798,11 @@ def test_feedback_resolve_rejects_duplicate_and_conflicting_records(cache: Path)
     assert path.read_bytes() == resolved
 
 
-def test_feedback_close_cli_accepts_structured_input(
+def test_feedback_close_cli_accepts_resolution_list(
     cache: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     result = append_feedback(message="Resolve through CLI")
-    request = json.dumps({"resolutions": [{"ref": result["ref"], "disposition": "not-actionable"}]})
+    request = json.dumps([{"ref": result["ref"], "disposition": "not-actionable"}])
     args = build_parser().parse_args(["feedback", "close", "--input", request, "--json"])
 
     assert run_feedback(args) == 0
@@ -816,6 +816,33 @@ def test_feedback_close_cli_accepts_structured_input(
     )
     with pytest.raises(ValueError, match="cannot be combined"):
         run_feedback(conflicting)
+
+    wrapped = build_parser().parse_args(
+        [
+            "feedback",
+            "close",
+            "--input",
+            json.dumps({"resolutions": [{"ref": result["ref"], "disposition": "addressed"}]}),
+        ]
+    )
+    with pytest.raises(ValueError, match="resolutions must be a non-empty array"):
+        run_feedback(wrapped)
+
+
+def test_feedback_close_cli_accepts_inline_json_longer_than_a_filename(
+    cache: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    result = append_feedback(message="Resolve a large atomic request")
+    note = ("validated context " * 20).strip()
+    request = json.dumps([{"ref": result["ref"], "disposition": "addressed", "note": note}])
+    assert len(request) > 255
+    args = build_parser().parse_args(["feedback", "close", "--input", request, "--json"])
+
+    assert run_feedback(args) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["changed"] == 1
+    assert feedback.find(str(result["ref"]))["resolution"]["note"] == note
 
 
 def test_feedback_legacy_payloads_are_scrubbed_atomically(cache: Path) -> None:

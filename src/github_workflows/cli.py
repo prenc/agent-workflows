@@ -39,16 +39,19 @@ REQUESTS = {
 }
 
 
-def load_request(raw: str) -> dict[str, Any]:
+def load_json(raw: str) -> Any:
     if raw == "-":
-        value = json.load(sys.stdin)
-    else:
-        candidate = Path(raw)
-        value = (
-            json.loads(candidate.read_text(encoding="utf-8"))
-            if candidate.is_file()
-            else json.loads(raw)
-        )
+        return json.load(sys.stdin)
+    candidate = Path(raw)
+    try:
+        is_file = candidate.is_file()
+    except OSError:
+        is_file = False
+    return json.loads(candidate.read_text(encoding="utf-8")) if is_file else json.loads(raw)
+
+
+def load_request(raw: str) -> dict[str, Any]:
+    value = load_json(raw)
     if not isinstance(value, dict):
         raise ValueError("request must be a JSON object")
     return value
@@ -141,7 +144,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--note",
         help="optional short PHI-free resolution note",
     )
-    feedback_close.add_argument("--input", help="JSON resolution object, JSON file, or - for stdin")
+    feedback_close.add_argument("--input", help="JSON resolution list, JSON file, or - for stdin")
     feedback_close.add_argument(
         "--json", action="store_true", dest="json_output", help="print machine-readable JSON"
     )
@@ -220,10 +223,7 @@ def run_feedback(args: argparse.Namespace) -> int:
                 raise ValueError(
                     "feedback close --input cannot be combined with IDs, --disposition, or --note"
                 )
-            request = load_request(args.input)
-            if set(request) != {"resolutions"}:
-                raise ValueError("close input requires only a resolutions array")
-            result = feedback.resolve_records(request["resolutions"])
+            result = feedback.resolve_records(load_json(args.input))
             print(
                 json.dumps(result, indent=2, sort_keys=True)
                 if args.json_output

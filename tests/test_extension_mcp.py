@@ -1558,6 +1558,7 @@ class TestExtensionMcp:
                     "non-conflicting root-cause group",
                     "consolidate overlapping owning tests",
                     "feedback close --input <JSON|file|->",
+                    "do not wrap it in a `resolutions` object",
                     "Prefer `--input -` with stdin",
                     "Ask the user before calling `feedback trace`",
                     "never use `feedback remove`",

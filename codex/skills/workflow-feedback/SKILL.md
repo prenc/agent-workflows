@@ -129,8 +129,8 @@ After validation, close every proven record in the group with one concise note:
 
 Apply mixed validated dispositions in one atomic
 `agent-workflows feedback close --input <JSON|file|->` request. The request
-contains a `resolutions` array whose entries have `ref`, `disposition`, and an
-optional `note`. Prefer `--input -` with stdin for generated JSON so it cannot
+is a JSON array whose entries have `ref`, `disposition`, and an optional
+`note`; do not wrap it in a `resolutions` object. Prefer `--input -` with stdin for generated JSON so it cannot
 be mistaken for a file path. Use positional `feedback close` for a simple group
 sharing one disposition and note; never use `feedback remove` as routine cleanup. Leave
 partial or ambiguous records open. Reopen a record when later review invalidates

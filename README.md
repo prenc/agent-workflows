@@ -81,9 +81,8 @@ selecting a disposition and a short PHI-free note; default lists
 show only open feedback, while `feedback ls --closed` inspects the retained
 closed set. Use `feedback reopen` to restore a
 closed record. Apply mixed dispositions atomically with
-`feedback close --input <JSON|file|->`, whose `resolutions` entries contain
-`ref`, `disposition`, and an optional `note`. `feedback remove` remains the
-explicit permanent-deletion command.
+`feedback close --input <JSON-list|file|->`; `feedback remove` permanently
+deletes records.
 
 The `workflow-feedback` skill is available to both Codex and Qwen. With no
 explicit action it performs read-only inventory, investigation, classification,
