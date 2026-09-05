@@ -63,6 +63,8 @@ def canonical_area(value: Any) -> dict[str, Any]:
     area = value.get("area") or value.get("id")
     if area is None and isinstance(value.get("title"), str) and value["title"].startswith("area/"):
         area = value["title"]
+    if not isinstance(area, str) or not area:
+        raise ValueError("each area requires a non-empty string area identifier")
     slug(area)
     title = value.get("title")
     if title == area:
