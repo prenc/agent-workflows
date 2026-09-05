@@ -694,12 +694,13 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
 
     @mcp.tool(annotations=CONTROL_WRITE, structured_output=True)
     def audit_publish(
-        action: Literal["begin", "finish", "uncertain"],
+        action: Literal["begin", "finish", "uncertain", "failed"],
         candidate_id: str,
         operation: Literal["create", "update", "no-op", "close", "dry-run"] | None = None,
         receipt: JsonObjectArgument[dict[str, Any] | None] = None,
+        error: str | None = None,
     ) -> dict[str, Any]:
-        """Begin publication or finish it atomically with its receipt and disposition."""
+        """Begin publication or record its typed finish, uncertain, or failed outcome."""
         return _request_call(runtime.audit_publish, PublishRequest, **locals())
 
     @mcp.tool(annotations=LOCAL_WRITE, structured_output=True)

@@ -372,6 +372,49 @@ class TestRuntimeSafety:
                 input=source,
             )
 
+    def attach_managed_worktree(self, runtime: WorkflowRuntime) -> Path:
+        state = runtime.state("gh-audit-repo")
+        managed_worktree = runtime.workspace / ".worktrees" / f"gh-audit-repo-{state['sha'][:7]}"
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(runtime.workspace),
+                "worktree",
+                "add",
+                "--detach",
+                str(managed_worktree),
+                "HEAD",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        state["audit_worktree"] = str(managed_worktree)
+        workflow_run.write_state(runtime.current("gh-audit-repo"), state)
+        return managed_worktree
+
+    def start_replacement_audit(
+        self, runtime: WorkflowRuntime, *, acknowledge: bool = False
+    ) -> None:
+        (runtime.workspace / "second.txt").write_text("second\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(runtime.workspace), "add", "second.txt"], check=True)
+        subprocess.run(["git", "-C", str(runtime.workspace), "commit", "-qm", "second"], check=True)
+        with mock.patch.object(
+            WorkflowRuntime,
+            "_worktree_root",
+            return_value=(runtime.workspace / ".worktrees").resolve(),
+        ):
+            runtime.run_manage(
+                RunManageRequest(
+                    action="start",
+                    workflow="gh-audit-repo",
+                    repository="example/repo",
+                    source_confirmed=True,
+                    acknowledge_pending_publication=acknowledge,
+                )
+            )
+
     def test_fresh_start_cleanup_is_limited_to_previous_run_artifacts(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-fresh-start-") as directory:
             runtime = self.make_runtime(Path(directory))
@@ -411,6 +454,86 @@ class TestRuntimeSafety:
 
             assert runtime.current("gh-audit-repo").is_dir()
 
+    def test_terminal_run_replacement_removes_worktree_and_staging(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-terminal-replacement-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            first = runtime.state("gh-audit-repo")
+            managed_worktree = self.attach_managed_worktree(runtime)
+            staging = github_cache.repo_dir(runtime.project_dir, "example/repo") / "staging"
+            staging.mkdir(parents=True)
+            transaction = staging / f"records-{first['run_id']}.sqlite3"
+            transaction.write_text("stale", encoding="utf-8")
+
+            runtime.run_manage(RunManageRequest(action="abort", workflow="gh-audit-repo"))
+            assert runtime.state("gh-audit-repo")["status"] == "aborted"
+
+            self.start_replacement_audit(runtime)
+
+            assert not managed_worktree.exists()
+            assert not transaction.exists()
+            listed = subprocess.run(
+                ["git", "-C", str(runtime.workspace), "worktree", "list", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            assert f"worktree {managed_worktree}" not in listed
+            replaced = runtime.state("gh-audit-repo")
+            assert replaced["run_id"] != first["run_id"]
+            assert Path(replaced["audit_worktree"]) != managed_worktree
+            assert Path(replaced["audit_worktree"]).exists()
+
+    def test_terminal_run_pending_publication_requires_acknowledgement(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-terminal-pending-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            first = runtime.state("gh-audit-repo")
+            managed_worktree = self.attach_managed_worktree(runtime)
+            state = runtime.state("gh-audit-repo")
+            state["history"].update(
+                {"publication_pending": True, "candidate_id": "C-1", "operation": "create"}
+            )
+            workflow_run.write_state(runtime.current("gh-audit-repo"), state)
+
+            runtime.run_manage(RunManageRequest(action="abort", workflow="gh-audit-repo"))
+
+            with mock.patch.object(
+                WorkflowRuntime,
+                "_worktree_root",
+                return_value=(runtime.workspace / ".worktrees").resolve(),
+            ):
+                with pytest.raises(
+                    ValueError,
+                    match="pending publication \\(candidate C-1, operation create\\)",
+                ):
+                    runtime.run_manage(
+                        RunManageRequest(
+                            action="start",
+                            workflow="gh-audit-repo",
+                            repository="example/repo",
+                            source_confirmed=True,
+                        )
+                    )
+            assert runtime.state("gh-audit-repo")["run_id"] == first["run_id"]
+            assert managed_worktree.exists()
+
+            with mock.patch(
+                "github_workflows.runtime.workflow_run.append_journal",
+                wraps=workflow_run.append_journal,
+            ) as journal:
+                self.start_replacement_audit(runtime, acknowledge=True)
+            journal.assert_any_call(
+                runtime.current("gh-audit-repo"),
+                "publication_discarded",
+                candidate_id="C-1",
+                operation="create",
+            )
+            replaced = runtime.state("gh-audit-repo")
+            assert replaced["run_id"] != first["run_id"]
+            assert not managed_worktree.exists()
+            assert replaced["history"]["publication_pending"] is False
+
     def test_every_public_request_rejects_unknown_fields(self) -> None:
         cases = [
             (
@@ -440,6 +563,13 @@ class TestRuntimeSafety:
         for model, payload in cases:
             with pytest.raises(ValidationError):
                 model.model_validate({**payload, "typo_field": True})
+        with pytest.raises(ValidationError):
+            RunManageRequest(
+                action="start",
+                workflow="gh-curate-issues",
+                repository="x/y",
+                acknowledge_pending_publication=True,
+            )
 
     def test_history_query_is_bounded_and_requires_a_selector(self) -> None:
         assert HistoryQueryRequest(state="open").limit == 25
@@ -879,6 +1009,55 @@ class TestRuntimeSafety:
                 "publication_pending": False,
                 "receipt": {"url": "https://example.invalid/1"},
             }
+
+    def test_publication_failed_records_typed_failure_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-publish-failed-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.audit_record(
+                AuditRecordRequest(
+                    action="candidate", candidate={"id": "C-1", "status": "verified"}
+                )
+            )
+            runtime.audit_publish(
+                PublishRequest(action="begin", candidate_id="C-1", operation="create")
+            )
+            result = runtime.audit_publish(
+                PublishRequest(
+                    action="failed",
+                    candidate_id="C-1",
+                    error="GitHub API rate limit exceeded",
+                )
+            )
+
+            state = runtime.state("gh-audit-repo")
+            assert result["publication"]["publication_pending"] is False
+            assert result["publication"]["outcome"] == "failed"
+            assert result["publication"]["error"] == "GitHub API rate limit exceeded"
+            assert result["publication"]["operation"] == "create"
+            assert "receipt" not in result["publication"]
+            assert state["mutations"] == []
+            assert state["candidates"]["C-1"]["status"] == "verified"
+
+            with pytest.raises(ValueError, match="no publication is pending"):
+                runtime.audit_publish(
+                    PublishRequest(action="failed", candidate_id="C-1", error="again")
+                )
+
+            # The run is unblocked: a retry can begin, and uncertain remains
+            # distinguishable by keeping the transaction pending.
+            runtime.audit_publish(
+                PublishRequest(action="begin", candidate_id="C-1", operation="create")
+            )
+            runtime.audit_publish(PublishRequest(action="uncertain", candidate_id="C-1"))
+            uncertain = runtime.state("gh-audit-repo")["history"]
+            assert uncertain["publication_pending"] is True
+            assert uncertain["outcome"] == "uncertain"
+
+            with pytest.raises(ValidationError):
+                PublishRequest(action="failed", candidate_id="C-1")
+            with pytest.raises(ValidationError):
+                PublishRequest(action="failed", candidate_id="C-1", error="x", typo=True)
 
     def test_missing_history_query_does_not_create_a_database(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-history-readonly-") as directory:

@@ -801,12 +801,17 @@ def audit_event(args: argparse.Namespace) -> None:
             artifact_path = (current / artifact_ref).resolve()
             validation_root = (current / "validation").resolve()
             try:
-                artifact_path.relative_to(validation_root)
+                relative = artifact_path.relative_to(validation_root)
             except ValueError as error:
                 raise ValueError(
                     "validation artifact must be inside the current run validation directory"
                 ) from error
-            if artifact_path.name != "result.json" or not artifact_path.is_file():
+            if len(relative.parts) != 2 or relative.parts[1] != "result.json":
+                raise ValueError(
+                    "validation artifact must follow the depth-1 probe layout "
+                    "validation/<probe_id>/result.json"
+                )
+            if not artifact_path.is_file():
                 raise ValueError("validation artifact must be an existing result.json")
             candidate_id = value.get("candidate_id")
             if candidate_id is not None and candidate_id not in state["candidates"]:
@@ -817,6 +822,40 @@ def audit_event(args: argparse.Namespace) -> None:
         identity = {identity_field: unit_id}
         state[target][unit_id] = {**existing, **value, **identity}
         detail = {identity_field if field == "verdict" else f"{field}_id": unit_id}
+    elif event_type == "candidate-correct":
+        candidate = payload.get("candidate")
+        if not isinstance(candidate, dict):
+            raise ValueError("candidate-correct requires a candidate object")
+        candidate_id = require_string(candidate.get("id"), "candidate id")
+        existing = state["candidates"].get(candidate_id)
+        if not isinstance(existing, dict):
+            raise ValueError(f"unknown candidate: {candidate_id}")
+        if existing.get("status") not in AUDIT_CANDIDATE_TERMINAL:
+            raise ValueError("candidate correction applies only to a terminal candidate status")
+        if any(
+            isinstance(mutation, dict) and mutation.get("candidate_id") == candidate_id
+            for mutation in state.get("mutations", [])
+        ):
+            raise ValueError("candidate correction is unavailable while a mutation record exists")
+        status = candidate.get("status", existing.get("status"))
+        if status not in AUDIT_CANDIDATE_STATUSES:
+            raise ValueError("candidate requires a supported lifecycle status")
+        if status == existing.get("status"):
+            raise ValueError("candidate is already in the corrected status")
+        reason = require_string(payload.get("reason"), "correction reason")
+        state["candidates"][candidate_id] = {
+            **existing,
+            "status": status,
+            "corrected_from": existing.get("status"),
+            "correction_reason": reason,
+            "updated_at": utc_now(),
+        }
+        detail = {
+            "candidate_id": candidate_id,
+            "previous_status": existing.get("status"),
+            "candidate_status": status,
+            "reason": reason,
+        }
     elif event_type == "mutation-record":
         mutation = payload.get("mutation")
         if not isinstance(mutation, dict):
