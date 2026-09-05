@@ -900,6 +900,12 @@ def _rewrite(path: Path, records: list[dict[str, Any]]) -> None:
         os.close(directory)
 
 
+def _reject_conflicting_close(record: dict[str, Any], resolution: dict[str, str]) -> None:
+    """Shared closed-record rule: re-closing under a different resolution needs a reopen."""
+    if record.get("status", "open") == "closed" and record.get("resolution") != resolution:
+        raise ValueError("closed feedback has a different resolution; reopen it first")
+
+
 def resolve_records(resolutions: Any) -> dict[str, Any]:
     """Atomically close records with independently specified dispositions."""
     if not isinstance(resolutions, list) or not resolutions:
@@ -941,8 +947,7 @@ def resolve_records(resolutions: Any) -> dict[str, Any]:
             resolution = {"disposition": item["disposition"]}
             if "note" in item:
                 resolution["note"] = item["note"]
-            if record.get("status", "open") == "closed" and record.get("resolution") != resolution:
-                raise ValueError("closed feedback has a different resolution; reopen it first")
+            _reject_conflicting_close(record, resolution)
             selected.append((record, item, resolution))
 
         timestamp = dt.datetime.now(dt.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -1006,6 +1011,8 @@ def set_closed(
             resolution["note"] = note
         changed: list[dict[str, Any]] = []
         for record in selected:
+            if closed:
+                _reject_conflicting_close(record, resolution)
             expected_resolution = resolution if closed else None
             if (
                 record.get("status", "open") == status
@@ -1041,11 +1048,6 @@ def remove(feedback_ids: list[str]) -> list[str]:
         retained = [record for record in records if record.get("feedback_id") not in selected_set]
         _rewrite(path, retained)
     return selected_ids
-
-
-def _display_id(value: Any) -> str:
-    rendered = str(value or "-")
-    return rendered[-SHORT_REF_LENGTH:] if rendered.startswith("fb-") else rendered
 
 
 def _display_time(value: Any) -> str:
