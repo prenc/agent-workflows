@@ -558,7 +558,7 @@ class IdentifiedAuditValue(ExtensibleRecord):
 class ShardRecordValue(IdentifiedAuditValue):
     area: str | None = None
     status: ShardStatus | None = None
-    paths: list[str] = Field(default_factory=list)
+    paths: list[str] | None = None
 
 
 class CandidateRecordValue(IdentifiedAuditValue):

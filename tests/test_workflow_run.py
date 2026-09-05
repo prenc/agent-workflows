@@ -379,6 +379,187 @@ class TestWorkflowRun:
         )
         assert json.loads(finalized.stdout)["status"] == "complete"
 
+    def test_status_only_shard_upsert_preserves_owned_shard(self) -> None:
+        self.initialize()
+        result = self.audit_event(
+            1,
+            {
+                "type": "task-register",
+                "task": {
+                    "id": "task-1",
+                    "logical_id": "discover-core",
+                    "role": "discover",
+                    "unit": "shard/core",
+                    "status": "running",
+                    "assignment": {
+                        "mode": "discover",
+                        "shard_id": "shard/core",
+                        "area": "area/core",
+                        "paths": ["a.py", "b.py"],
+                    },
+                },
+            },
+        )
+        revision = json.loads(result.stdout)["revision"]
+        result = self.audit_event(
+            revision,
+            {
+                "type": "task-transition",
+                "task_id": "task-1",
+                "status": "completed",
+                "report_status": "complete",
+                "result": self.result_artifact("core.json"),
+            },
+        )
+        revision = json.loads(result.stdout)["revision"]
+        upsert = self.audit_event(
+            revision,
+            {
+                "type": "shard-upsert",
+                "shard": {"id": "shard/core", "status": "complete"},
+            },
+        )
+        revision = json.loads(upsert.stdout)["revision"]
+        state = json.loads(
+            (self.project_dir / "workflows/gh-audit-repo/current/state.json").read_text()
+        )
+        assert state["shards"]["shard/core"] == {
+            "id": "shard/core",
+            "area": "area/core",
+            "paths": ["a.py", "b.py"],
+            "status": "complete",
+        }
+        started = self.audit_event(revision, {"type": "integration-start", "task_id": "task-1"})
+        revision = json.loads(started.stdout)["revision"]
+        self.audit_event(revision, {"type": "integration-complete", "task_id": "task-1"})
+        state = json.loads(
+            (self.project_dir / "workflows/gh-audit-repo/current/state.json").read_text()
+        )
+        assert state["tasks"]["task-1"]["integrated"] is True
+        assert state["shards"]["shard/core"]["paths"] == ["a.py", "b.py"]
+
+    def test_desyncing_shard_upsert_is_rejected_with_field_error(self) -> None:
+        self.initialize()
+        result = self.audit_event(
+            1,
+            {
+                "type": "task-register",
+                "task": {
+                    "id": "task-1",
+                    "logical_id": "discover-core",
+                    "role": "discover",
+                    "unit": "shard/core",
+                    "status": "running",
+                    "assignment": {
+                        "mode": "discover",
+                        "shard_id": "shard/core",
+                        "area": "area/core",
+                        "paths": ["a.py", "b.py"],
+                    },
+                },
+            },
+        )
+        revision = json.loads(result.stdout)["revision"]
+        paths = self.audit_event(
+            revision,
+            {
+                "type": "shard-upsert",
+                "shard": {"id": "shard/core", "status": "skipped", "paths": []},
+            },
+            check=False,
+        )
+        assert paths.returncode == 2
+        assert "shard paths does not match the owning task assignment" in paths.stderr
+        area = self.audit_event(
+            revision,
+            {
+                "type": "shard-upsert",
+                "shard": {"id": "shard/core", "area": "area/other", "status": "skipped"},
+            },
+            check=False,
+        )
+        assert area.returncode == 2
+        assert "shard area does not match the owning task assignment" in area.stderr
+        state = json.loads(
+            (self.project_dir / "workflows/gh-audit-repo/current/state.json").read_text()
+        )
+        assert state["revision"] == revision
+        assert state["shards"]["shard/core"]["area"] == "area/core"
+        assert state["shards"]["shard/core"]["paths"] == ["a.py", "b.py"]
+        assert state["shards"]["shard/core"]["status"] == "pending"
+
+    def test_replacement_and_transitions_succeed_after_status_only_upsert(self) -> None:
+        self.initialize()
+        assignment = {
+            "mode": "discover",
+            "shard_id": "shard/core",
+            "area": "area/core",
+            "paths": ["a.py", "b.py"],
+        }
+        result = self.audit_event(
+            1,
+            {
+                "type": "task-register",
+                "task": {
+                    "id": "task-1",
+                    "logical_id": "discover-core",
+                    "role": "discover",
+                    "unit": "shard/core",
+                    "status": "running",
+                    "assignment": assignment,
+                },
+            },
+        )
+        revision = json.loads(result.stdout)["revision"]
+        upsert = self.audit_event(
+            revision,
+            {
+                "type": "shard-upsert",
+                "shard": {"id": "shard/core", "status": "partial"},
+            },
+        )
+        revision = json.loads(upsert.stdout)["revision"]
+        failed = self.audit_event(
+            revision,
+            {
+                "type": "task-transition",
+                "task_id": "task-1",
+                "status": "failed",
+                "error": "worker lost",
+            },
+        )
+        revision = json.loads(failed.stdout)["revision"]
+        started = self.audit_event(revision, {"type": "integration-start", "task_id": "task-1"})
+        revision = json.loads(started.stdout)["revision"]
+        finished = self.audit_event(revision, {"type": "integration-complete", "task_id": "task-1"})
+        revision = json.loads(finished.stdout)["revision"]
+        replaced = self.audit_event(
+            revision,
+            {
+                "type": "task-register",
+                "task": {
+                    "id": "task-2",
+                    "logical_id": "discover-core",
+                    "role": "discover",
+                    "unit": "shard/core",
+                    "attempt": 2,
+                    "status": "running",
+                    "assignment": assignment,
+                },
+            },
+        )
+        revision = json.loads(replaced.stdout)["revision"]
+        completed = self.audit_event(
+            revision,
+            {
+                "type": "task-transition",
+                "task_id": "task-2",
+                "status": "completed",
+                "result": self.result_artifact("core-2.json"),
+            },
+        )
+        assert json.loads(completed.stdout)["revision"] > revision
+
     def test_candidate_updates_merge_and_terminal_disposition_is_stable(self) -> None:
         self.initialize()
         result = self.audit_event(
