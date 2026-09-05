@@ -7,8 +7,11 @@ import sys
 import tempfile
 import venv
 from pathlib import Path
+from unittest import mock
 
 import pytest
+
+from github_workflows import audit_probe
 
 HELPER = Path(__file__).parents[1] / "src/github_workflows/audit_probe.py"
 
@@ -238,3 +241,19 @@ print("isolated")
         artifact = json.loads(Path(summary["result"]).read_text())
         assert artifact["probe_status"] == "unavailable"
         assert artifact["environment"]["python_source"] == "project-venv"
+
+    def test_git_output_passes_explicit_timeout(self) -> None:
+        completed = subprocess.CompletedProcess(["git"], 0, stdout="sha\n", stderr="")
+        with mock.patch(
+            "github_workflows.audit_probe.subprocess.run", return_value=completed
+        ) as run:
+            assert audit_probe.git_output(Path("/missing"), "rev-parse", "HEAD") == "sha"
+        assert run.call_args.kwargs["timeout"] == audit_probe.GIT_SECONDS
+
+    def test_git_output_timeout_is_a_bounded_error(self) -> None:
+        with mock.patch(
+            "github_workflows.audit_probe.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["git"], timeout=audit_probe.GIT_SECONDS),
+        ):
+            with pytest.raises(ValueError, match="timed out after"):
+                audit_probe.git_output(Path("/missing"), "status")

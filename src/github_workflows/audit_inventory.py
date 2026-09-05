@@ -166,14 +166,9 @@ def manifest_inventory(worktree: Path) -> dict[str, Any]:
     return result
 
 
-def initialize(args: argparse.Namespace) -> None:
-    project, worktree, run_dir = validate_paths(args)
-    path = inventory_path(run_dir)
-    state = json.loads(path.read_text(encoding="utf-8"))
-    if isinstance(state, dict) and "inventory" in state:
-        raise ValueError("environment inventory already exists")
+def build_initial_inventory(project: Path, worktree: Path) -> dict[str, Any]:
     now = utc_now()
-    value = {
+    return {
         "schema_version": 1,
         "revision": 1,
         "created_at": now,
@@ -187,23 +182,45 @@ def initialize(args: argparse.Namespace) -> None:
         },
         "requests": {},
     }
+
+
+def commit_initial_inventory(run_dir: Path, value: dict[str, Any]) -> dict[str, Any]:
+    path = inventory_path(run_dir)
+    state = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(state, dict) and "inventory" in state:
+        raise ValueError("environment inventory already exists")
     state_revision = write_inventory(
-        run_dir, value, {"type": "inventory_initialized", "revision": 1, "timestamp": now}
+        run_dir,
+        value,
+        {"type": "inventory_initialized", "revision": 1, "timestamp": value["updated_at"]},
     )
-    print(json.dumps({"inventory": str(path), "revision": 1, "state_revision": state_revision}))
+    return {"inventory": str(path), "revision": 1, "state_revision": state_revision}
 
 
-def refresh(args: argparse.Namespace) -> None:
+def initialize(args: argparse.Namespace) -> None:
     project, worktree, run_dir = validate_paths(args)
+    state = json.loads(inventory_path(run_dir).read_text(encoding="utf-8"))
+    if isinstance(state, dict) and "inventory" in state:
+        raise ValueError("environment inventory already exists")
+    value = build_initial_inventory(project, worktree)
+    print(json.dumps(commit_initial_inventory(run_dir, value)))
+
+
+def refresh_sources(project: Path, worktree: Path) -> dict[str, Any]:
+    return {
+        "python_environment": package_inventory(project),
+        "repository_manifests": manifest_inventory(worktree),
+    }
+
+
+def commit_refresh(
+    run_dir: Path, current: dict[str, Any], expected_revision: int
+) -> dict[str, Any]:
     value = load_inventory(run_dir)
-    check_revision(value, args.expected_revision)
+    check_revision(value, expected_revision)
     previous = {
         "python_environment": value["sources"]["python_environment"],
         "repository_manifests": value["sources"]["repository_manifests"],
-    }
-    current = {
-        "python_environment": package_inventory(project),
-        "repository_manifests": manifest_inventory(worktree),
     }
     changed = previous != current
     value["sources"].update(current)
@@ -220,16 +237,20 @@ def refresh(args: argparse.Namespace) -> None:
             "timestamp": now,
         },
     )
-    print(
-        json.dumps(
-            {
-                "inventory": str(inventory_path(run_dir)),
-                "revision": value["revision"],
-                "state_revision": state_revision,
-                "changed": changed,
-            }
-        )
-    )
+    return {
+        "inventory": str(inventory_path(run_dir)),
+        "revision": value["revision"],
+        "state_revision": state_revision,
+        "changed": changed,
+    }
+
+
+def refresh(args: argparse.Namespace) -> None:
+    project, worktree, run_dir = validate_paths(args)
+    value = load_inventory(run_dir)
+    check_revision(value, args.expected_revision)
+    current = refresh_sources(project, worktree)
+    print(json.dumps(commit_refresh(run_dir, current, args.expected_revision)))
 
 
 def limits() -> None:
@@ -384,13 +405,9 @@ def probe_program(
     return fact
 
 
-def inspect_programs(args: argparse.Namespace) -> None:
-    project, worktree, run_dir = validate_paths(args)
-    probes = json.loads(args.input.read_text(encoding="utf-8"))
-    if not isinstance(probes, list) or not probes:
-        raise ValueError("program probes input must be a non-empty JSON list")
-    value = load_inventory(run_dir)
-    check_revision(value, args.expected_revision)
+def collect_program_facts(
+    project: Path, worktree: Path, run_dir: Path, probes: list[Any]
+) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     facts: dict[str, dict[str, Any]] = {}
     request_ids: dict[str, str] = {}
     for probe in probes:
@@ -406,6 +423,17 @@ def inspect_programs(args: argparse.Namespace) -> None:
                 raise ValueError(f"program {name} request_id contains unsupported characters")
             request_ids[request_id] = name
         facts[name] = probe_program(project, worktree, run_dir, name, arguments)
+    return facts, request_ids
+
+
+def commit_program_facts(
+    run_dir: Path,
+    facts: dict[str, dict[str, Any]],
+    request_ids: dict[str, str],
+    expected_revision: int,
+) -> dict[str, Any]:
+    value = load_inventory(run_dir)
+    check_revision(value, expected_revision)
     value["sources"]["programs"].update(facts)
     for request_id, name in request_ids.items():
         value["requests"][request_id] = {"status": "resolved", "fact": f"program:{name}"}
@@ -422,16 +450,23 @@ def inspect_programs(args: argparse.Namespace) -> None:
             "timestamp": value["updated_at"],
         },
     )
-    print(
-        json.dumps(
-            {
-                "inventory": str(inventory_path(run_dir)),
-                "revision": value["revision"],
-                "state_revision": state_revision,
-                "facts": facts,
-            }
-        )
-    )
+    return {
+        "inventory": str(inventory_path(run_dir)),
+        "revision": value["revision"],
+        "state_revision": state_revision,
+        "facts": facts,
+    }
+
+
+def inspect_programs(args: argparse.Namespace) -> None:
+    project, worktree, run_dir = validate_paths(args)
+    probes = json.loads(args.input.read_text(encoding="utf-8"))
+    if not isinstance(probes, list) or not probes:
+        raise ValueError("program probes input must be a non-empty JSON list")
+    value = load_inventory(run_dir)
+    check_revision(value, args.expected_revision)
+    facts, request_ids = collect_program_facts(project, worktree, run_dir, probes)
+    print(json.dumps(commit_program_facts(run_dir, facts, request_ids, args.expected_revision)))
 
 
 def record_facts(args: argparse.Namespace) -> None:
