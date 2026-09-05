@@ -20,6 +20,12 @@ availability failure:
   server-availability error;
 - the server reports authentication or authorization failure.
 
+A connected status badge is not evidence that tools are declared or callable.
+When tools are absent from a restored session, do not spend turns searching for
+or re-registering them in-session and do not spawn workers. Checkpoint and end
+the run under this policy, reporting that a new session or corrected client tool
+registration is required.
+
 Tool exposure alone is not a failure for a runtime such as Codex where
 subagents inherit the parent session's complete MCP schema. In that runtime,
 `read-only worker` constrains authorized tool use: the worker calls only GitHub

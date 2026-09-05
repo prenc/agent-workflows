@@ -70,6 +70,9 @@ external requests. Documentation research may clarify terminology or public API
 semantics, while GitHub records remain the evidence for curation decisions.
 Record MCP queries and public URLs used. Documentation-tool unavailability is a
 reported limitation unless the assigned decision depends on that documentation.
+After a quota or authentication rejection, record one limitation, make no more
+calls to that provider in this assignment, and use known official public
+sources instead.
 
 The worker's complete activity is analysis and reporting for its assigned
 issue. GitHub publication, local file changes, source inspection, PR-diff

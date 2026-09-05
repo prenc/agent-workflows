@@ -431,7 +431,10 @@ Track library-resolution attempts separately and cache successful facts by
 provider, library ID, version/constraint, and normalized question. A worker that
 still has a material documentation question returns a `CONTEXT_REQUEST` for a
 supervisor-approved extension of five queries; the extension and use count are
-recorded in state.
+recorded in state. A provider quota or authentication rejection makes Context7
+unavailable for the rest of that assignment: record one limitation, do not
+repeat resolution calls or grant a query extension, and continue through the
+established bundled-help, official-source, and installed-source fallbacks.
 
 Store the completed structure, technology, ownership, and guidance map as phase
 `structure` for this run. Its observation includes concise conclusions only for
@@ -460,6 +463,12 @@ linked shard atomically. Task transitions then maintain the shard lifecycle, so
 do not repeat running, partial, complete, or failed states through
 `audit_record`. Use an explicit shard record only for skipped or supervisor-owned
 work without a task.
+Before registration, verify every assigned path exists in the immutable audit
+worktree and still belongs to the intended shard. Derive test surfaces from the
+current inventory and repository configuration rather than remembered or
+guessed filenames. Reconcile every issue lead against the current supervisor
+history snapshot and live native closing-PR relationships; never assert that no
+implementation PR exists from stale lead notes.
 For notebook evidence, identify the repository-relative `.ipynb` path, stable
 cell index, and a unique symbol or text anchor. Do not assign serialized notebook
 line ranges: `read_file` cannot page notebooks by offset, and JSON line numbers

@@ -289,16 +289,22 @@ network access. Retain isolated environments across rounds and suspension;
 validate them on resume and remove them with their owning worktrees.
 
 Before each active round, refresh the unit and confirm its recorded claim. For
-an existing PR, remove `ready-to-merge`, apply PR `in-progress`, and preserve
-`partial` while accepted scope remains incomplete.
+an existing PR implementation round, remove `ready-to-merge`, apply PR
+`in-progress`, and preserve `partial` while accepted scope remains incomplete.
+Do not mutate labels or draft state before a verification-only round.
 
-Record the PR's observed draft flag as `initial_draft` in every existing-PR
-assignment and set `required_worker_draft` to `true`. State the transition
-explicitly: tell the worker to keep an existing draft as draft, or to change a
-ready PR to draft before editing because only the supervisor may restore ready
-status. Never say to keep the PR in its "current state." If the user's current
-instruction forbids changing a ready PR to draft, stop for direction instead of
-launching a worker under contradictory rules.
+Every existing-PR assignment records `initial_draft`, `pr_round_mode`,
+`pr_expected_end_state`, and `required_worker_draft`. Use `implementation`,
+`draft`, and `true` for an editing round; explicitly keep an existing draft or
+change a ready PR to draft before editing because only the supervisor may
+restore ready status. An inherited draft always uses implementation mode so it
+can complete normal validation and supervisor promotion, even when no edit is
+expected. Use `verification-only`, `unchanged`, and `false` only for an
+inherited ready PR undergoing non-mutating review; a proven gap returns
+`CORRECTION_NEEDED` and requires a new implementation assignment. Never say to
+keep the PR in its "current state." If the user's instruction forbids a required
+draft transition, stop for direction instead of launching a contradictory
+round.
 
 ## Stage 4: run bounded implementation rounds
 
@@ -311,6 +317,16 @@ pre-edit SHA before making it a completion gate. A check that already fails at
 that SHA is an informational baseline limitation, not required worker
 validation. Do not invent broad test, formatter, interpreter, or compiler
 commands when the repository does not establish them.
+For verification-only, include only commands proven not to rewrite the
+worktree; never assign pre-commit or another auto-fixing command. If adequate
+validation requires a potentially mutating command, use implementation mode.
+
+Before launching any round that must push, perform a non-mutating,
+non-interactive authenticated push preflight for the exact remote, refspec, and
+lease, using `GIT_TERMINAL_PROMPT=0` and `git push --dry-run --no-verify`. Do not
+inspect or inject tokens. Distinguish authentication failure from a ref/lease
+rejection; if no sanctioned push mechanism is available, stop before assigning
+implementation rather than letting the worker discover it after editing.
 
 Put `execution_environment` in every assignment. It contains `mode: native`,
 `mode: isolated`, or `mode: shared` plus `pythonpath`, an ordered list of
@@ -374,12 +390,21 @@ same explained cause trigger termination or user escalation.
 
 ## Stage 5: supervisor verification of the draft
 
-For inherited and new work, require the worker's pushed draft PR and independently
-inspect the complete rebased diff, callers, tests, configuration, and required
-outcomes. Treat PR coverage and worker validation as assertions. Preserve correct
-work and send the smallest bounded correction back to the same worker for any
-missing, incorrect, unrelated, or regressive change. The worker commits, pushes,
-and updates the same draft before verification repeats.
+For a verification-only round on an inherited ready PR, accept
+`NO_IMPLEMENTATION` only after independently confirming the existing PR,
+branch, and worktree remained unchanged and every accepted outcome is correct.
+Finalize that already-ready PR unchanged through Stage 7; do not send it through
+draft promotion. A proven gap must return `CORRECTION_NEEDED`; create an
+implementation round and perform its required draft transition and push
+preflight before editing.
+
+For implementation rounds and new work, require the worker's pushed draft PR
+and independently inspect the complete rebased diff, callers, tests,
+configuration, and required outcomes. Treat PR coverage and worker validation
+as assertions. Preserve correct work and send the smallest bounded correction
+back to the same worker for any missing, incorrect, unrelated, or regressive
+change. The worker commits, pushes, and updates the same draft before
+verification repeats.
 
 Do not invent a task reference or substitute an inline assignment for any worker
 round. If a correction or additional inspection is delegated, register it through

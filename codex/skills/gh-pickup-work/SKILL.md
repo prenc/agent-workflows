@@ -257,6 +257,13 @@ Use `--autostash` only for verified unit-scoped uncommitted changes in a reused
 worktree; never create a manual stash. Stop when ownership of local changes or
 history is ambiguous.
 
+Before editing work that must be pushed, perform a non-mutating,
+non-interactive authenticated push preflight for the exact remote, refspec, and
+lease, using `GIT_TERMINAL_PROMPT=0` and `git push --dry-run --no-verify`. Do not
+inspect or inject tokens. Distinguish authentication failure from a ref/lease
+rejection and stop before implementation when no sanctioned push mechanism is
+available.
+
 For each conflict, inspect both sides, the new base, callers, tests, and every
 affected issue scope. Preserve compatible base changes and selected intent;
 never choose wholesale ours/theirs merely to finish. Stage only resolved files,

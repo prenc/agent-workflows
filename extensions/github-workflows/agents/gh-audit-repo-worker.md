@@ -121,7 +121,12 @@ This worker is read-only and must not create or execute any orchestration file.
 - The base allowance is 12 successful Context7 `query-docs` calls. Record
   resolution attempts separately and reuse supplied cached facts. If a material
   question remains after 12 calls, return `CONTEXT_REQUEST` for a five-call
-  extension rather than silently exceeding the allowance.
+  extension rather than silently exceeding the allowance. A provider quota or
+  authentication rejection makes Context7 unavailable for the remainder of the
+  assignment: record one limitation, make no repeated resolution attempts, and
+  continue with assigned skills, bundled help, official sources, or installed
+  source in the established order. Do not request a query-budget extension for
+  a provider that cannot accept queries.
 - Do not recommend silent research-semantic changes.
 - Treat any supplied area and applicable `area/shared-core` Markdown documents
   as the complete interface to earlier audits. When none are supplied, continue
@@ -178,6 +183,13 @@ same-area/type/priority findings that support one outcome and one reasonably
 sized PR. Give every grouped item distinct evidence and an observable required
 outcome. Move cross-entrypoint root causes to `area/shared-core`.
 
+In both modes, every successfully completed inventory, documentation, or
+runtime check used in a conclusion produces a compact `check_conclusion` with
+the question, applicable version or constraint, method/evidence source,
+observed result, interpreted conclusion, and `confirmed` or `disproved`
+disposition. Failed, unavailable, timed-out, and inconclusive attempts are
+current-run limitations instead. Summarize evidence, not artifact paths.
+
 For a behavior claim that is safely reproducible, include an optional
 `validation_proposal` for the supervisor. Specify the hypothesis, component,
 small synthetic setup, action, observable assertion, expected confirming and
@@ -214,6 +226,8 @@ boundaries. Apply focus as a question, not an assumed defect. Return:
   runtime validation is unsuitable or unnecessary.
 - any pending `CONTEXT_REQUEST`, or the inventory revision used when no request
   remains;
+- check conclusions for every successful inventory, documentation, or runtime
+  check relied upon;
 - for each existing issue whose entire accepted scope appears delivered,
   invalidated by current code, or duplicated: propose `close-completed`,
   `close-invalid`, or `close-duplicate`, with remaining-scope analysis and the
@@ -249,16 +263,8 @@ The worker proposes evidence and never comments, labels, or closes.
 
 Always list the evidence inspected, plausible matches read, guidance and MCP
 use, prior observations rechecked, environment inventory revision, validation
-proposal and supplied runtime artifacts, disagreements with the candidate, and
-remaining limitations. For every successfully completed inventory,
-documentation, or runtime check used in a conclusion, return a compact
-`check_conclusion` containing the question,
-applicable version or declared constraint, method/evidence source, observed
-result, interpreted conclusion, and disposition (`confirmed` or `disproved`).
-A sound negative result is `disproved`. Report failed requests, unavailable
-tools, timeouts, and inconclusive attempts only as current-run limitations, not
-as `check_conclusion` knowledge. Summarize the evidence itself; an artifact
-path or statement that a check ran is not a conclusion.
+proposal and supplied runtime artifacts, check conclusions, disagreements with
+the candidate, and remaining limitations.
 
 ## Turn and result budget
 

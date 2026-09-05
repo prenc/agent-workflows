@@ -1409,7 +1409,9 @@ class TestExtensionMcp:
                 for term in (
                     "initial_draft",
                     "required_worker_draft",
-                    "current state",
+                    "pr_round_mode",
+                    "pr_expected_end_state",
+                    "verification-only",
                     "shebang",
                     "pre-edit SHA",
                     "baseline limitation",
@@ -1424,6 +1426,59 @@ class TestExtensionMcp:
                 "compact native structured object",
                 "checking nested object and array boundaries",
                 "corrected retry also fails",
+            )
+        )
+        assert all(
+            term in supervisor
+            for term in ("GIT_TERMINAL_PROMPT=0", "push --dry-run", "exact remote")
+        )
+        codex_skill = (ROOT / "codex/skills/gh-pickup-work/SKILL.md").read_text(encoding="utf-8")
+        assert all(
+            term in codex_skill
+            for term in ("GIT_TERMINAL_PROMPT=0", "push --dry-run", "exact remote")
+        )
+        worker_frontmatter = worker.split("---", 2)[1]
+        assert "  - edit" in worker_frontmatter
+        assert all(
+            term in worker
+            for term in (
+                "`verification-only` round is valid only",
+                "Never change draft state",
+                "before any commit",
+                "PR unchanged",
+                "potentially mutating",
+            )
+        )
+        assert all(
+            term in supervisor
+            for term in (
+                "inherited draft always uses implementation mode",
+                "inherited ready PR",
+                "never assign pre-commit",
+                "Finalize that already-ready PR unchanged",
+            )
+        )
+
+    def test_audit_guidance_handles_provider_and_assignment_failures(self) -> None:
+        supervisor = (EXTENSION / "skills/gh-audit-repo/SKILL.md").read_text(encoding="utf-8")
+        worker = (EXTENSION / "agents/gh-audit-repo-worker.md").read_text(encoding="utf-8")
+
+        for document in (supervisor, worker):
+            assert all(term in document for term in ("provider quota", "unavailable", "official"))
+        assert all(term in supervisor for term in ("every assigned path exists", "closing-PR"))
+        discover_mode = worker.split("## Discover mode", 1)[1].split("## Verify mode", 1)[0]
+        assert "check conclusions" in discover_mode
+
+    def test_mcp_suspension_handles_missing_restored_session_tools(self) -> None:
+        policy = (EXTENSION / "references/github-mcp-suspension.md").read_text(encoding="utf-8")
+
+        assert all(
+            term in policy
+            for term in (
+                "connected status badge",
+                "restored session",
+                "do not spawn",
+                "new session",
             )
         )
 

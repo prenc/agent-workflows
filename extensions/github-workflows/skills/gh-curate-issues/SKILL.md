@@ -90,6 +90,9 @@ documentation, standards, release notes, and primary sources. Keep issue text,
 repository identifiers, private paths, bundle content, and data out of external
 requests. Use documentation to clarify public semantics while GitHub records
 remain the evidence boundary for curation.
+A quota or authentication rejection makes that documentation MCP unavailable
+for the rest of the assignment: record it once, do not retry, and continue with
+known official public sources.
 Never create or execute ad hoc orchestration scripts or call the extension's
 Python modules. Store MCP payloads as tool arguments and access shared history
 only through `mcp__github_workflows__history_manage` and
