@@ -126,8 +126,8 @@ def validated_run_id(value: str) -> str:
 
 
 def repo_dir(project_dir: Path, repo: str) -> Path:
-    normalized_repo(repo)
-    return project_dir.expanduser().resolve() / "github"
+    owner, name = normalized_repo(repo).split("/")
+    return project_dir.expanduser().resolve() / "github" / owner / name
 
 
 def secure_directory(path: Path) -> None:
@@ -305,6 +305,17 @@ def prepare_database(args: argparse.Namespace, kind: str) -> None:
     mode = "new"
     reuse_live = live.exists() and not args.rebuild
     if reuse_live:
+        stored_repo = None
+        try:
+            with connect(live) as current:
+                stored_repo = metadata(current).get("repository")
+        except (ValueError, sqlite3.DatabaseError):
+            stored_repo = None
+        if stored_repo is not None and stored_repo != normalized_repo(args.repo):
+            raise ValueError(
+                f"cache repository identity mismatch: the committed cache belongs to "
+                f"{stored_repo}, not {normalized_repo(args.repo)}; refusing to move it aside"
+            )
         try:
             with connect(live) as current:
                 previous = validate(current, args.repo, kind)
@@ -568,20 +579,24 @@ def query_records(args: argparse.Namespace) -> None:
     linked = set(ordered_links)
     offset = int(getattr(args, "offset", 0) or 0)
     fill = bool(getattr(args, "fill", False))
+    if not fill:
+        ordered_links.sort()
     text = args.terms or (args.terms_file.read_text() if args.terms_file else "")
     match = safe_match_query(text)
     with connect_readonly(args.db) as connection:
         validate(connection, args.repo, "records")
         target = offset + args.limit + 1 if args.limit else None
         selected: dict[tuple[str, int], sqlite3.Row] = {}
+        linked_selected: set[tuple[str, int]] = set()
         for kind, number in ordered_links:
+            key = (kind, number)
             row = connection.execute(
-                "SELECT * FROM records WHERE kind=? AND number=?", (kind, number)
+                "SELECT * FROM records WHERE kind=? AND number=?", key
             ).fetchone()
             if row and (not args.kind or row["kind"] == args.kind):
-                selected[(kind, number)] = row
-            if target is not None and len(selected) >= target:
-                break
+                linked_selected.add(key)
+                if target is None or len(selected) < target:
+                    selected[key] = row
 
         def collect(rows: Iterable[sqlite3.Row]) -> None:
             for row in rows:
@@ -613,9 +628,12 @@ def query_records(args: argparse.Namespace) -> None:
             selected_records = selected_records[offset : offset + args.limit]
         elif offset:
             selected_records = selected_records[offset:]
+        included = {(row["kind"], row["number"]) for row in selected_records}
+        linked_dropped = sum(1 for key in linked_selected if key not in included)
         result = {
             "cutoff": iso_utc(cutoff) if cutoff else None,
             "has_more": has_more,
+            "linked_dropped": linked_dropped,
             "records": [row_dict(row) for row in selected_records],
         }
     rendered = json.dumps(result, indent=2, sort_keys=True) + "\n"
