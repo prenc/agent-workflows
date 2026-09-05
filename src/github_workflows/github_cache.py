@@ -85,6 +85,7 @@ RECORDS_SCHEMA_VERSION = 1
 RECORDS_DB = "records-v1.sqlite3"
 RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 TOKEN_RE = re.compile(r"[A-Za-z0-9_]{2,}")
+RECORDS_INPUT_BYTES = 10 * 1024 * 1024
 
 
 def utc_now() -> dt.datetime:
@@ -238,6 +239,14 @@ def validate(connection: sqlite3.Connection, repo: str, kind: str) -> dict[str, 
 
 def live_path(directory: Path, kind: str) -> Path:
     return directory / RECORDS_DB
+
+
+def is_no_cache_database(path: Path) -> bool:
+    return (
+        path.parent.parent == Path("/tmp")
+        and path.parent.name.startswith("qwen-github-records-")
+        and path.name == RECORDS_DB
+    )
 
 
 def prepare_database(args: argparse.Namespace, kind: str) -> None:
@@ -448,17 +457,31 @@ def compact_existing_records(connection: sqlite3.Connection) -> None:
 
 
 def ingest_records(args: argparse.Namespace) -> None:
+    if args.input.stat().st_size > RECORDS_INPUT_BYTES:
+        raise ValueError(f"records input exceeds {RECORDS_INPUT_BYTES} bytes")
     payload = json.loads(args.input.read_text())
     fetched_at = args.fetched_at or iso_utc(utc_now())
     items = [
         normalize_record(item, args.kind, args.source, fetched_at) for item in record_list(payload)
     ]
-    with connect(args.db) as connection:
+    db = args.db.resolve()
+    if getattr(args, "no_cache", False):
+        if not is_no_cache_database(db):
+            raise ValueError(
+                "no-cache database must be under a /tmp/qwen-github-records- directory"
+            )
+    else:
+        run_id = validated_run_id(args.run_id)
+        staging = (repo_dir(args.cache_root, args.repo) / "staging").resolve()
+        if db.parent != staging or db.name != f"records-{run_id}.sqlite3":
+            raise ValueError("database path does not match the prepared staging transaction")
+    with connect_readonly(db) as connection:
         validate(connection, args.repo, "records")
+    with connect(db) as connection:
         with connection:
             for item in items:
                 upsert_record(connection, item)
-    secure_file(args.db)
+    secure_file(db)
     print(json.dumps({"ingested": len(items), "kind": args.kind}))
 
 
@@ -660,9 +683,11 @@ def commit_database(args: argparse.Namespace, kind: str) -> None:
 
 def abort_database(args: argparse.Namespace) -> None:
     path = args.db.resolve()
-    if path.parent.name == "staging" or str(path).startswith("/tmp/qwen-github-"):
+    staging = (repo_dir(args.cache_root, args.repo) / "staging").resolve()
+    no_cache = is_no_cache_database(path)
+    if path.parent == staging or no_cache:
         path.unlink(missing_ok=True)
-        if str(path.parent).startswith("/tmp/qwen-github-"):
+        if no_cache:
             path.parent.rmdir()
     else:
         raise ValueError("refusing to remove a non-staging database")
@@ -728,6 +753,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     command = sub.add_parser("ingest-records")
     add_common_repo(command)
+    command.add_argument("--run-id", required=True)
+    command.add_argument("--no-cache", action="store_true")
     command.add_argument("--db", type=Path, required=True)
     command.add_argument("--kind", choices=("issue", "pull"), required=True)
     command.add_argument("--input", type=Path, required=True)
@@ -753,6 +780,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_commit(sub, "commit-records", "records")
 
     command = sub.add_parser("abort")
+    add_common_repo(command)
     command.add_argument("--db", type=Path, required=True)
     command.set_defaults(handler=abort_database)
 
@@ -768,7 +796,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     configured = getattr(args, "project_dir", None) or os.environ.get("QWEN_CODE_PROJECT_DIR")
-    if args.command not in {"abort", "runtime-info"} and not configured:
+    if args.command != "runtime-info" and not configured:
         raise ValueError(
             "QWEN_CODE_PROJECT_DIR is required outside tests; use --project-dir explicitly"
         )
