@@ -6,7 +6,7 @@ Determine the project language and supported commands from its repository instru
 
 For Python projects, use `uv` for dependency management and the project-root `.venv`. Do not create another environment unless asked. If a dependency is missing, report it and suggest the appropriate repository or `uv` command.
 
-When the project root contains `.venv` and `uv` is installed, invoke Python commands and project executables through `uv run` so uv uses the root environment. This includes test and validation commands, for example `uv run pytest` and `uv run pre-commit run --all-files`. Prefer a documented Make target or repository command when it owns the operation; run `make test` directly rather than wrapping Make itself with `uv run`.
+When the project root contains `.venv` and `uv` is installed, invoke Python commands and project executables through `uv run --no-sync` so uv uses the existing root environment without changing it. This includes test and validation commands, for example `uv run --no-sync pytest` and `uv run --no-sync pre-commit run --all-files`. Prefer a documented Make target or repository command when it owns the operation; run `UV_NO_SYNC=1 make test` directly rather than wrapping Make itself with `uv run`.
 
 If either `.venv` or `uv` is unavailable, follow the repository instructions and use the available project or system command without creating an environment solely to run it.
 
@@ -22,7 +22,7 @@ Until Qwen's native Glob tool supports per-call Git-ignore control, do not use i
 
 During implementation, run the fastest coherent lightweight checks for the behavior being changed. Use focused tests before broader validation and keep output concise unless diagnosing a failure. Running lightweight tests, formatters, linters, and pre-commit hooks is authorized when they are part of the repository's documented workflow. Report unavailable tools or skipped coverage instead of silently installing dependencies or claiming validation that did not run.
 
-When a repository configures pre-commit, run it once after implementation and affected tests with `uv run pre-commit run --all-files` in Python projects. Inspect hook changes, rerun affected tests when warranted, and finish with a passing full pre-commit run. Use the configured pre-commit hooks for Ruff instead of invoking Ruff directly.
+When a repository configures pre-commit, run it once after implementation and affected tests with `uv run --no-sync pre-commit run --all-files` in Python projects. Inspect hook changes, rerun affected tests when warranted, and finish with a passing full pre-commit run. Use the configured pre-commit hooks for Ruff instead of invoking Ruff directly.
 
 If an asynchronous or process-based test appears to stall only in the sandbox, rerun that same focused test outside the sandbox before treating the stall as a product failure.
 

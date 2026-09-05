@@ -45,9 +45,6 @@ Use prose for a single statement and bullets when multiple distinct items are
 easier to scan. Issue coverage remains a task list because each checkbox tracks
 a separate accepted requirement.
 
-When a PR includes a `Validation` section, record checks actually run and their
-observed results. Routine test-passing expectations remain implicit.
-
 Add one exact `Closes #N` line for each issue whose complete required scope is
 implemented. Preserve compatible existing closing references. These lines
 create the issue-to-PR relationship represented by GitHub's Development

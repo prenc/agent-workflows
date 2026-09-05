@@ -12,11 +12,13 @@ For Python projects, use `uv` for dependency management and the project-root
 missing, report it and suggest the appropriate repository or `uv` command.
 
 When the project root contains `.venv` and `uv` is installed, invoke Python
-commands and project executables through `uv run` so uv uses the root
-environment. This includes test and validation commands, for example
-`uv run pytest` and `uv run pre-commit run --all-files`. Prefer a documented
-Make target or repository command when it owns the operation; run `make test`
-directly rather than wrapping Make itself with `uv run`.
+commands and project executables through `uv run --no-sync` so uv uses the
+existing root environment without changing it. This includes test and
+validation commands, for example `uv run --no-sync pytest` and
+`uv run --no-sync pre-commit run --all-files`. Prefer a documented Make target
+or repository command when it owns the operation; run
+`UV_NO_SYNC=1 make test` directly rather than wrapping Make itself with
+`uv run`.
 
 If either `.venv` or `uv` is unavailable, follow the repository instructions
 and use the available project or system command without creating an
@@ -33,7 +35,8 @@ coverage instead of silently installing dependencies or claiming validation
 that did not run.
 
 When a repository configures pre-commit, run it once after implementation and
-affected tests with `uv run pre-commit run --all-files` in Python projects.
+affected tests with `uv run --no-sync pre-commit run --all-files` in Python
+projects.
 Inspect hook changes, rerun affected tests when warranted, and finish with a
 passing full pre-commit run. Use the configured pre-commit hooks for Ruff
 instead of invoking Ruff directly.

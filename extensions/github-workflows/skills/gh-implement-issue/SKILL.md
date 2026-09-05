@@ -400,8 +400,7 @@ Refresh the worker-created draft PR, its head/base, and the remote branch. Assig
 the PR to the authenticated user when the MCP surface supports it and apply PR
 `in-progress` during active supervisor verification. Confirm the body follows
 `../../references/github-pr-template.md`, begins with
-`<!-- qwen:issue-implementation:v1 -->`, and contains meaningful validation
-evidence from checks actually run and observed results. Send body corrections to the worker so
+`<!-- qwen:issue-implementation:v1 -->`. Send body corrections to the worker so
 the draft remains worker-maintained.
 
 Refresh each fully covered issue after the PR body is current. Require the PR

@@ -190,12 +190,11 @@ for an existing remote branch and a normal first push after confirming a new
 remote ref remains absent.
 
 Build the PR body from the shared template and begin it with
-`<!-- qwen:issue-implementation:v1 -->`. Record only meaningful validation
-evidence from checks actually run and their observed results. Create a new PR with `draft: true`,
-or update the assigned existing PR with `draft: true`, the current title/body,
-and the assigned head/base. Confirm through MCP that the PR is a draft and its
-head equals the pushed commit. Keep assignments, labels, issue mutations,
-reviews, merges, CI, and draft-to-ready promotion with the supervisor.
+`<!-- qwen:issue-implementation:v1 -->`. Create a new PR with `draft: true`, or
+update the assigned existing PR with `draft: true`, the current title/body, and
+the assigned head/base. Confirm through MCP that the PR is a draft and its head
+equals the pushed commit. Keep assignments, labels, issue mutations, reviews,
+merges, CI, and draft-to-ready promotion with the supervisor.
 
 Other workers, branches, worktrees, unrelated GitHub artifacts, CI, and
 repository-root `data/` contents remain outside this worker's activity.

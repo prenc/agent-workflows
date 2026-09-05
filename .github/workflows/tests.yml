@@ -30,6 +30,11 @@ jobs:
           version: "0.12.10"
           python-version: ${{ matrix.python-version }}
           enable-cache: true
+      - name: Install system test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ripgrep
+          rg --version
       - run: uv venv --python "${{ matrix.python-version }}"
       - run: uv pip install --python .venv/bin/python -e ".[dev]"
       - name: Enable audit namespace isolation
@@ -38,7 +43,7 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           unshare --user --map-root-user --mount --net true
-      - run: uv run pytest -q --tb=line
+      - run: uv run --no-sync pytest -q --tb=line
 
   pre-commit:
     runs-on: ubuntu-latest
@@ -54,7 +59,7 @@ jobs:
           enable-cache: true
       - run: uv venv --python 3.12
       - run: uv pip install --python .venv/bin/python -e ".[dev]"
-      - run: uv run pre-commit run --all-files
+      - run: uv run --no-sync pre-commit run --all-files
 
   build:
     runs-on: ubuntu-latest
