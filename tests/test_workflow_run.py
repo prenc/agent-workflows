@@ -572,3 +572,234 @@ class TestWorkflowRun:
         assert source["branch"] == "main"
         assert source["excluded_dirty_state"]["tracked_entries"] == 1
         assert not source["confirmation_required"]
+
+    def test_non_depth_one_validation_artifacts_are_rejected_at_record_time(self) -> None:
+        self.initialize()
+        current = self.project_dir / "workflows/gh-audit-repo/current"
+        for artifact in (
+            "validation/nested/probe-1/result.json",
+            "validation/result.json",
+            "validation/probe-1/out.json",
+        ):
+            target = current / artifact
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("{}\n")
+            rejected = self.audit_event(
+                1,
+                {
+                    "type": "validation-record",
+                    "validation": {
+                        "id": "probe-1",
+                        "artifact": artifact,
+                        "status": "succeeded",
+                    },
+                },
+                check=False,
+            )
+            assert rejected.returncode == 2
+            assert "depth-1 probe layout" in rejected.stderr
+        state = json.loads((current / "state.json").read_text())
+        assert state["validations"] == {}
+
+    def test_depth_one_validation_record_finalizes_cleanly(self) -> None:
+        self.initialize()
+        current = self.project_dir / "workflows/gh-audit-repo/current"
+        artifact = current / "validation/probe-1/result.json"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text("{}\n")
+        revision = 1
+        for phase in (
+            "source",
+            "history",
+            "structure",
+            "discovery",
+            "verification",
+            "publication",
+        ):
+            result = self.audit_event(
+                revision,
+                {
+                    "type": "phase-set",
+                    "phase": phase,
+                    "value": {"status": "complete"},
+                },
+            )
+            revision = json.loads(result.stdout)["revision"]
+        result = self.audit_event(
+            revision,
+            {
+                "type": "shard-upsert",
+                "shard": {"id": "shard/core", "area": "area/core", "status": "complete"},
+            },
+        )
+        revision = json.loads(result.stdout)["revision"]
+        result = self.audit_event(
+            revision,
+            {
+                "type": "task-register",
+                "task": {
+                    "id": "task-1",
+                    "logical_id": "discover-core",
+                    "role": "discover",
+                    "unit": "shard/core",
+                    "status": "running",
+                },
+            },
+        )
+        revision = json.loads(result.stdout)["revision"]
+        result = self.audit_event(
+            revision,
+            {
+                "type": "task-transition",
+                "task_id": "task-1",
+                "status": "completed",
+                "result": self.result_artifact("core.json"),
+            },
+        )
+        revision = json.loads(result.stdout)["revision"]
+        result = self.audit_event(revision, {"type": "integration-start", "task_id": "task-1"})
+        revision = json.loads(result.stdout)["revision"]
+        result = self.audit_event(revision, {"type": "integration-complete", "task_id": "task-1"})
+        revision = json.loads(result.stdout)["revision"]
+        result = self.audit_event(
+            revision,
+            {
+                "type": "validation-record",
+                "validation": {
+                    "id": "probe-1",
+                    "artifact": "validation/probe-1/result.json",
+                    "status": "succeeded",
+                },
+            },
+        )
+        revision = json.loads(result.stdout)["revision"]
+        finalized = self.call(
+            "finalize",
+            "gh-audit-repo",
+            "--expected-revision",
+            str(revision),
+            "--status",
+            "complete",
+        )
+        assert json.loads(finalized.stdout)["status"] == "complete"
+
+    def test_wrongly_stamped_terminal_candidate_has_typed_correction(self) -> None:
+        self.initialize()
+        state_path = self.project_dir / "workflows/gh-audit-repo/current/state.json"
+        self.audit_event(
+            1,
+            {"type": "candidate-upsert", "candidate": {"id": "C-1", "status": "published"}},
+        )
+        failed = self.call(
+            "finalize",
+            "gh-audit-repo",
+            "--expected-revision",
+            "2",
+            "--status",
+            "complete",
+            check=False,
+        )
+        assert failed.returncode == 2
+        assert "without mutation records" in failed.stderr
+        reopened = self.audit_event(
+            2,
+            {"type": "candidate-upsert", "candidate": {"id": "C-1", "status": "verified"}},
+            check=False,
+        )
+        assert reopened.returncode == 2
+        assert "cannot be reopened" in reopened.stderr
+        self.audit_event(
+            2,
+            {
+                "type": "candidate-correct",
+                "candidate": {"id": "C-1", "status": "verified"},
+                "reason": "terminal status was pre-stamped without a matching mutation",
+            },
+        )
+        state = json.loads(state_path.read_text())
+        assert state["candidates"]["C-1"]["status"] == "verified"
+        assert state["candidates"]["C-1"]["corrected_from"] == "published"
+        assert state["candidates"]["C-1"]["correction_reason"]
+        assert state["mutations"] == []
+        # The corrected candidate can be disposed through the ordinary lifecycle.
+        self.audit_event(
+            3,
+            {"type": "candidate-upsert", "candidate": {"id": "C-1", "status": "rejected"}},
+        )
+        unblocked = self.call(
+            "finalize",
+            "gh-audit-repo",
+            "--expected-revision",
+            "4",
+            "--status",
+            "complete",
+            check=False,
+        )
+        assert unblocked.returncode == 2
+        assert "without mutation records" not in unblocked.stderr
+
+    def test_candidate_correction_is_guarded_by_lifecycle_state(self) -> None:
+        self.initialize()
+        self.audit_event(
+            1,
+            {"type": "candidate-upsert", "candidate": {"id": "C-1", "status": "verified"}},
+        )
+        nonterminal = self.audit_event(
+            2,
+            {
+                "type": "candidate-correct",
+                "candidate": {"id": "C-1", "status": "rejected"},
+                "reason": "no",
+            },
+            check=False,
+        )
+        assert nonterminal.returncode == 2
+        assert "terminal candidate status" in nonterminal.stderr
+        unknown = self.audit_event(
+            2,
+            {
+                "type": "candidate-correct",
+                "candidate": {"id": "C-missing", "status": "rejected"},
+                "reason": "no",
+            },
+            check=False,
+        )
+        assert unknown.returncode == 2
+        assert "unknown candidate" in unknown.stderr
+        self.audit_event(
+            2,
+            {"type": "candidate-upsert", "candidate": {"id": "C-1", "status": "published"}},
+        )
+        same = self.audit_event(
+            3,
+            {
+                "type": "candidate-correct",
+                "candidate": {"id": "C-1", "status": "published"},
+                "reason": "no",
+            },
+            check=False,
+        )
+        assert same.returncode == 2
+        assert "already in the corrected status" in same.stderr
+        self.audit_event(
+            3,
+            {
+                "type": "mutation-record",
+                "mutation": {
+                    "candidate_id": "C-1",
+                    "action": "create",
+                    "receipt": {"url": "https://example.invalid/1"},
+                },
+            },
+        )
+        backed = self.audit_event(
+            4,
+            {
+                "type": "candidate-correct",
+                "candidate": {"id": "C-1", "status": "verified"},
+                "reason": "no",
+            },
+            check=False,
+        )
+        assert backed.returncode == 2
+        assert "mutation record" in backed.stderr

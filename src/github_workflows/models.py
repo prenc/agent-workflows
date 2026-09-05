@@ -110,6 +110,7 @@ class RunManageRequest(StrictRequest):
             "a changed source before creating run state or a worktree."
         ),
     )
+    acknowledge_pending_publication: bool = False
     note: str | None = None
 
     @field_validator("n", mode="before")
@@ -152,6 +153,7 @@ class RunManageRequest(StrictRequest):
                 "dry_run",
                 "separate",
                 "confirmed_source_sha",
+                "acknowledge_pending_publication",
             }
         elif self.action == "resume":
             allowed = {"n"}
@@ -176,6 +178,7 @@ class RunManageRequest(StrictRequest):
                     "regression_sweep",
                     "dry_run",
                     "confirmed_source_sha",
+                    "acknowledge_pending_publication",
                 },
                 "gh-curate-issues": {
                     "targets",
@@ -693,8 +696,14 @@ class PublishUncertainRequest(StrictRequest):
     receipt: dict[str, Any] = Field(default_factory=dict)
 
 
+class PublishFailedRequest(StrictRequest):
+    action: Literal["failed"]
+    candidate_id: str
+    error: str = Field(min_length=1)
+
+
 PublishAction = Annotated[
-    PublishBeginRequest | PublishFinishRequest | PublishUncertainRequest,
+    PublishBeginRequest | PublishFinishRequest | PublishUncertainRequest | PublishFailedRequest,
     Field(discriminator="action"),
 ]
 
