@@ -58,7 +58,19 @@ def audit_session(payload: dict[str, Any]) -> bool:
     )
 
 
+def is_public_text_write(payload: dict[str, Any]) -> bool:
+    tool_name = str(payload.get("tool_name", ""))
+    return "github" in tool_name and any(
+        operation in tool_name for operation in ("issue_write", "add_issue_comment")
+    )
+
+
 def targets_private_boundary(payload: dict[str, Any]) -> bool:
+    # GitHub write tools carry publication text, not file paths. Repository-
+    # relative citations are required by the issue convention, and host-path
+    # exposure in that text is already denied by public_text_has_absolute_path.
+    if is_public_text_write(payload):
+        return False
     tool_input = payload.get("tool_input", {})
     rendered = json.dumps(tool_input, sort_keys=True).replace("\\\\", "/")
     lowered = rendered.lower()
@@ -94,10 +106,7 @@ def targets_private_boundary(payload: dict[str, Any]) -> bool:
 
 
 def public_text_has_absolute_path(payload: dict[str, Any]) -> bool:
-    tool_name = str(payload.get("tool_name", ""))
-    if "github" not in tool_name or not any(
-        operation in tool_name for operation in ("issue_write", "add_issue_comment")
-    ):
+    if not is_public_text_write(payload):
         return False
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
