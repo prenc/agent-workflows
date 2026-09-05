@@ -606,6 +606,15 @@ def task_shard(state: dict[str, Any], task: dict[str, Any]) -> dict[str, Any] | 
     return shard
 
 
+def shard_owner_assignments(state: dict[str, Any], shard_id: str) -> list[dict[str, Any]]:
+    """Return the discovery assignments of the tasks owning a shard, if any."""
+    return [
+        task["assignment"]
+        for task in state["tasks"].values()
+        if discovery_shard_id(task) == shard_id
+    ]
+
+
 def audit_event(args: argparse.Namespace) -> None:
     current, state = audit_state(args, allow_suspended=True)
     if state["revision"] != args.expected_revision:
@@ -857,8 +866,6 @@ def audit_event(args: argparse.Namespace) -> None:
         if not isinstance(shard, dict):
             raise ValueError("shard-upsert requires a shard object")
         shard_id = require_string(shard.get("id"), "shard id")
-        if any(discovery_shard_id(task) == shard_id for task in tasks.values()):
-            raise ValueError("task-owned shards may only be changed through task_manage")
         existing = state["shards"].get(shard_id, {})
         area = shard.get("area", existing.get("area"))
         status = shard.get("status", existing.get("status"))
@@ -867,6 +874,15 @@ def audit_event(args: argparse.Namespace) -> None:
             raise ValueError("shard requires a supported lifecycle status")
         if existing.get("status") in {"complete", "skipped"} and status != existing.get("status"):
             raise ValueError("terminal shard cannot be reopened")
+        owners = shard_owner_assignments(state, shard_id)
+        for field in ("area", "paths"):
+            if field not in shard or not owners:
+                continue
+            if any(
+                owner.get(field, [] if field == "paths" else None) != shard[field]
+                for owner in owners
+            ):
+                raise ValueError(f"shard {field} does not match the owning task assignment")
         state["shards"][shard_id] = {
             **existing,
             **shard,
