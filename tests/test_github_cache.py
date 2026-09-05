@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Any
+
+from github_workflows.github_cache import RECORDS_INPUT_BYTES
 
 SCRIPT = Path(__file__).parents[1] / "src/github_workflows/github_cache.py"
 REPO = "example/private-repo"
@@ -19,7 +23,10 @@ class TestGithubCache:
         self.temp.cleanup()
 
     def call(self, *args: str, check: bool = True):
-        return subprocess.run([str(SCRIPT), *args], check=check, capture_output=True, text=True)
+        env = {key: value for key, value in os.environ.items() if key != "QWEN_CODE_PROJECT_DIR"}
+        return subprocess.run(
+            [str(SCRIPT), *args], check=check, capture_output=True, text=True, env=env
+        )
 
     def parsed(self, *args: str) -> dict:
         return json.loads(self.call(*args).stdout)
@@ -49,6 +56,8 @@ class TestGithubCache:
         self.parsed(
             "ingest-records",
             *self.common(),
+            "--run-id",
+            "first",
             "--db",
             prepared["work_db"],
             "--kind",
@@ -166,6 +175,118 @@ class TestGithubCache:
             ).fetchone()[0]
         assert stored == ("", "[]", "{}", "[]", "summary")
         assert body_matches == 0
+
+    def failed_call(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return self.call(*args, check=False)
+
+    def ingest_args(
+        self, work_db: str, run_id: str = "first", records: list[dict[str, Any]] | None = None
+    ) -> list[str]:
+        payload = Path(self.temp.name) / "records.json"
+        if records is None:
+            records = [{"number": 1, "state": "open", "title": "Scoped"}]
+        payload.write_text(json.dumps({"records": records}))
+        return [
+            "ingest-records",
+            *self.common(),
+            "--run-id",
+            run_id,
+            "--db",
+            work_db,
+            "--kind",
+            "issue",
+            "--input",
+            str(payload),
+            "--source",
+            "test",
+        ]
+
+    def test_failed_ingest_does_not_wedge_next_prepare(self) -> None:
+        prepared = self.parsed("prepare-records", *self.common(), "--run-id", "first")
+        work_db = Path(prepared["work_db"])
+        work_db.unlink()
+        failed = self.failed_call(*self.ingest_args(str(work_db)))
+        assert failed.returncode == 2
+        assert "does not exist" in failed.stderr
+        assert not work_db.exists()
+        retried = self.parsed("prepare-records", *self.common(), "--run-id", "first")
+        assert Path(retried["work_db"]) == work_db
+
+    def test_ingest_rejects_database_outside_prepared_staging(self) -> None:
+        prepared = self.parsed("prepare-records", *self.common(), "--run-id", "first")
+        work_db = prepared["work_db"]
+        live = self.project_dir / "github" / "records-v1.sqlite3"
+        failed = self.failed_call(*self.ingest_args(str(live)))
+        assert failed.returncode == 2
+        assert "staging" in failed.stderr
+        assert not live.exists()
+        other = self.project_dir / "github" / "staging" / "records-other.sqlite3"
+        failed = self.failed_call(*self.ingest_args(str(other)))
+        assert failed.returncode == 2
+        assert "staging" in failed.stderr
+        assert not other.exists()
+        result = self.parsed(*self.ingest_args(work_db))
+        assert result["ingested"] == 1
+
+    def test_ingest_no_cache_override_scopes_to_temp_prefix(self) -> None:
+        prepared = self.parsed("prepare-records", *self.common(), "--run-id", "nc", "--no-cache")
+        work_db = Path(prepared["work_db"])
+        assert work_db.parent.parent == Path("/tmp")
+        assert work_db.parent.name.startswith("qwen-github-records-")
+        args = self.ingest_args(str(work_db), run_id="nc")
+        self.parsed(*args, "--no-cache")
+        failed = self.failed_call(*args)
+        assert failed.returncode == 2
+        assert "staging" in failed.stderr
+        failed = self.failed_call(
+            *args,
+            "--db",
+            str(work_db.parent / "other-v1.sqlite3"),
+            "--no-cache",
+        )
+        assert failed.returncode == 2
+        assert "no-cache" in failed.stderr
+        self.call("abort", *self.common(), "--db", str(work_db))
+        assert not work_db.exists()
+
+    def test_abort_rejects_database_outside_project_staging(self) -> None:
+        prepared = self.parsed("prepare-records", *self.common(), "--run-id", "first")
+        work_db = Path(prepared["work_db"])
+        foreign = (
+            Path(self.temp.name) / "other-project" / "github" / "staging" / "records-v1.sqlite3"
+        )
+        foreign.parent.mkdir(parents=True)
+        foreign.write_bytes(b"foreign")
+        failed = self.failed_call("abort", *self.common(), "--db", str(foreign))
+        assert failed.returncode == 2
+        assert "refusing to remove" in failed.stderr
+        assert foreign.exists()
+        self.call("abort", *self.common(), "--db", str(work_db))
+        assert not work_db.exists()
+
+    def test_ingest_rejects_input_over_byte_cap(self) -> None:
+        prepared = self.parsed("prepare-records", *self.common(), "--run-id", "first")
+        work_db = Path(prepared["work_db"])
+        failed = self.failed_call(
+            *self.ingest_args(
+                str(work_db), records=[{"number": 1, "title": "x" * (11 * 1024 * 1024)}]
+            )
+        )
+        assert failed.returncode == 2
+        assert "exceeds" in failed.stderr
+        queried = self.parsed("query-records", *self.common(), "--db", str(work_db))
+        assert queried["records"] == []
+
+    def test_ingest_accepts_input_at_byte_cap(self) -> None:
+        prepared = self.parsed("prepare-records", *self.common(), "--run-id", "first")
+        record = {"number": 1, "state": "open", "title": "x" * 64}
+        rendered = json.dumps({"records": [record]})
+        record["title"] = "x" * (64 + RECORDS_INPUT_BYTES - len(rendered.encode()))
+        payload = Path(self.temp.name) / "records.json"
+        payload.write_text(json.dumps({"records": [record]}))
+        assert payload.stat().st_size == RECORDS_INPUT_BYTES
+        result = self.parsed(*self.ingest_args(prepared["work_db"], records=[record]))
+        assert result["ingested"] == 1
 
     def test_project_directory_is_required(self) -> None:
         failed = self.call("status", "--repo", REPO, check=False)
