@@ -20,6 +20,7 @@ from pathlib import Path
 PROBE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 WALL_SECONDS = 60
 CPU_SECONDS = 45
+GIT_SECONDS = 10
 OUTPUT_BYTES = 10 * 1024 * 1024
 EXCERPT_BYTES = 256 * 1024
 INLINE_CODE_BYTES = 8 * 1024
@@ -47,22 +48,26 @@ def sha256_file(path: Path) -> str:
 
 
 def git_output(worktree: Path, *args: str) -> str:
-    result = subprocess.run(
-        [
-            "git",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-C",
-            str(worktree),
-            *args,
-        ],
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-C",
+                str(worktree),
+                *args,
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=GIT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise ValueError(f"git {' '.join(args)} timed out after {GIT_SECONDS} seconds") from error
     return result.stdout.strip()
 
 

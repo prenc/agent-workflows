@@ -43,6 +43,7 @@ from .models import (
 
 SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 HISTORY_ARTIFACT_BYTES = 5 * 1024 * 1024
+GIT_TIMEOUT_SECONDS = 10
 HISTORY_ARTIFACT_TOTAL_BYTES = 25 * 1024 * 1024
 TASK_HISTORY_LIMIT = 40
 TASK_VALIDATION_EXCERPT_BYTES = 2 * 1024
@@ -384,12 +385,18 @@ class WorkflowRuntime:
         expected = state.get("sha")
         if not isinstance(worktree, str) or not isinstance(expected, str):
             raise ValueError("audit worker context requires an audit worktree and SHA")
-        result = subprocess.run(
-            ["git", "-C", worktree, "rev-parse", "--verify", "HEAD^{commit}"],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        try:
+            result = subprocess.run(
+                ["git", "-C", worktree, "rev-parse", "--verify", "HEAD^{commit}"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=GIT_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise ValueError(
+                f"audit worktree HEAD verification timed out after {GIT_TIMEOUT_SECONDS} s"
+            ) from error
         actual = result.stdout.strip()
         if result.returncode != 0 or not re.fullmatch(r"[0-9a-fA-F]{40}", actual):
             raise ValueError("audit worktree HEAD could not be verified")
@@ -397,9 +404,22 @@ class WorkflowRuntime:
             raise ValueError("audit worktree HEAD no longer matches audit SHA")
         return actual.lower()
 
-    def _discard_stale_run(
-        self, workflow: WorkflowName, *, retained_worktree: Path | None = None
-    ) -> None:
+    def _stale_audit_worktree(self, state: dict[str, Any], retained_worktree: Path) -> Path | None:
+        raw_worktree = state.get("audit_worktree")
+        if not isinstance(raw_worktree, str):
+            return None
+        worktree = Path(raw_worktree).resolve()
+        managed_roots = {
+            (self.workspace / ".worktrees").resolve(),
+            self._cache_worktree_root(),
+        }
+        if worktree.parent not in managed_roots or not worktree.name.startswith("gh-audit-repo-"):
+            raise ValueError("stale audit worktree is outside the managed location")
+        if worktree == retained_worktree:
+            return None
+        return worktree if worktree.exists() else None
+
+    def _discard_stale_run(self, workflow: WorkflowName) -> None:
         current = self.current(workflow)
         if not current.is_dir():
             return
@@ -414,32 +434,6 @@ class WorkflowRuntime:
             if SAFE_ID.fullmatch(run_id):
                 staging = self.project_dir / "github" / "staging"
                 (staging / f"records-{run_id}.sqlite3").unlink(missing_ok=True)
-            raw_worktree = state.get("audit_worktree")
-            if isinstance(raw_worktree, str):
-                worktree = Path(raw_worktree).resolve()
-                managed_roots = {
-                    (self.workspace / ".worktrees").resolve(),
-                    self._cache_worktree_root(),
-                }
-                if worktree.parent not in managed_roots or not worktree.name.startswith(
-                    "gh-audit-repo-"
-                ):
-                    raise ValueError("stale audit worktree is outside the managed location")
-                if worktree.exists() and worktree != retained_worktree:
-                    subprocess.run(
-                        [
-                            "git",
-                            "-C",
-                            str(self.workspace),
-                            "worktree",
-                            "remove",
-                            "--force",
-                            str(worktree),
-                        ],
-                        check=True,
-                        capture_output=True,
-                        text=True,
-                    )
         shutil.rmtree(current)
 
     @staticmethod
@@ -878,43 +872,79 @@ class WorkflowRuntime:
         if errors:
             raise ValueError("generic workflow cannot be finalized: " + "; ".join(errors))
 
-    def run_manage(self, request: RunManageRequest) -> dict[str, Any]:
+    def _start_run(self, request: RunManageRequest) -> dict[str, Any]:
+        workflow = request.workflow
         with self.lock():
-            if request.action == "start":
-                if request.workflow == "gh-audit-repo" and self.current(request.workflow).is_dir():
-                    previous = workflow_run.load_state(self.current(request.workflow))
-                    history = previous.get("history", {})
-                    if (
-                        previous.get("status") in workflow_run.RESUMABLE
-                        and isinstance(history, dict)
-                        and history.get("publication_pending")
-                    ):
-                        raise ValueError("pending publication requires resume")
-                inputs = {
-                    "repository": request.repository,
-                    "inputs": request.invocation(),
-                }
-                if request.workflow == "gh-audit-repo":
-                    inputs = {**inputs, **self._source_and_worktree(request.source_confirmed)}
-                    self._discard_stale_run(
-                        request.workflow,
-                        retained_worktree=Path(str(inputs["audit_worktree"])).resolve(),
+            current = self.current(workflow)
+            previous = workflow_run.load_state(current) if current.is_dir() else None
+            if workflow == "gh-audit-repo" and previous is not None:
+                history = previous.get("history", {})
+                if (
+                    previous.get("status") in workflow_run.RESUMABLE
+                    and isinstance(history, dict)
+                    and history.get("publication_pending")
+                ):
+                    raise ValueError("pending publication requires resume")
+            expected_revision = previous["revision"] if previous is not None else None
+        # git worktree create/verify/remove and the audit source inspection run
+        # outside the exclusive lock so concurrent operations are not blocked.
+        inputs = {
+            "repository": request.repository,
+            "inputs": request.invocation(),
+        }
+        if workflow == "gh-audit-repo":
+            inputs = {**inputs, **self._source_and_worktree(request.source_confirmed)}
+            if previous is not None:
+                stale = self._stale_audit_worktree(
+                    previous, Path(str(inputs["audit_worktree"])).resolve()
+                )
+                if stale is not None:
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(self.workspace),
+                            "worktree",
+                            "remove",
+                            "--force",
+                            str(stale),
+                        ],
+                        check=True,
+                        capture_output=True,
+                        text=True,
                     )
-                else:
-                    self._discard_stale_run(request.workflow)
-                    limit = request.invocation()["n"]
-                    inputs["tasks"] = {}
-                    inputs["scheduler"] = {
-                        "limit": limit,
-                        "integration_queue": [],
-                        "supervisor_activity": None,
-                    }
-                    inputs["pending"] = []
-                with self._json_file(inputs) as source:
-                    self._invoke(
-                        workflow_run.initialize, **self._base(request.workflow), input=source
+        else:
+            limit = request.invocation()["n"]
+            inputs["tasks"] = {}
+            inputs["scheduler"] = {
+                "limit": limit,
+                "integration_queue": [],
+                "supervisor_activity": None,
+            }
+            inputs["pending"] = []
+        with self.lock():
+            if previous is not None:
+                current = self.current(workflow)
+                fresh = workflow_run.load_state(current) if current.is_dir() else None
+                if (
+                    fresh is None
+                    or fresh.get("run_id") != previous["run_id"]
+                    or fresh.get("revision") != expected_revision
+                ):
+                    raise RuntimeError(
+                        "workflow state changed while the run start was in flight; retry"
                     )
-            elif request.action == "resume":
+            self._discard_stale_run(workflow)
+            with self._json_file(inputs) as source:
+                self._invoke(workflow_run.initialize, **self._base(workflow), input=source)
+            state = self.state(workflow)
+            return self._receipt(workflow, state, True, next_actions=self._next_actions(state))
+
+    def run_manage(self, request: RunManageRequest) -> dict[str, Any]:
+        if request.action == "start":
+            return self._start_run(request)
+        with self.lock():
+            if request.action == "resume":
                 if request.n is not None:
                     state = self.state(request.workflow)
                     scheduler = self._scheduler_status(state)
@@ -1934,7 +1964,46 @@ class WorkflowRuntime:
                 output=None,
             )
 
+    def _audit_inventory_probed(self, request: InventoryRequest) -> dict[str, Any]:
+        with self.lock():
+            state, worktree, run_dir = self._audit_paths()
+            inventory = state.get("inventory")
+            revision = inventory.get("revision") if isinstance(inventory, dict) else None
+            if request.action == "initialize":
+                if "inventory" in state:
+                    raise ValueError("environment inventory already exists")
+            elif revision is None:
+                raise ValueError("audit inventory has not been initialized")
+            expected_revision = state["revision"]
+        # The package and program probe subprocesses run outside the exclusive
+        # lock; state is re-read and revision-checked under the lock before the
+        # collected sources are persisted.
+        if request.action == "initialize":
+            collected = audit_inventory.build_initial_inventory(self.workspace, worktree)
+        elif request.action == "refresh":
+            collected = audit_inventory.refresh_sources(self.workspace, worktree)
+        else:
+            probes = [program.model_dump(mode="json") for program in request.programs]
+            collected = audit_inventory.collect_program_facts(
+                self.workspace, worktree, run_dir, probes
+            )
+        with self.lock():
+            state = self.state("gh-audit-repo")
+            if state["revision"] != expected_revision:
+                raise RuntimeError(
+                    "audit state changed while the inventory collection was in flight; "
+                    f"expected revision {expected_revision}, found {state['revision']}"
+                )
+            if request.action == "initialize":
+                return audit_inventory.commit_initial_inventory(run_dir, collected)
+            if request.action == "refresh":
+                return audit_inventory.commit_refresh(run_dir, collected, revision)
+            facts, request_ids = collected
+            return audit_inventory.commit_program_facts(run_dir, facts, request_ids, revision)
+
     def audit_inventory(self, request: InventoryRequest) -> dict[str, Any]:
+        if request.action in {"initialize", "refresh", "program"}:
+            return self._audit_inventory_probed(request)
         with self.lock():
             state, worktree, run_dir = self._audit_paths()
             common = {
@@ -1945,23 +2014,10 @@ class WorkflowRuntime:
             }
             inventory = state.get("inventory")
             revision = inventory.get("revision") if isinstance(inventory, dict) else None
-            if request.action == "initialize":
-                return self._invoke(audit_inventory.initialize, **common)
             if request.action == "status":
                 return self._invoke(audit_inventory.status, **common)
             if revision is None:
                 raise ValueError("audit inventory has not been initialized")
-            if request.action == "refresh":
-                return self._invoke(audit_inventory.refresh, **common, expected_revision=revision)
-            if request.action == "program":
-                probes = [program.model_dump(mode="json") for program in request.programs]
-                with self._json_file(probes) as source:
-                    return self._invoke(
-                        audit_inventory.inspect_programs,
-                        **common,
-                        input=source,
-                        expected_revision=revision,
-                    )
             payload = (
                 request.facts
                 if request.action == "record_declared"
@@ -2040,6 +2096,7 @@ class WorkflowRuntime:
             state, worktree, run_dir = self._audit_paths()
             if request.candidate_id not in state.get("candidates", {}):
                 raise ValueError("probe refers to an unknown candidate")
+            expected_revision = state["revision"]
             values = {
                 "project_root": self.workspace,
                 "project_dir": self.project_dir,
@@ -2051,7 +2108,18 @@ class WorkflowRuntime:
                 "selector": getattr(request, "selectors", None),
                 "code": getattr(request, "code", None),
             }
-            self._invoke(audit_probe.run_probe, allow_timeout=True, **values)
+        # The probe subprocess runs outside the exclusive lock; state is re-read
+        # and revision-checked under the lock before the result is persisted.
+        self._invoke(audit_probe.run_probe, allow_timeout=True, **values)
+        with self.lock():
+            state, worktree, run_dir = self._audit_paths()
+            if request.candidate_id not in state.get("candidates", {}):
+                raise ValueError("probe refers to an unknown candidate")
+            if state["revision"] != expected_revision:
+                raise RuntimeError(
+                    "audit state changed while the probe was in flight; "
+                    f"expected revision {expected_revision}, found {state['revision']}"
+                )
             artifact_path = run_dir / "validation" / request.probe_id / "result.json"
             try:
                 artifact = json.loads(artifact_path.read_text(encoding="utf-8"))

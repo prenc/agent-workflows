@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import subprocess
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -1509,3 +1511,371 @@ class TestRuntimeSafety:
                 "missing_requested_packages": ["missing-package"],
             }
             assert len(json.dumps(context)) < 8_000
+
+    def _slow_probe_stub(self, started: threading.Event) -> Any:
+        def slow_probe(args: Any) -> int:
+            started.set()
+            time.sleep(2.0)
+            artifact_dir = args.run_dir / "validation" / args.probe_id
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            artifact = {
+                "probe_id": args.probe_id,
+                "probe_status": "succeeded",
+                "returncode": 0,
+                "timed_out": False,
+                "worktree_unchanged": True,
+                "stdout_excerpt": "slow",
+                "stderr_excerpt": "",
+            }
+            (artifact_dir / "result.json").write_text(json.dumps(artifact))
+            print(json.dumps({"returncode": 0, "timed_out": False}))
+            return 0
+
+        return slow_probe
+
+    def _slow_program_probe(self, started: threading.Event) -> Any:
+        def slow_program_probe(
+            project: Any, worktree: Any, run_dir: Any, name: str, arguments: Any
+        ) -> dict[str, Any]:
+            started.set()
+            time.sleep(2.0)
+            return {
+                "available": True,
+                "probe_status": "succeeded",
+                "executable": name,
+                "arguments": arguments,
+                "stdout": "slow fact",
+                "stderr": "",
+                "collected_at": "2026-01-01T00:00:00Z",
+                "source": "test",
+            }
+
+        return slow_program_probe
+
+    def test_in_flight_probe_returns_concurrent_mutation_promptly(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-probe-lock-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.audit_record(
+                AuditRecordRequest(
+                    action="candidate",
+                    candidate={"id": "candidate-block", "status": "discovered"},
+                )
+            )
+            started = threading.Event()
+            errors: list[Exception] = []
+
+            def probe_call() -> None:
+                try:
+                    runtime.audit_probe(
+                        ProbeRequest(
+                            kind="python",
+                            probe_id="probe-block",
+                            candidate_id="candidate-block",
+                            code="pass",
+                        )
+                    )
+                except Exception as error:
+                    errors.append(error)
+
+            with mock.patch(
+                "github_workflows.runtime.audit_probe.run_probe",
+                side_effect=self._slow_probe_stub(started),
+            ):
+                thread = threading.Thread(target=probe_call)
+                thread.start()
+                assert started.wait(10)
+                time.sleep(0.3)
+                started_at = time.monotonic()
+                runtime.audit_record(
+                    AuditRecordRequest(
+                        action="phase",
+                        phase={"name": "structure", "status": "in-progress"},
+                    )
+                )
+                elapsed = time.monotonic() - started_at
+                thread.join(timeout=30)
+
+            assert not thread.is_alive()
+            assert elapsed < 0.8
+            assert len(errors) == 1
+            assert "while the probe was in flight" in str(errors[0])
+            state = runtime.state("gh-audit-repo")
+            assert "probe-block" not in state["validations"]
+            assert state["candidates"]["candidate-block"]["status"] == "discovered"
+            assert state["phases"]["structure"]["status"] == "in-progress"
+
+    def test_in_flight_probe_keeps_lock_free_for_concurrent_read(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-probe-reader-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.audit_inventory(InventoryRequest(action="initialize"))
+            runtime.audit_record(
+                AuditRecordRequest(
+                    action="candidate",
+                    candidate={"id": "candidate-reader", "status": "discovered"},
+                )
+            )
+            started = threading.Event()
+            errors: list[Exception] = []
+            receipts: dict[str, Any] = {}
+
+            def probe_call() -> None:
+                try:
+                    receipts["probe"] = runtime.audit_probe(
+                        ProbeRequest(
+                            kind="python",
+                            probe_id="probe-reader",
+                            candidate_id="candidate-reader",
+                            code="pass",
+                        )
+                    )
+                except Exception as error:
+                    errors.append(error)
+
+            with mock.patch(
+                "github_workflows.runtime.audit_probe.run_probe",
+                side_effect=self._slow_probe_stub(started),
+            ):
+                thread = threading.Thread(target=probe_call)
+                thread.start()
+                assert started.wait(10)
+                time.sleep(0.3)
+                started_at = time.monotonic()
+                inventory = runtime.audit_inventory(InventoryRequest(action="status"))
+                elapsed = time.monotonic() - started_at
+                thread.join(timeout=30)
+
+            assert not thread.is_alive()
+            assert elapsed < 0.8
+            assert errors == []
+            assert inventory["revision"] == 1
+            assert receipts["probe"]["status"] == "succeeded"
+            state = runtime.state("gh-audit-repo")
+            assert state["validations"]["probe-reader"]["status"] == "succeeded"
+
+    def test_in_flight_inventory_probe_persists_under_lock(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-inv-lock-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.audit_inventory(InventoryRequest(action="initialize"))
+            state_revision = runtime.state("gh-audit-repo")["revision"]
+            started = threading.Event()
+            errors: list[Exception] = []
+            receipts: dict[str, Any] = {}
+
+            def inventory_call() -> None:
+                try:
+                    receipts["inventory"] = runtime.audit_inventory(
+                        InventoryRequest(action="program", programs=[{"name": "git"}])
+                    )
+                except Exception as error:
+                    errors.append(error)
+
+            with mock.patch(
+                "github_workflows.audit_inventory.probe_program",
+                side_effect=self._slow_program_probe(started),
+            ):
+                thread = threading.Thread(target=inventory_call)
+                thread.start()
+                assert started.wait(10)
+                time.sleep(0.3)
+                started_at = time.monotonic()
+                inventory = runtime.audit_inventory(InventoryRequest(action="status"))
+                elapsed = time.monotonic() - started_at
+                thread.join(timeout=30)
+
+            assert not thread.is_alive()
+            assert elapsed < 0.8
+            assert errors == []
+            assert inventory["revision"] == 1
+            assert receipts["inventory"]["revision"] == 2
+            assert receipts["inventory"]["state_revision"] == state_revision + 1
+            state = runtime.state("gh-audit-repo")
+            assert state["inventory"]["sources"]["programs"]["git"]["probe_status"] == "succeeded"
+
+    def test_in_flight_inventory_probe_gates_persist_on_state_revision(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-inv-conflict-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.audit_inventory(InventoryRequest(action="initialize"))
+            started = threading.Event()
+            errors: list[Exception] = []
+
+            def inventory_call() -> None:
+                try:
+                    runtime.audit_inventory(
+                        InventoryRequest(action="program", programs=[{"name": "git"}])
+                    )
+                except Exception as error:
+                    errors.append(error)
+
+            with mock.patch(
+                "github_workflows.audit_inventory.probe_program",
+                side_effect=self._slow_program_probe(started),
+            ):
+                thread = threading.Thread(target=inventory_call)
+                thread.start()
+                assert started.wait(10)
+                time.sleep(0.3)
+                started_at = time.monotonic()
+                runtime.audit_record(
+                    AuditRecordRequest(
+                        action="phase",
+                        phase={"name": "structure", "status": "in-progress"},
+                    )
+                )
+                elapsed = time.monotonic() - started_at
+                thread.join(timeout=30)
+
+            assert not thread.is_alive()
+            assert elapsed < 0.8
+            assert len(errors) == 1
+            assert "inventory collection was in flight" in str(errors[0])
+            state = runtime.state("gh-audit-repo")
+            assert state["inventory"]["sources"]["programs"] == {}
+            assert state["inventory"]["revision"] == 1
+
+    def test_run_start_keeps_lock_free_for_concurrent_start(self, monkeypatch) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-start-lock-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            monkeypatch.setenv("XDG_CACHE_HOME", str(Path(directory) / "xdg-cache"))
+            started = threading.Event()
+            real = WorkflowRuntime._source_and_worktree
+
+            def slow(self: WorkflowRuntime, confirmed: bool) -> dict[str, Any]:
+                started.set()
+                time.sleep(2.0)
+                return real(self, confirmed)
+
+            errors: list[Exception] = []
+            receipts: dict[str, Any] = {}
+
+            def audit_start() -> None:
+                try:
+                    receipts["audit"] = runtime.run_manage(
+                        RunManageRequest(
+                            action="start",
+                            workflow="gh-audit-repo",
+                            repository="example/repo",
+                            source_confirmed=True,
+                        )
+                    )
+                except Exception as error:
+                    errors.append(error)
+
+            with mock.patch.object(WorkflowRuntime, "_source_and_worktree", slow):
+                thread = threading.Thread(target=audit_start)
+                thread.start()
+                assert started.wait(10)
+                time.sleep(0.3)
+                started_at = time.monotonic()
+                receipts["curate"] = runtime.run_manage(
+                    RunManageRequest(
+                        action="start", workflow="gh-curate-issues", repository="example/repo"
+                    )
+                )
+                elapsed = time.monotonic() - started_at
+                thread.join(timeout=60)
+
+            assert not thread.is_alive()
+            assert elapsed < 0.8
+            assert errors == []
+            assert receipts["curate"]["workflow"] == "gh-curate-issues"
+            assert receipts["curate"]["status"] == "in-progress"
+            assert receipts["audit"]["workflow"] == "gh-audit-repo"
+            state = runtime.state("gh-audit-repo")
+            assert state["status"] == "in-progress"
+            assert Path(state["audit_worktree"]).is_dir()
+
+    def test_run_start_gates_on_previous_run_state_revision(self, monkeypatch) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-start-conflict-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            monkeypatch.setenv("XDG_CACHE_HOME", str(Path(directory) / "xdg-cache"))
+            state = runtime.state("gh-audit-repo")
+            state["audit_worktree"] = str(
+                runtime.workspace / ".worktrees" / "gh-audit-repo-aaaaaaa"
+            )
+            workflow_run.write_state(runtime.current("gh-audit-repo"), state)
+            started = threading.Event()
+            real = WorkflowRuntime._source_and_worktree
+
+            def slow(self: WorkflowRuntime, confirmed: bool) -> dict[str, Any]:
+                started.set()
+                time.sleep(2.0)
+                return real(self, confirmed)
+
+            errors: list[Exception] = []
+
+            def audit_start() -> None:
+                try:
+                    runtime.run_manage(
+                        RunManageRequest(
+                            action="start",
+                            workflow="gh-audit-repo",
+                            repository="example/repo",
+                            source_confirmed=True,
+                        )
+                    )
+                except Exception as error:
+                    errors.append(error)
+
+            with mock.patch.object(WorkflowRuntime, "_source_and_worktree", slow):
+                thread = threading.Thread(target=audit_start)
+                thread.start()
+                assert started.wait(10)
+                time.sleep(0.3)
+                started_at = time.monotonic()
+                runtime.audit_record(
+                    AuditRecordRequest(
+                        action="phase",
+                        phase={"name": "structure", "status": "in-progress"},
+                    )
+                )
+                elapsed = time.monotonic() - started_at
+                thread.join(timeout=60)
+
+            assert not thread.is_alive()
+            assert elapsed < 0.8
+            assert len(errors) == 1
+            assert "while the run start was in flight" in str(errors[0])
+            state = runtime.state("gh-audit-repo")
+            assert state["status"] == "in-progress"
+            assert state["phases"]["structure"]["status"] == "in-progress"
+
+    def test_probe_git_timeout_is_bounded_and_refused(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-probe-git-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.audit_record(
+                AuditRecordRequest(
+                    action="candidate",
+                    candidate={"id": "candidate-git", "status": "discovered"},
+                )
+            )
+            blocked = subprocess.TimeoutExpired(cmd=["git"], timeout=10)
+            with mock.patch(
+                "github_workflows.runtime.audit_probe.subprocess.run",
+                side_effect=blocked,
+            ):
+                with pytest.raises(ValueError, match="timed out after"):
+                    runtime.audit_probe(
+                        ProbeRequest(
+                            kind="python",
+                            probe_id="probe-git",
+                            candidate_id="candidate-git",
+                            code="pass",
+                        )
+                    )
+            state = runtime.state("gh-audit-repo")
+            assert "probe-git" not in state["validations"]
+            assert state["candidates"]["candidate-git"]["status"] == "discovered"
+
+    def test_worktree_head_verification_times_out(self) -> None:
+        blocked = subprocess.TimeoutExpired(cmd=["git"], timeout=10)
+        with mock.patch("github_workflows.runtime.subprocess.run", side_effect=blocked):
+            with pytest.raises(ValueError, match="verification timed out"):
+                WorkflowRuntime._verified_audit_worktree_head(
+                    {"audit_worktree": "/missing", "sha": "a" * 40}
+                )
