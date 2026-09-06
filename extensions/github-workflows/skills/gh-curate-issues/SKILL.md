@@ -159,7 +159,10 @@ prepare-records -> import/ingest -> query per issue -> commit-records
                                                   \-> abort on failure
 ```
 
-The server owns transaction paths and generations. Commit holds a short lock
+The server owns transaction paths and generations. Pass the full immutable
+default-branch SHA from the live repository read as `default_sha` on the
+initial commit; later commits inherit it from their staging base unless the
+live default SHA changed. Commit holds a short lock
 and succeeds only when the live generation still matches the prepared base. On
 conflict, abort, prepare from the new live generation, repeat the incremental
 refresh once, and retry. A second conflict blocks GitHub mutation and is
@@ -207,10 +210,14 @@ titles and labels to select plausible matches. Also run targeted GitHub issue an
 pull-request searches whose closed/merged date qualifiers enforce the same cutoff, so
 body-only matches remain discoverable. Read every selected issue and plausible match in
 full through MCP before including a duplicate, scope, body, or relationship conclusion;
-do not ingest those detail payloads into history. Create each user-private candidate
-bundle under the run's `artifacts/` directory.
-Include only that issue, plausible matches read in full, relevant relationship
-records, the repository summary, cutoff, watermark, and immutable default SHA.
+do not ingest those detail payloads into history. Create each user-private
+candidate bundle as UTF-8 JSON under the run's `artifacts/` directory. Use
+top-level `selected_issue`, `matches`, `relationships`, `repository`, `cutoff`,
+`watermark`, and `default_sha` fields. Each selected issue and match has `kind`,
+positive `number`, `state`, and its snapshot reference. Include each
+`(kind, number)` at most once; contradictory states are invalid. Include only
+that issue, plausible matches read in full, relevant relationship records, the
+repository summary, cutoff, watermark, and immutable default SHA.
 Keep secrets and repository contents out of bundles.
 
 GitHub issue and PR records are the curator's evidence boundary. Treat paths,
@@ -222,6 +229,10 @@ decision requiring current-code proof to `/gh-audit-repo` or
 
 Register one complete assignment per issue with
 `mcp__github_workflows__task_manage` using action `plan` and a typed `task`.
+Its assignment contains `issue`, `issue_snapshot`, and the run-relative
+`candidate_bundle` path. Repository, default SHA, dry-run state,
+documentation, and reference paths are server-derived task context and must
+not be duplicated in the assignment.
 Use its returned server-generated task ID and task reference, then queue exactly one fresh-context
 `gh-curate-issues-worker` for every selected issue. Each worker receives only:
 

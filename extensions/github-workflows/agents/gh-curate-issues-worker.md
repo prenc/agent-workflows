@@ -36,9 +36,10 @@ This worker is read-only and must not create or execute any orchestration file.
 
 The spawn prompt contains only a namespaced task reference. Call
 `mcp__github_workflows__task_context` before any other operation. Require its
-stored assignment to contain the repository, immutable SHA, exactly one issue,
-the current issue snapshot and candidate bundle, history cutoff and watermark,
-documentation guidance, and dry-run state. Return `CONTEXT_UNAVAILABLE` with
+stored assignment to contain exactly one issue, its current snapshot, and a
+run-relative candidate-bundle path. Require repository, immutable SHA,
+documentation guidance, and dry-run state from the server-derived run context,
+and require cutoff and watermark inside the bundle. Return `CONTEXT_UNAVAILABLE` with
 the missing field when context retrieval fails or is incomplete. The
 supervisor owns recovery and reassignment decisions.
 

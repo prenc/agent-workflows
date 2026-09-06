@@ -384,6 +384,20 @@ def _public_input_schema(name: str, schema: dict[str, Any]) -> dict[str, Any]:
                 },
             }
         )
+        for field, action in (
+            ("source", "ingest"),
+            ("default_sha", "commit"),
+            ("full_history_complete", "commit"),
+        ):
+            conditions.append(
+                {
+                    "if": {"required": [field]},
+                    "then": {
+                        "properties": {"action": {"const": action}},
+                        "required": ["action"],
+                    },
+                }
+            )
     if name == "history_query":
         conditions.append(
             {
@@ -629,9 +643,9 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
         )
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
-    def task_context(task_ref: str) -> dict[str, Any]:
-        """Resolve the exact short task_ref returned by task_manage."""
-        return _public_call(runtime.task_context, task_ref)
+    def task_context(task_ref: str, history_cursor: str | None = None) -> dict[str, Any]:
+        """Resolve a task and optionally continue its bounded history selection."""
+        return _public_call(runtime.task_context, task_ref, history_cursor)
 
     @mcp.tool(annotations=LOCAL_WRITE, structured_output=True)
     def history_manage(
@@ -642,6 +656,7 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
         source: str | None = None,
         fetched_at: str | None = None,
         full_history_complete: bool | None = None,
+        default_sha: str | None = None,
     ) -> dict[str, Any]:
         """Manage a compact GitHub index; details are discarded and read live when needed."""
         return _request_call(runtime.history_manage, HistoryManageRequest, **locals())

@@ -521,17 +521,22 @@ def row_dict(row: sqlite3.Row) -> dict[str, Any]:
     return {key: value for key, value in result.items() if value is not None}
 
 
-def linked_keys(path: Path | None) -> set[tuple[str, int]]:
+def linked_key_list(path: Path | None) -> list[tuple[str, int]]:
+    """Return valid linked keys in caller order without duplicates."""
     if path is None:
-        return set()
+        return []
     payload = json.loads(path.read_text())
-    return {
-        (item["kind"], item["number"])
-        for item in payload
-        if isinstance(item, dict)
-        and item.get("kind") in {"issue", "pull"}
-        and isinstance(item.get("number"), int)
-    }
+    result: list[tuple[str, int]] = []
+    for item in payload:
+        if (
+            isinstance(item, dict)
+            and item.get("kind") in {"issue", "pull"}
+            and isinstance(item.get("number"), int)
+        ):
+            key = (item["kind"], item["number"])
+            if key not in result:
+                result.append(key)
+    return result
 
 
 def event_time(row: sqlite3.Row) -> dt.datetime | None:
@@ -559,40 +564,55 @@ def query_records(args: argparse.Namespace) -> None:
     cutoff = parse_time(args.cutoff) if args.cutoff else None
     if args.cutoff and cutoff is None:
         raise ValueError("cutoff must be an ISO-8601 timestamp")
-    linked = linked_keys(args.linked)
+    ordered_links = linked_key_list(args.linked)
+    linked = set(ordered_links)
+    offset = int(getattr(args, "offset", 0) or 0)
+    fill = bool(getattr(args, "fill", False))
     text = args.terms or (args.terms_file.read_text() if args.terms_file else "")
     match = safe_match_query(text)
     with connect_readonly(args.db) as connection:
         validate(connection, args.repo, "records")
-        rows: Iterable[sqlite3.Row]
-        if match:
-            rows = connection.execute(
-                "SELECT r.* FROM records_fts f JOIN records r ON r.kind=f.kind AND r.number=f.number "
-                "WHERE records_fts MATCH ? ORDER BY bm25(records_fts)",
-                (f"{{title labels}} : ({match})",),
-            )
-        else:
-            rows = connection.execute("SELECT * FROM records ORDER BY kind, number")
+        target = offset + args.limit + 1 if args.limit else None
         selected: dict[tuple[str, int], sqlite3.Row] = {}
-        for kind, number in linked:
+        for kind, number in ordered_links:
             row = connection.execute(
                 "SELECT * FROM records WHERE kind=? AND number=?", (kind, number)
             ).fetchone()
-            if row:
+            if row and (not args.kind or row["kind"] == args.kind):
                 selected[(kind, number)] = row
-        for row in rows:
-            if args.kind and row["kind"] != args.kind:
-                continue
-            if args.state and row["state"] != args.state:
-                continue
-            if eligible(row, cutoff, linked):
-                selected[(row["kind"], row["number"])] = row
-            if args.limit and len(selected) > args.limit:
+            if target is not None and len(selected) >= target:
                 break
+
+        def collect(rows: Iterable[sqlite3.Row]) -> None:
+            for row in rows:
+                if args.kind and row["kind"] != args.kind:
+                    continue
+                if args.state and row["state"] != args.state:
+                    continue
+                if eligible(row, cutoff, linked):
+                    selected.setdefault((row["kind"], row["number"]), row)
+                if target is not None and len(selected) >= target:
+                    break
+
+        if target is None or len(selected) < target:
+            rows: Iterable[sqlite3.Row]
+            if match:
+                rows = connection.execute(
+                    "SELECT r.* FROM records_fts f JOIN records r ON r.kind=f.kind AND r.number=f.number "
+                    "WHERE records_fts MATCH ? ORDER BY bm25(records_fts), r.kind, r.number",
+                    (f"{{title labels}} : ({match})",),
+                )
+            else:
+                rows = connection.execute("SELECT * FROM records ORDER BY kind, number")
+            collect(rows)
+        if fill and match and (target is None or len(selected) < target):
+            collect(connection.execute("SELECT * FROM records ORDER BY kind, number"))
         selected_records = list(selected.values())
-        has_more = bool(args.limit and len(selected_records) > args.limit)
+        has_more = bool(args.limit and len(selected_records) > offset + args.limit)
         if args.limit:
-            selected_records = selected_records[: args.limit]
+            selected_records = selected_records[offset : offset + args.limit]
+        elif offset:
+            selected_records = selected_records[offset:]
         result = {
             "cutoff": iso_utc(cutoff) if cutoff else None,
             "has_more": has_more,
@@ -982,6 +1002,8 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--kind", choices=("issue", "pull"))
     command.add_argument("--state", choices=("open", "closed"))
     command.add_argument("--limit", type=int, default=0)
+    command.add_argument("--offset", type=int, default=0, help=argparse.SUPPRESS)
+    command.add_argument("--fill", action="store_true", help=argparse.SUPPRESS)
     command.add_argument("--output", type=Path)
     command.set_defaults(handler=query_records)
 

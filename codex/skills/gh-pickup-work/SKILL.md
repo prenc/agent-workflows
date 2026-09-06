@@ -329,9 +329,10 @@ line and default-branch target. Correct the PR body once when linkage is
 missing; a remaining failure blocks final publication.
 
 Confirm through MCP that the PR points to the pushed SHA. Never query CI or
-status rollups. Before publication, read the PR labels through the issue-label
-API, reconcile the derived taxonomy from the complete covered-issue set, and
-read it back. A usable incomplete handoff stays draft: apply `partial` to the
+status rollups. Before publication, obtain complete current PR labels and
+reconcile the derived taxonomy from the complete covered-issue set under the
+shared PR-label convention. If complete membership or read-back is unavailable,
+preserve labels and report that mutation as blocked. A usable incomplete handoff stays draft: apply `partial` to the
 PR and each issue whose accepted scope has usable pushed but incomplete work,
 and retain unchecked coverage in the PR body. Do not split the unit during
 publication.

@@ -232,7 +232,18 @@ class TaskPlan(StrictRequest):
     logical_id: str
     role: str | None = None
     unit: str | None = None
-    assignment: dict[str, Any] = Field(default_factory=dict)
+    assignment: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Workflow-specific assignment object; extension fields are allowed. Curator "
+            "assignments require issue, issue_snapshot, and candidate_bundle. Implementation "
+            "assignments require issues, pull_request, worktree, branch, rebased_base_sha, "
+            "remote_lease, round_objective, acceptance_condition, repository_instructions, "
+            "validation_plan, and execution_environment. Audit verify assignments may include "
+            "validation_ids. New plans and replacement retries are validated before an attempt "
+            "is created."
+        ),
+    )
     required: bool = True
 
 
@@ -351,6 +362,11 @@ class HistoryCommitRequest(StrictRequest):
     workflow: WorkflowName = "gh-audit-repo"
     fetched_at: str | None = None
     full_history_complete: bool | None = None
+    default_sha: str | None = Field(
+        default=None,
+        pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+        description="Full immutable default-branch SHA represented by this committed history.",
+    )
 
 
 class HistoryAbortRequest(StrictRequest):

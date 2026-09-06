@@ -145,8 +145,10 @@ without direct inspection of current code in the immutable audit worktree.
 
 Before returning a candidate, search `task_context.history.selection.records` and
 compare root cause, symbols/paths, failure mode, requested outcome, and required
-outcomes. When `task_context.history.selection.has_more` is true or a body-only match
-is plausible, use targeted semantic GitHub search for additional plausible matches
+outcomes. When `task_context.history.selection.has_more` is true, call
+`task_context` again, passing the returned `next_cursor` as `history_cursor`,
+and continue until `next_cursor` is absent. When a body-only match is plausible, use targeted semantic GitHub search
+for additional plausible matches
 rather than broad issue or pull-request enumeration. Pass repository scope through
 `owner` and `repo`, not GitHub qualifiers in the natural-language query. A zero-result
 semantic search is inconclusive; rely on supplied indexed history for exact identifiers

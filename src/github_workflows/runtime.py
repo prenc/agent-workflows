@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import fcntl
 import hashlib
 import json
@@ -45,6 +47,7 @@ SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 HISTORY_ARTIFACT_BYTES = 5 * 1024 * 1024
 HISTORY_ARTIFACT_TOTAL_BYTES = 25 * 1024 * 1024
 TASK_HISTORY_LIMIT = 40
+TASK_VALIDATION_LIMIT = 40
 TASK_VALIDATION_EXCERPT_BYTES = 2 * 1024
 TASK_HISTORY_FIELDS = (
     "kind",
@@ -644,6 +647,209 @@ class WorkflowRuntime:
             CANDIDATE_FINGERPRINT_FIELD: fingerprint,
         }
 
+    @staticmethod
+    def _non_blank(value: Any, field: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"assignment.{field} must be a non-empty string")
+        return value.strip()
+
+    def _curation_bundle(self, assignment: dict[str, Any]) -> dict[str, Any]:
+        issue = assignment.get("issue")
+        if isinstance(issue, bool) or not isinstance(issue, int) or issue < 1:
+            raise ValueError("curation assignment.issue must be a positive integer")
+        relative = self._non_blank(assignment.get("candidate_bundle"), "candidate_bundle")
+        snapshot_relative = self._non_blank(assignment.get("issue_snapshot"), "issue_snapshot")
+        path = Path(relative)
+        snapshot_path = Path(snapshot_relative)
+        if any(item.is_absolute() or ".." in item.parts for item in (path, snapshot_path)):
+            raise ValueError("curation artifact paths must be run-relative")
+        artifacts = (self.current("gh-curate-issues") / "artifacts").resolve()
+        snapshot = self.current("gh-curate-issues") / snapshot_path
+        if snapshot.is_symlink() or not snapshot.is_file():
+            raise ValueError("assignment.issue_snapshot must name an existing non-symlink file")
+        try:
+            snapshot.resolve().relative_to(artifacts)
+        except ValueError as error:
+            raise ValueError("assignment.issue_snapshot must be under run artifacts") from error
+        unresolved = self.current("gh-curate-issues") / path
+        if unresolved.is_symlink():
+            raise ValueError("assignment.candidate_bundle must name a non-symlink file")
+        resolved = unresolved.resolve()
+        try:
+            resolved.relative_to(artifacts)
+        except ValueError as error:
+            raise ValueError("assignment.candidate_bundle must be under run artifacts") from error
+        if not resolved.is_file():
+            raise ValueError("assignment.candidate_bundle must name an existing regular file")
+        try:
+            bundle = json.loads(resolved.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError("assignment.candidate_bundle must contain valid UTF-8 JSON") from error
+        if not isinstance(bundle, dict):
+            raise ValueError("candidate bundle must be a JSON object")
+        selected = bundle.get("selected_issue")
+        matches = bundle.get("matches")
+        if (
+            not isinstance(selected, dict)
+            or selected.get("kind") != "issue"
+            or selected.get("number") != issue
+        ):
+            raise ValueError("candidate bundle selected_issue must match assignment.issue")
+        for field in ("state", "snapshot"):
+            self._non_blank(selected.get(field), f"candidate_bundle.selected_issue.{field}")
+        if selected["snapshot"] != assignment["issue_snapshot"]:
+            raise ValueError("candidate bundle selected_issue snapshot must match assignment")
+        if not isinstance(matches, list):
+            raise ValueError("candidate bundle matches must be an array")
+        seen: dict[tuple[str, int], str] = {("issue", issue): str(selected.get("state", ""))}
+        for item in matches:
+            if not isinstance(item, dict):
+                raise ValueError("candidate bundle matches must contain objects")
+            kind, number, state = item.get("kind"), item.get("number"), item.get("state")
+            if (
+                kind not in {"issue", "pull"}
+                or isinstance(number, bool)
+                or not isinstance(number, int)
+                or number < 1
+            ):
+                raise ValueError("candidate bundle matches require kind and positive number")
+            key = (kind, number)
+            normalized_state = str(state or "")
+            self._non_blank(state, "candidate_bundle.matches.state")
+            self._non_blank(item.get("snapshot"), "candidate_bundle.matches.snapshot")
+            if key in seen:
+                detail = "contradictory " if seen[key] != normalized_state else "duplicate "
+                raise ValueError(f"candidate bundle contains a {detail}{kind} #{number}")
+            seen[key] = normalized_state
+        if not isinstance(bundle.get("relationships"), (dict, list)):
+            raise ValueError("candidate bundle relationships must be an object or array")
+        for field in ("repository", "cutoff", "watermark"):
+            self._non_blank(bundle.get(field), f"candidate_bundle.{field}")
+        default_sha = self._non_blank(bundle.get("default_sha"), "candidate_bundle.default_sha")
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", default_sha):
+            raise ValueError("candidate bundle default_sha must be a full hexadecimal SHA")
+        state = self.state("gh-curate-issues")
+        if bundle["repository"] != state.get("repository"):
+            raise ValueError("candidate bundle repository must match the current run")
+        history = state.get("history")
+        committed_sha = history.get("default_sha") if isinstance(history, dict) else None
+        if committed_sha and default_sha != committed_sha:
+            raise ValueError("candidate bundle default_sha must match committed history")
+        return assignment
+
+    def _generic_task_assignment(
+        self, workflow: WorkflowName, assignment: dict[str, Any]
+    ) -> dict[str, Any]:
+        if workflow == "gh-curate-issues":
+            for field in ("issue_snapshot",):
+                self._non_blank(assignment.get(field), field)
+            return self._curation_bundle(assignment)
+        if workflow != "gh-implement-issue":
+            return assignment
+        issues = assignment.get("issues")
+        if not isinstance(issues, list) or not issues:
+            raise ValueError("implementation assignment.issues must be a non-empty array")
+        seen: set[int] = set()
+        for issue in issues:
+            if not isinstance(issue, dict):
+                raise ValueError("implementation assignment.issues must contain objects")
+            number = issue.get("number")
+            if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+                raise ValueError("implementation issue number must be a positive integer")
+            if number in seen:
+                raise ValueError(f"implementation assignment repeats issue #{number}")
+            seen.add(number)
+            for field in ("snapshot", "accepted_scope"):
+                self._non_blank(issue.get(field), f"issues.{field}")
+        for field in (
+            "worktree",
+            "branch",
+            "rebased_base_sha",
+            "round_objective",
+            "acceptance_condition",
+        ):
+            self._non_blank(assignment.get(field), field)
+        sha = assignment["rebased_base_sha"]
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
+            raise ValueError("assignment.rebased_base_sha must be a full hexadecimal SHA")
+        for field in ("pull_request", "remote_lease", "execution_environment"):
+            if not isinstance(assignment.get(field), dict):
+                raise ValueError(f"assignment.{field} must be an object")
+        self._non_blank(assignment["pull_request"].get("state"), "pull_request.state")
+        self._non_blank(assignment["remote_lease"].get("state"), "remote_lease.state")
+        environment = assignment["execution_environment"]
+        if environment.get("mode") not in {"native", "shared", "isolated"}:
+            raise ValueError(
+                "assignment.execution_environment.mode must be native, shared, or isolated"
+            )
+        pythonpath = environment.get("pythonpath", [])
+        if not isinstance(pythonpath, list) or any(
+            not isinstance(item, str) or not item.strip() for item in pythonpath
+        ):
+            raise ValueError("assignment.execution_environment.pythonpath must be an array")
+        if environment["mode"] == "shared":
+            worktree = Path(assignment["worktree"])
+            worktree = worktree if worktree.is_absolute() else self.workspace / worktree
+            for value in pythonpath:
+                relative = Path(value)
+                if (
+                    relative.is_absolute()
+                    or ".." in relative.parts
+                    or "\\" in value
+                    or "\x00" in value
+                    or value != value.strip()
+                    or value != relative.as_posix()
+                ):
+                    raise ValueError(
+                        "shared execution_environment.pythonpath entries must be normalized "
+                        "project-relative paths"
+                    )
+                if worktree.is_dir():
+                    candidate = (worktree / relative).resolve()
+                    try:
+                        candidate.relative_to(worktree.resolve())
+                    except ValueError as error:
+                        raise ValueError(
+                            "shared execution_environment.pythonpath entries must remain "
+                            "inside the assigned worktree"
+                        ) from error
+                    if not candidate.is_dir():
+                        raise ValueError(
+                            "shared execution_environment.pythonpath entries must exist under "
+                            "the assigned worktree"
+                        )
+        instructions = assignment.get("repository_instructions")
+        if (
+            not isinstance(instructions, list)
+            or not instructions
+            or any(not isinstance(item, str) or not item.strip() for item in instructions)
+        ):
+            raise ValueError("assignment.repository_instructions must be a non-empty array")
+        validation_plan = assignment.get("validation_plan")
+        if not isinstance(validation_plan, list) or any(
+            not isinstance(item, str) or not item.strip() for item in validation_plan
+        ):
+            raise ValueError("assignment.validation_plan must be an array of strings")
+        return assignment
+
+    @staticmethod
+    def _validate_assignment_validations(state: dict[str, Any], assignment: dict[str, Any]) -> None:
+        if "validation_ids" in assignment and assignment.get("mode") != "verify":
+            raise ValueError("assignment.validation_ids is accepted only for verify tasks")
+        identifiers = assignment.get("validation_ids", [])
+        if not isinstance(identifiers, list) or any(
+            not isinstance(item, str) or not item for item in identifiers
+        ):
+            raise ValueError("verify assignment.validation_ids must be an array of strings")
+        if len(identifiers) > TASK_VALIDATION_LIMIT:
+            raise ValueError(
+                f"verify assignments accept at most {TASK_VALIDATION_LIMIT} validations"
+            )
+        known = state.get("validations", {})
+        missing = [item for item in identifiers if not isinstance(known, dict) or item not in known]
+        if missing:
+            raise ValueError(f"verify assignment references unknown validation IDs: {missing}")
+
     def _write_audit_task_report(
         self, task_id: str, report: dict[str, Any], *, checkpoint: bool
     ) -> tuple[Path, str]:
@@ -722,9 +928,9 @@ class WorkflowRuntime:
             raise ValueError("managed task is missing from workflow state")
         scheduler = cls._scheduler_status(state)
         allowed_actions = cls._task_actions(task, scheduler)
-        if workflow == "gh-audit-repo" and state.get("status") == "suspended":
+        if state.get("status") == "suspended":
             allowed_actions = (
-                ["checkpoint", "complete", "fail", "abandon"]
+                ["checkpoint", "complete", "fail"]
                 if task.get("status") in {"running", "checkpointed"}
                 else []
             )
@@ -1147,6 +1353,7 @@ class WorkflowRuntime:
                         revised["assignment"] = self._audit_task_assignment(
                             revised["assignment"], caller_supplied=True
                         )
+                        self._validate_assignment_validations(state, revised["assignment"])
                         self._event(
                             {
                                 "type": "task-plan-update",
@@ -1174,6 +1381,7 @@ class WorkflowRuntime:
                 assignment = self._audit_task_assignment(
                     assignment, caller_supplied=plan is not None
                 )
+                self._validate_assignment_validations(state, assignment)
                 if not SAFE_ID.fullmatch(logical_id):
                     raise ValueError("logical_id contains unsupported characters")
                 if not SAFE_ID.fullmatch(task_id):
@@ -1264,7 +1472,9 @@ class WorkflowRuntime:
         *,
         invocation_id: str | None = None,
     ) -> dict[str, Any]:
-        if state.get("status") != "in-progress":
+        run_status = state.get("status")
+        late_result = request.action in {"checkpoint", "complete", "fail"}
+        if run_status != "in-progress" and not (run_status == "suspended" and late_result):
             raise ValueError("current generic workflow run is not active")
         tasks = state.setdefault("tasks", {})
         scheduler = state.setdefault("scheduler", {"limit": 3, "integration_queue": []})
@@ -1304,12 +1514,13 @@ class WorkflowRuntime:
                     if item.get("logical_id") == logical_id and item.get("status") == "queued"
                 ]
                 if queued:
+                    assignment = self._generic_task_assignment(request.workflow, plan.assignment)
                     task = queued[0]
                     task.update(
                         {
                             "role": plan.role or "worker",
                             "unit": plan.unit or logical_id,
-                            "assignment": plan.assignment,
+                            "assignment": assignment,
                             "required": plan.required,
                         }
                     )
@@ -1338,6 +1549,7 @@ class WorkflowRuntime:
                 unit = plan.unit or logical_id
                 assignment = plan.assignment
                 required = plan.required
+            assignment = self._generic_task_assignment(request.workflow, assignment)
             if not SAFE_ID.fullmatch(logical_id):
                 raise ValueError("logical_id contains unsupported characters")
             if not SAFE_ID.fullmatch(task_id):
@@ -1503,8 +1715,28 @@ class WorkflowRuntime:
                 return result
         return result or None
 
+    @staticmethod
+    def _history_cursor(payload: dict[str, Any]) -> str:
+        rendered = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        return base64.urlsafe_b64encode(rendered).decode().rstrip("=")
+
+    @staticmethod
+    def _decode_history_cursor(cursor: str) -> dict[str, Any]:
+        try:
+            padding = "=" * (-len(cursor) % 4)
+            value = json.loads(base64.urlsafe_b64decode(cursor + padding))
+        except (ValueError, UnicodeError, json.JSONDecodeError, binascii.Error) as error:
+            raise ValueError("history_cursor is malformed") from error
+        if not isinstance(value, dict):
+            raise ValueError("history_cursor is malformed")
+        return value
+
     def _audit_task_history(
-        self, state: dict[str, Any], assignment: dict[str, Any]
+        self,
+        state: dict[str, Any],
+        assignment: dict[str, Any],
+        task_ref: str,
+        history_cursor: str | None,
     ) -> dict[str, Any]:
         history = state.get("history", {})
         if not isinstance(history, dict) or not history.get("full_history_complete"):
@@ -1538,24 +1770,27 @@ class WorkflowRuntime:
             )
             if value
         )
-
-        def query(query_terms: str) -> dict[str, Any]:
-            with self._json_file(links) as linked:
-                return self._invoke(
-                    github_cache.query_records,
-                    repo=repo,
-                    project_dir=self.project_dir,
-                    cache_root=self.project_dir,
-                    db=database,
-                    cutoff=None,
-                    linked=linked if links else None,
-                    terms=query_terms,
-                    terms_file=None,
-                    kind=None,
-                    state="open",
-                    limit=TASK_HISTORY_LIMIT,
-                    output=None,
-                )
+        generation = history.get("generation")
+        query_fingerprint = hashlib.sha256(
+            json.dumps(
+                {"links": links, "state": "open", "terms": terms},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        offset = 0
+        if history_cursor is not None:
+            cursor = self._decode_history_cursor(history_cursor)
+            expected = {
+                "task_ref": task_ref,
+                "generation": generation,
+                "query": query_fingerprint,
+            }
+            if any(cursor.get(key) != value for key, value in expected.items()):
+                raise ValueError("history_cursor is stale or belongs to another task")
+            offset = cursor.get("offset")
+            if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+                raise ValueError("history_cursor is malformed")
 
         def projected(queried: dict[str, Any]) -> list[dict[str, Any]]:
             return [
@@ -1568,41 +1803,41 @@ class WorkflowRuntime:
                 if isinstance(record, dict)
             ]
 
-        relevant = query(terms) if links or terms else {"records": [], "has_more": False}
-        records = projected(relevant)
-        if links:
-            by_key = {
-                (record.get("kind"), record.get("number")): record
-                for record in records
-                if isinstance(record, dict)
-            }
-            linked_records = [
-                by_key[(item["kind"], item["number"])]
-                for item in links
-                if (item["kind"], item["number"]) in by_key
-            ]
-            linked_keys = {(item["kind"], item["number"]) for item in links}
-            records = linked_records + [
-                record
-                for record in records
-                if (record.get("kind"), record.get("number")) not in linked_keys
-            ]
-        fallback = query("")
-        selected_keys = {(record.get("kind"), record.get("number")) for record in records}
-        records.extend(
-            record
-            for record in projected(fallback)
-            if (record.get("kind"), record.get("number")) not in selected_keys
+        with self._json_file(links) as linked:
+            queried = self._invoke(
+                github_cache.query_records,
+                repo=repo,
+                project_dir=self.project_dir,
+                cache_root=self.project_dir,
+                db=database,
+                cutoff=None,
+                linked=linked if links else None,
+                terms=terms,
+                terms_file=None,
+                kind=None,
+                state="open",
+                limit=TASK_HISTORY_LIMIT,
+                offset=offset,
+                fill=True,
+                output=None,
+            )
+        records = projected(queried)
+        has_more = bool(queried.get("has_more"))
+        next_cursor = (
+            self._history_cursor(
+                {
+                    "task_ref": task_ref,
+                    "generation": generation,
+                    "query": query_fingerprint,
+                    "offset": offset + len(records),
+                }
+            )
+            if has_more
+            else None
         )
-        has_more = (
-            bool(relevant.get("has_more"))
-            or bool(fallback.get("has_more"))
-            or len(records) > TASK_HISTORY_LIMIT
-        )
-        records = records[:TASK_HISTORY_LIMIT]
         return {
             "cache": {
-                "generation": history.get("generation"),
+                "generation": generation,
                 "record_count": history.get("record_count"),
                 "complete": True,
             },
@@ -1611,6 +1846,7 @@ class WorkflowRuntime:
                 "limit": TASK_HISTORY_LIMIT,
                 "has_more": has_more,
                 "records": records,
+                "next_cursor": next_cursor,
             },
         }
 
@@ -1689,13 +1925,15 @@ class WorkflowRuntime:
         candidate_id = candidate.get("id") if isinstance(candidate, dict) else None
         if not isinstance(candidate_id, str) or not candidate_id:
             return None
+        requested_ids = set(assignment.get("validation_ids", []))
         validations = state.get("validations", {})
         if not isinstance(validations, dict):
             return None
         records = [
             {key: validation[key] for key in TASK_VALIDATION_FIELDS if key in validation}
-            for validation in validations.values()
-            if isinstance(validation, dict) and validation.get("candidate_id") == candidate_id
+            for validation_id, validation in validations.items()
+            if isinstance(validation, dict)
+            and (validation.get("candidate_id") == candidate_id or validation_id in requested_ids)
         ]
         return {
             "candidate_id": candidate_id,
@@ -1703,7 +1941,7 @@ class WorkflowRuntime:
             "records": records,
         }
 
-    def task_context(self, task_ref: str) -> dict[str, Any]:
+    def task_context(self, task_ref: str, history_cursor: str | None = None) -> dict[str, Any]:
         workflow, run_ref, task_id = self._parse_task_ref(task_ref)
         state = self.state(workflow)
         if not self._task_ref_matches(state, run_ref):
@@ -1711,6 +1949,8 @@ class WorkflowRuntime:
         task = state.get("tasks", {}).get(task_id)
         if not isinstance(task, dict):
             raise ValueError("task_ref is unknown; use the exact value from task_manage")
+        if history_cursor is not None and workflow != "gh-audit-repo":
+            raise ValueError("history_cursor is supported only for audit worker context")
         assignment = task.get("assignment", {})
         if workflow == "gh-audit-repo":
             assignment = self._audit_task_assignment(assignment, caller_supplied=False)
@@ -1748,6 +1988,10 @@ class WorkflowRuntime:
             )
         if workflow == "gh-implement-issue":
             references["pull_request_template"] = str(reference_root / "github-pr-template.md")
+        stored_history = state.get("history")
+        default_sha = (
+            stored_history.get("default_sha") if isinstance(stored_history, dict) else None
+        )
         result = {
             "task_ref": task_ref,
             "task_id": task_id,
@@ -1766,13 +2010,20 @@ class WorkflowRuntime:
             },
             "references": references,
             "control_plane": {"user_messages_always_available": True},
+            "run_context": {
+                "repository": state.get("repository"),
+                "default_sha": state.get("sha") or default_sha,
+                "dry_run": bool(state.get("inputs", {}).get("dry_run", False)),
+            },
         }
         continuation = self._continuation_context(workflow, state, task)
         if continuation is not None:
             result["continuation"] = continuation
         if workflow == "gh-audit-repo":
             result["audit_worktree_head"] = self._verified_audit_worktree_head(state)
-            result["history"] = self._audit_task_history(state, assignment)
+            result["history"] = self._audit_task_history(
+                state, assignment, task_ref, history_cursor
+            )
             validation = self._worker_validation(state, assignment)
             if validation is not None:
                 result["validation"] = validation
@@ -1823,6 +2074,16 @@ class WorkflowRuntime:
                     updated = self.state(request.workflow)
                     history = updated["history"]
                 else:
+                    state["history"] = history
+                    state["revision"] += 1
+                    state["updated_at"] = workflow_run.utc_now()
+                    workflow_run.write_state(self.current(request.workflow), state)
+                    workflow_run.append_journal(
+                        self.current(request.workflow),
+                        "history_sync",
+                        revision=state["revision"],
+                        status=status,
+                    )
                     updated = state
                 return self._receipt(
                     request.workflow,
@@ -1915,6 +2176,12 @@ class WorkflowRuntime:
             full_history_complete = request.full_history_complete
             if full_history_complete is None:
                 full_history_complete = metadata.get("full_history_complete") == "true"
+            default_sha = request.default_sha or metadata.get("default_sha")
+            if not default_sha or default_sha == "unknown":
+                raise ValueError(
+                    "fresh history commit requires default_sha; copy the full immutable "
+                    "default-branch SHA from the live repository read"
+                )
             result = self._invoke(
                 lambda args: github_cache.commit_database(args, "records"),
                 **common,
@@ -1922,7 +2189,7 @@ class WorkflowRuntime:
                 db=work_db,
                 base_generation=int(metadata["generation"]),
                 synced_at=request.fetched_at or workflow_run.utc_now(),
-                default_sha=str(state.get("sha") or "unknown"),
+                default_sha=default_sha,
                 full_history_complete=full_history_complete,
                 repo_sha=None,
                 keep_shas=5,

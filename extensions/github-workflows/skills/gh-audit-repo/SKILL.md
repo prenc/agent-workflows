@@ -297,8 +297,9 @@ reduces them to compact metadata without returning their contents. Use inline
 carries its own `kind`, so an ingest call may contain both issues and pulls, with at most
 100 records per call. `records` and `artifacts` are mutually exclusive.
 
-Commit with action `commit` after all pages are ingested. The server supplies
-the transaction generation, run timestamp, and audited local SHA, takes a short lock, and rejects a
+Commit with action `commit` after all pages are ingested, passing the full
+immutable default-branch SHA from the live repository read as `default_sha`.
+The server supplies the transaction generation and run timestamp, takes a short lock, and rejects a
 changed live generation. On conflict, prepare from the newer database, repeat
 incremental synchronization once, and retry. A second conflict blocks
 publication. Treat abandoned staging files as non-blocking artifacts.
@@ -706,7 +707,12 @@ After an area's discovery and every candidate verification finish:
    accepted issues. Do not change existing label metadata; report drift for
    `/gh-curate-issues`.
 
-7. For `update-existing`, refresh immediately before writing, preserve the
+7. Immediately before rendering or publishing any accepted candidate, reopen
+   every cited current-SHA symbol and repository-relative path. Revalidate each
+   impact statement against that source, replace stale locations, and correct
+   inaccurate claims. Reject or return the candidate to verification when the
+   cited source or impact cannot be re-established. For `update-existing`,
+   refresh immediately before writing, preserve the
    accepted root cause/intent and unrelated labels, then directly update title,
    body, and exactly one area/type/priority in that order. The revised body
    begins with the audit provenance marker below, preserving a distinct curator

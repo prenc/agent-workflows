@@ -36,6 +36,56 @@ EXTENSION = ROOT / "extensions/github-workflows"
 
 class TestExtensionMcp:
     @staticmethod
+    def curation_assignment(runtime: WorkflowRuntime, issue: int, **extra: Any) -> dict[str, Any]:
+        artifacts = runtime.current("gh-curate-issues") / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        bundle = artifacts / f"bundle-{issue}.json"
+        (artifacts / f"issue-{issue}.json").write_text("{}\n", encoding="utf-8")
+        bundle.write_text(
+            json.dumps(
+                {
+                    "selected_issue": {
+                        "kind": "issue",
+                        "number": issue,
+                        "state": "open",
+                        "snapshot": f"artifacts/issue-{issue}.json",
+                    },
+                    "matches": [],
+                    "relationships": {},
+                    "repository": runtime.state("gh-curate-issues")["repository"],
+                    "cutoff": "2025-01-01T00:00:00Z",
+                    "watermark": "2026-01-01T00:00:00Z",
+                    "default_sha": "a" * 40,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return {
+            "issue": issue,
+            "issue_snapshot": f"artifacts/issue-{issue}.json",
+            "candidate_bundle": f"artifacts/{bundle.name}",
+            **extra,
+        }
+
+    @staticmethod
+    def implementation_assignment(issue: int) -> dict[str, Any]:
+        return {
+            "issues": [
+                {"number": issue, "snapshot": f"issue-{issue}.json", "accepted_scope": "scope"}
+            ],
+            "pull_request": {"state": "none"},
+            "worktree": ".worktrees/unit",
+            "branch": "work/unit",
+            "rebased_base_sha": "a" * 40,
+            "remote_lease": {"state": "absent"},
+            "round_objective": "Complete the accepted scope",
+            "acceptance_condition": "Focused validation passes",
+            "repository_instructions": ["AGENTS.md"],
+            "validation_plan": ["pytest"],
+            "execution_environment": {"mode": "shared", "pythonpath": ["src"]},
+        }
+
+    @staticmethod
     def invocation_context(session_id: str, prompt_id: str) -> SimpleNamespace:
         request_context = SimpleNamespace(
             meta={
@@ -80,7 +130,10 @@ class TestExtensionMcp:
                     {
                         "action": "plan",
                         "workflow": "gh-curate-issues",
-                        "task": {"logical_id": "unit-a"},
+                        "task": {
+                            "logical_id": "unit-a",
+                            "assignment": self.curation_assignment(runtime, 1),
+                        },
                     },
                     meta=first_meta,
                 )
@@ -393,11 +446,12 @@ class TestExtensionMcp:
                             "logical_id": "issue-12",
                             "role": "curate",
                             "unit": "issue/12",
-                            "assignment": {
-                                "issue": 12,
-                                "source_kind": "python-library",
-                                "accepted_scope": "Normalize the public API issue",
-                            },
+                            "assignment": self.curation_assignment(
+                                runtime,
+                                12,
+                                source_kind="python-library",
+                                accepted_scope="Normalize the public API issue",
+                            ),
                         },
                     },
                 )
@@ -414,11 +468,12 @@ class TestExtensionMcp:
                             "logical_id": "issue-12",
                             "role": "curate",
                             "unit": "issue/12",
-                            "assignment": {
-                                "issue": 12,
-                                "source_kind": "python-library",
-                                "accepted_scope": "Revised scope",
-                            },
+                            "assignment": self.curation_assignment(
+                                runtime,
+                                12,
+                                source_kind="python-library",
+                                accepted_scope="Revised scope",
+                            ),
                         },
                     },
                 )
@@ -591,7 +646,10 @@ class TestExtensionMcp:
                     {
                         "action": "plan",
                         "workflow": workflow,
-                        "task": {"logical_id": "issue-5"},
+                        "task": {
+                            "logical_id": "issue-5",
+                            "assignment": self.implementation_assignment(5),
+                        },
                     },
                 )
                 task_id = planned.structured_content["task_id"]
@@ -769,7 +827,14 @@ class TestExtensionMcp:
                     TaskManageRequest(
                         action="plan",
                         workflow=workflow,
-                        task={"logical_id": "issue-12", "assignment": {"issue": 12}},
+                        task={
+                            "logical_id": "issue-12",
+                            "assignment": (
+                                self.curation_assignment(runtime, 12)
+                                if workflow == "gh-curate-issues"
+                                else self.implementation_assignment(12)
+                            ),
+                        },
                     )
                 )
                 references[workflow] = receipt["task_ref"]
@@ -825,7 +890,9 @@ class TestExtensionMcp:
                         workflow=workflow,
                         task={
                             "logical_id": task_id.rsplit("-", 1)[0],
-                            "assignment": {"issue": task_id},
+                            "assignment": self.curation_assignment(
+                                runtime, int(task_id.split("-")[1])
+                            ),
                         },
                     )
                 )
@@ -950,6 +1017,98 @@ class TestExtensionMcp:
             finished = runtime.run_manage(RunManageRequest(action="finish", workflow=workflow))
             assert finished["status"] == "complete"
 
+    def test_generic_assignments_are_validated_before_attempt_creation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="github-workflows-assignment-") as directory:
+            root = Path(directory)
+            workspace = root / "repo"
+            workspace.mkdir()
+            curator = WorkflowRuntime(workspace, root / "qwen-curator")
+            curator.run_manage(
+                RunManageRequest(
+                    action="start",
+                    workflow="gh-curate-issues",
+                    repository="example/repo",
+                )
+            )
+            assignment = self.curation_assignment(curator, 1)
+            bundle = curator.current("gh-curate-issues") / assignment["candidate_bundle"]
+            payload = json.loads(bundle.read_text(encoding="utf-8"))
+            payload["matches"] = [
+                {"kind": "issue", "number": 2, "state": "open", "snapshot": "issue-2"},
+                {"kind": "issue", "number": 2, "state": "closed", "snapshot": "issue-2"},
+            ]
+            bundle.write_text(json.dumps(payload), encoding="utf-8")
+            with pytest.raises(ValueError, match="contradictory issue #2"):
+                curator.task_manage(
+                    TaskManageRequest(
+                        action="plan",
+                        workflow="gh-curate-issues",
+                        task={"logical_id": "issue-1", "assignment": assignment},
+                    )
+                )
+            assert curator.state("gh-curate-issues")["tasks"] == {}
+
+            implementer = WorkflowRuntime(workspace, root / "qwen-implementer")
+            implementer.run_manage(
+                RunManageRequest(
+                    action="start",
+                    workflow="gh-implement-issue",
+                    repository="example/repo",
+                    targets=["#1"],
+                )
+            )
+            incomplete = self.implementation_assignment(1)
+            incomplete.pop("rebased_base_sha")
+            with pytest.raises(ValueError, match="rebased_base_sha"):
+                implementer.task_manage(
+                    TaskManageRequest(
+                        action="plan",
+                        workflow="gh-implement-issue",
+                        task={"logical_id": "unit-1", "assignment": incomplete},
+                    )
+                )
+            assert implementer.state("gh-implement-issue")["tasks"] == {}
+
+            worktree = workspace / ".worktrees" / "unit"
+            (worktree / "src").mkdir(parents=True)
+            outside = root / "outside-src"
+            outside.mkdir()
+            (worktree / "escape").symlink_to(outside, target_is_directory=True)
+            for index, pythonpath in enumerate(
+                (
+                    ["/tmp/src"],
+                    ["../../other"],
+                    ["src/../other"],
+                    [r"src\other"],
+                    ["missing"],
+                    ["escape"],
+                )
+            ):
+                invalid = self.implementation_assignment(1)
+                invalid["execution_environment"]["pythonpath"] = pythonpath
+                with pytest.raises(ValueError, match="pythonpath"):
+                    implementer.task_manage(
+                        TaskManageRequest(
+                            action="plan",
+                            workflow="gh-implement-issue",
+                            task={
+                                "logical_id": f"invalid-path-{index}",
+                                "assignment": invalid,
+                            },
+                        )
+                    )
+
+            valid = self.implementation_assignment(1)
+            valid["validation_plan"] = []
+            planned = implementer.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    workflow="gh-implement-issue",
+                    task={"logical_id": "no-safe-validation", "assignment": valid},
+                )
+            )
+            assert planned["task"]["assignment"]["validation_plan"] == []
+
     def test_required_generic_task_needs_a_successful_integrated_attempt(self) -> None:
         with tempfile.TemporaryDirectory(prefix="github-workflows-retry-") as directory:
             root = Path(directory)
@@ -970,7 +1129,10 @@ class TestExtensionMcp:
                 TaskManageRequest(
                     action="plan",
                     workflow=workflow,
-                    task={"logical_id": "unit-1"},
+                    task={
+                        "logical_id": "unit-1",
+                        "assignment": self.implementation_assignment(1),
+                    },
                 )
             )
             runtime.task_manage(
@@ -1040,7 +1202,11 @@ class TestExtensionMcp:
                 TaskManageRequest(
                     action="plan",
                     workflow=workflow,
-                    task={"logical_id": "optional", "required": False},
+                    task={
+                        "logical_id": "optional",
+                        "assignment": self.implementation_assignment(2),
+                        "required": False,
+                    },
                 )
             )
             runtime.task_manage(
@@ -1265,6 +1431,7 @@ class TestExtensionMcp:
                         "action": "commit",
                         "workflow": "gh-audit-repo",
                         "full_history_complete": True,
+                        "default_sha": state["sha"],
                     },
                 )
                 assert not committed.is_error
@@ -1501,7 +1668,13 @@ class TestExtensionMcp:
         )
         assert all(
             term in issue_conventions
-            for term in ("`issue_write`", "`issue_number`", "`get_labels`", "complete desired")
+            for term in (
+                "`issue_write`",
+                "`issue_number`",
+                "complete desired",
+                "omitted label field",
+                "skip the",
+            )
         )
         assert "### Pull request taxonomy" in issue_conventions
         assert re.search(r"multiple area\s+or type labels", issue_conventions)

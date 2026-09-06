@@ -139,13 +139,18 @@ labels already on the PR unless current evidence makes them incompatible. PR
 status labels follow their separate lifecycle and do not count as taxonomy
 labels.
 
-Pull requests use the issue-label API. With the GitHub MCP tools, read the
-current PR labels through `issue_read` method `get_labels`, then call
-`issue_write` method `update` with the PR number in `issue_number` and the
-complete desired label list, preserving unrelated labels. Read the labels back
-through `issue_read` before recording success. `label_write` manages repository
-label definitions, while `update_pull_request` does not mutate labels; neither
-is the PR-label assignment interface.
+Pull requests use the issue-label write API, but not every GitHub MCP registry
+can read PR labels through its issue tools. Prefer a complete current PR read
+performed by the supervisor and retain its normalized labels in the private
+run snapshot. Worker list/search results may corroborate that snapshot but do
+not establish complete membership when their projection omits labels. If no
+complete current label read is available, preserve the PR labels, skip the
+mutation, and report it as blocked; never interpret an omitted label field as
+an empty list. When complete membership is known, call `issue_write` method
+`update` with the PR number in `issue_number` and the complete desired label
+list, preserving unrelated labels. Record success only after a complete
+current read-back confirms the exact list. `label_write` manages repository
+label definitions, while `update_pull_request` does not mutate labels.
 
 ## Label responsibility
 

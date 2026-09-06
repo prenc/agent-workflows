@@ -58,10 +58,11 @@ prefer existing project commands and visible inline checks.
 
 The spawn prompt contains only a namespaced task reference. Call
 `mcp__github_workflows__task_context` before any other operation. Require its
-stored assignment to contain the repository, accepted issue scopes and
-snapshots, unit grouping, PR state, worktree and branch, rebased base SHA,
-remote lease state, round objective, acceptance condition, repository
-instructions, and documentation guidance. Return `CONTEXT_UNAVAILABLE` with
+stored assignment to contain accepted issue scopes and snapshots, PR state,
+worktree and branch, rebased base SHA, remote lease state, round objective,
+acceptance condition, repository instructions, validation plan, and execution
+environment. Require repository and documentation guidance from server-derived
+task context. Return `CONTEXT_UNAVAILABLE` with
 the missing field when context retrieval fails or is incomplete.
 
 ## Read GitHub evidence

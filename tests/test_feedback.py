@@ -54,6 +54,52 @@ def append_feedback(**overrides: object) -> dict[str, object]:
     return feedback.append(**values)  # type: ignore[arg-type]
 
 
+def task_assignment(runtime: WorkflowRuntime, workflow: str, issue: int = 1) -> dict[str, object]:
+    if workflow == "gh-curate-issues":
+        artifacts = runtime.current("gh-curate-issues") / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        bundle = artifacts / f"bundle-{issue}.json"
+        snapshot = f"artifacts/issue-{issue}.json"
+        (artifacts / f"issue-{issue}.json").write_text("{}\n", encoding="utf-8")
+        bundle.write_text(
+            json.dumps(
+                {
+                    "selected_issue": {
+                        "kind": "issue",
+                        "number": issue,
+                        "state": "open",
+                        "snapshot": snapshot,
+                    },
+                    "matches": [],
+                    "relationships": {},
+                    "repository": runtime.state("gh-curate-issues")["repository"],
+                    "cutoff": "2025-01-01T00:00:00Z",
+                    "watermark": "2026-01-01T00:00:00Z",
+                    "default_sha": "a" * 40,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return {
+            "issue": issue,
+            "issue_snapshot": snapshot,
+            "candidate_bundle": f"artifacts/{bundle.name}",
+        }
+    return {
+        "issues": [{"number": issue, "snapshot": "issue.json", "accepted_scope": "scope"}],
+        "pull_request": {"state": "none"},
+        "worktree": ".worktrees/unit",
+        "branch": "work/unit",
+        "rebased_base_sha": "a" * 40,
+        "remote_lease": {"state": "absent"},
+        "round_objective": "Complete scope",
+        "acceptance_condition": "Tests pass",
+        "repository_instructions": ["AGENTS.md"],
+        "validation_plan": ["pytest"],
+        "execution_environment": {"mode": "shared", "pythonpath": ["src"]},
+    }
+
+
 def test_feedback_is_private_and_sanitized(cache: Path) -> None:
     private = cache.parent / "workspace"
     first = append_feedback(
@@ -142,7 +188,11 @@ def test_feedback_task_ref_derives_task_provenance(cache: Path, tmp_path: Path) 
             {
                 "action": "plan",
                 "workflow": "gh-curate-issues",
-                "task": {"logical_id": "review-docs", "role": "review"},
+                "task": {
+                    "logical_id": "review-docs",
+                    "role": "review",
+                    "assignment": task_assignment(runtime, "gh-curate-issues"),
+                },
             }
         )
     )
@@ -186,7 +236,11 @@ def test_feedback_task_ref_selects_repository_among_multiple_runs(
                 {
                     "action": "plan",
                     "workflow": workflow,
-                    "task": {"logical_id": "review-docs", "role": "review"},
+                    "task": {
+                        "logical_id": "review-docs",
+                        "role": "review",
+                        "assignment": task_assignment(runtime, workflow),
+                    },
                 }
             )
         )

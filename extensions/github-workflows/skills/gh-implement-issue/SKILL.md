@@ -357,6 +357,14 @@ root against the verified assigned worktree and sets the resulting absolute
 
 Register the complete round assignment with
 `mcp__github_workflows__task_manage` using action `plan` and a typed `task`.
+Include non-empty `issues` entries with `number`, `snapshot`, and
+`accepted_scope`; `pull_request`, `worktree`, `branch`, full
+`rebased_base_sha`, `remote_lease`, `round_objective`, `acceptance_condition`,
+`repository_instructions`, `validation_plan`, and `execution_environment`.
+Use an empty `validation_plan` only when preflight found no safe repository-owned
+test, formatter, interpreter, or compiler command, and record that limitation;
+never invent a command merely to make the list non-empty.
+Repository identity, documentation, and reference paths are server-derived.
 If client-side validation rejects `task` with an object/null `anyOf` error
 before the MCP call starts, do not infer a payload-size limit or repeat the
 identical call. Rebuild `task` once as a compact native structured object,
@@ -448,9 +456,10 @@ Draft-to-ready promotion requires:
 ## Stage 6: promote centrally
 
 Refresh the worker-created draft PR, its head/base, and the remote branch. Assign
-the PR to the authenticated user when the MCP surface supports it. Read its
-labels through the issue-label API, reconcile the shared derived PR taxonomy,
-and apply PR `in-progress` during active supervisor verification. Confirm the body follows
+the PR to the authenticated user when the MCP surface supports it. Obtain its
+complete current labels through the shared PR-label convention, reconcile the
+shared derived PR taxonomy, and apply PR `in-progress` during active supervisor
+verification only when complete membership and read-back are available. Confirm the body follows
 `../../references/github-pr-template.md`, begins with
 `<!-- qwen:issue-implementation:v1 -->`. Send body corrections to the worker so
 the draft remains worker-maintained.

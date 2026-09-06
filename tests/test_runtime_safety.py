@@ -29,6 +29,55 @@ EXTENSION = ROOT / "extensions/github-workflows"
 
 
 class TestRuntimeSafety:
+    @staticmethod
+    def curation_assignment(runtime: WorkflowRuntime, issue: int) -> dict[str, Any]:
+        artifacts = runtime.current("gh-curate-issues") / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        bundle = artifacts / f"bundle-{issue}.json"
+        (artifacts / f"issue-{issue}.json").write_text("{}\n", encoding="utf-8")
+        bundle.write_text(
+            json.dumps(
+                {
+                    "selected_issue": {
+                        "kind": "issue",
+                        "number": issue,
+                        "state": "open",
+                        "snapshot": f"artifacts/issue-{issue}.json",
+                    },
+                    "matches": [],
+                    "relationships": {},
+                    "repository": runtime.state("gh-curate-issues")["repository"],
+                    "cutoff": "2025-01-01T00:00:00Z",
+                    "watermark": "2026-01-01T00:00:00Z",
+                    "default_sha": "a" * 40,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return {
+            "issue": issue,
+            "issue_snapshot": f"artifacts/issue-{issue}.json",
+            "candidate_bundle": f"artifacts/{bundle.name}",
+        }
+
+    @staticmethod
+    def implementation_assignment(issue: int) -> dict[str, Any]:
+        return {
+            "issues": [
+                {"number": issue, "snapshot": f"issue-{issue}.json", "accepted_scope": "scope"}
+            ],
+            "pull_request": {"state": "none"},
+            "worktree": ".worktrees/unit",
+            "branch": "work/unit",
+            "rebased_base_sha": "a" * 40,
+            "remote_lease": {"state": "absent"},
+            "round_objective": "Complete the accepted scope",
+            "acceptance_condition": "Focused validation passes",
+            "repository_instructions": ["AGENTS.md"],
+            "validation_plan": ["pytest"],
+            "execution_environment": {"mode": "shared", "pythonpath": ["src"]},
+        }
+
     def test_probe_timeout_payload_is_available_for_registration(self) -> None:
         def timed_out(_: Any) -> int:
             print(json.dumps({"returncode": -15, "timed_out": True}))
@@ -53,7 +102,11 @@ class TestRuntimeSafety:
             self.initialize_audit(runtime)
             runtime.history_manage(HistoryManageRequest(action="prepare"))
             runtime.history_manage(
-                HistoryManageRequest(action="commit", full_history_complete=True)
+                HistoryManageRequest(
+                    action="commit",
+                    full_history_complete=True,
+                    default_sha=runtime.state("gh-audit-repo")["sha"],
+                )
             )
             runtime.audit_record(
                 AuditRecordRequest(
@@ -157,7 +210,11 @@ class TestRuntimeSafety:
             self.initialize_audit(runtime)
             runtime.history_manage(HistoryManageRequest(action="prepare"))
             runtime.history_manage(
-                HistoryManageRequest(action="commit", full_history_complete=True)
+                HistoryManageRequest(
+                    action="commit",
+                    full_history_complete=True,
+                    default_sha=runtime.state("gh-audit-repo")["sha"],
+                )
             )
             planned = runtime.task_manage(
                 TaskManageRequest(
@@ -187,7 +244,11 @@ class TestRuntimeSafety:
             self.initialize_audit(runtime)
             runtime.history_manage(HistoryManageRequest(action="prepare"))
             runtime.history_manage(
-                HistoryManageRequest(action="commit", full_history_complete=True)
+                HistoryManageRequest(
+                    action="commit",
+                    full_history_complete=True,
+                    default_sha=runtime.state("gh-audit-repo")["sha"],
+                )
             )
             runtime.audit_record(
                 AuditRecordRequest(
@@ -242,6 +303,37 @@ class TestRuntimeSafety:
             assert len(record["stderr_excerpt"]) == 2048
             assert record["stdout_truncated"] is True
             assert record["stderr_truncated"] is True
+
+            linked = runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    task={
+                        "logical_id": "verify-linked-output",
+                        "assignment": {
+                            "mode": "verify",
+                            "candidate": {"id": "another-candidate"},
+                            "validation_ids": ["probe-output"],
+                        },
+                    },
+                )
+            )
+            explicit = runtime.task_context(linked["task_ref"])["validation"]
+            assert explicit["record_count"] == 1
+            assert explicit["records"][0]["id"] == "probe-output"
+            with pytest.raises(ValueError, match="unknown validation IDs"):
+                runtime.task_manage(
+                    TaskManageRequest(
+                        action="plan",
+                        task={
+                            "logical_id": "verify-missing-output",
+                            "assignment": {
+                                "mode": "verify",
+                                "candidate": {"id": "missing-candidate"},
+                                "validation_ids": ["missing-probe"],
+                            },
+                        },
+                    )
+                )
 
     def test_verdict_uses_candidate_id_as_its_only_identity(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-verdict-identity-") as directory:
@@ -465,14 +557,20 @@ class TestRuntimeSafety:
                 TaskManageRequest(
                     action="plan",
                     workflow=workflow,
-                    task={"logical_id": "unit-a"},
+                    task={
+                        "logical_id": "unit-a",
+                        "assignment": self.curation_assignment(runtime, 1),
+                    },
                 )
             )
             runtime.task_manage(
                 TaskManageRequest(
                     action="plan",
                     workflow=workflow,
-                    task={"logical_id": "unit-b"},
+                    task={
+                        "logical_id": "unit-b",
+                        "assignment": self.curation_assignment(runtime, 2),
+                    },
                 )
             )
             task_id = first["task_id"]
@@ -644,10 +742,27 @@ class TestRuntimeSafety:
                     action="commit",
                     workflow=workflow,
                     full_history_complete=True,
+                    default_sha="a" * 40,
                 )
             )
+            assert runtime.state(workflow)["history"]["default_sha"] == "a" * 40
+            runtime.history_manage(HistoryManageRequest(action="prepare", workflow=workflow))
+            inherited = runtime.history_manage(
+                HistoryManageRequest(action="commit", workflow=workflow)
+            )
+            assert inherited["history"]["default_sha"] == "a" * 40
             with pytest.raises(ValueError, match="requires a record selector"):
                 runtime.history_query(HistoryQueryRequest(workflow=workflow))
+
+            fresh_root = root / "fresh"
+            fresh_root.mkdir()
+            fresh = self.make_runtime(fresh_root)
+            fresh.run_manage(
+                RunManageRequest(action="start", workflow=workflow, repository="example/other")
+            )
+            fresh.history_manage(HistoryManageRequest(action="prepare", workflow=workflow))
+            with pytest.raises(ValueError, match="requires default_sha"):
+                fresh.history_manage(HistoryManageRequest(action="commit", workflow=workflow))
 
     def test_history_ingest_requires_one_bounded_input(self) -> None:
         with pytest.raises(ValidationError, match="exactly one"):
@@ -769,14 +884,20 @@ class TestRuntimeSafety:
                 TaskManageRequest(
                     action="plan",
                     workflow=workflow,
-                    task={"logical_id": "foo"},
+                    task={
+                        "logical_id": "foo",
+                        "assignment": self.curation_assignment(runtime, 1),
+                    },
                 )
             )
             runtime.task_manage(
                 TaskManageRequest(
                     action="plan",
                     workflow=workflow,
-                    task={"logical_id": "unrelated"},
+                    task={
+                        "logical_id": "unrelated",
+                        "assignment": self.curation_assignment(runtime, 2),
+                    },
                 )
             )
             runtime.task_manage(
@@ -828,7 +949,12 @@ class TestRuntimeSafety:
                     TaskManageRequest(
                         action="plan",
                         workflow=workflow,
-                        task={"logical_id": task_id.rsplit("-", 1)[0]},
+                        task={
+                            "logical_id": task_id.rsplit("-", 1)[0],
+                            "assignment": self.curation_assignment(
+                                second, 1 if task_id.startswith("running") else 2
+                            ),
+                        },
                     )
                 )
             second.task_manage(
@@ -871,7 +997,12 @@ class TestRuntimeSafety:
                     TaskManageRequest(
                         action="plan",
                         workflow=workflow,
-                        task={"logical_id": logical_id},
+                        task={
+                            "logical_id": logical_id,
+                            "assignment": self.curation_assignment(
+                                runtime, 1 if logical_id.endswith("one") else 2
+                            ),
+                        },
                     )
                 )
                 runtime.task_manage(
@@ -1138,7 +1269,11 @@ class TestRuntimeSafety:
             self.initialize_audit(runtime)
             runtime.history_manage(HistoryManageRequest(action="prepare"))
             runtime.history_manage(
-                HistoryManageRequest(action="commit", full_history_complete=True)
+                HistoryManageRequest(
+                    action="commit",
+                    full_history_complete=True,
+                    default_sha=runtime.state("gh-audit-repo")["sha"],
+                )
             )
             candidate = {
                 "id": "C-core",
@@ -1278,7 +1413,11 @@ class TestRuntimeSafety:
             self.initialize_audit(runtime)
             runtime.history_manage(HistoryManageRequest(action="prepare"))
             runtime.history_manage(
-                HistoryManageRequest(action="commit", full_history_complete=True)
+                HistoryManageRequest(
+                    action="commit",
+                    full_history_complete=True,
+                    default_sha=runtime.state("gh-audit-repo")["sha"],
+                )
             )
             state = runtime.state("gh-audit-repo")
             state["tasks"]["verify-legacy-1"] = {
@@ -1343,7 +1482,11 @@ class TestRuntimeSafety:
             self.initialize_audit(runtime)
             runtime.history_manage(HistoryManageRequest(action="prepare"))
             runtime.history_manage(
-                HistoryManageRequest(action="commit", full_history_complete=True)
+                HistoryManageRequest(
+                    action="commit",
+                    full_history_complete=True,
+                    default_sha=runtime.state("gh-audit-repo")["sha"],
+                )
             )
             runtime.task_manage(
                 TaskManageRequest(
@@ -1389,13 +1532,68 @@ class TestRuntimeSafety:
                     )
                 )
 
+    def test_suspended_generic_run_accepts_only_late_worker_results(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-generic-suspend-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            workflow = "gh-implement-issue"
+            runtime.run_manage(
+                RunManageRequest(
+                    action="start",
+                    workflow=workflow,
+                    repository="example/repo",
+                    targets=["#1"],
+                )
+            )
+            planned = runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    workflow=workflow,
+                    task={
+                        "logical_id": "unit",
+                        "assignment": self.implementation_assignment(1),
+                    },
+                )
+            )
+            runtime.task_manage(
+                TaskManageRequest(
+                    action="mark_running", workflow=workflow, task_id=planned["task_id"]
+                )
+            )
+            runtime.run_manage(RunManageRequest(action="pause", workflow=workflow))
+
+            completed = runtime.task_manage(
+                TaskManageRequest(
+                    action="complete",
+                    workflow=workflow,
+                    task_id=planned["task_id"],
+                    report={"status": "complete"},
+                )
+            )
+            assert completed["task"]["status"] == "completed"
+            assert completed["allowed_actions"] == []
+            assert completed["scheduler"]["next_action"] == "resume"
+            for request in (
+                TaskManageRequest(action="plan", workflow=workflow, task={"logical_id": "late"}),
+                TaskManageRequest(
+                    action="integration_begin",
+                    workflow=workflow,
+                    task_id=planned["task_id"],
+                ),
+            ):
+                with pytest.raises(ValueError, match="not active"):
+                    runtime.task_manage(request)
+
     def test_audit_checkpoint_can_be_refreshed_after_resuming_task(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-audit-checkpoint-refresh-") as directory:
             runtime = self.make_runtime(Path(directory))
             self.initialize_audit(runtime)
             runtime.history_manage(HistoryManageRequest(action="prepare"))
             runtime.history_manage(
-                HistoryManageRequest(action="commit", full_history_complete=True)
+                HistoryManageRequest(
+                    action="commit",
+                    full_history_complete=True,
+                    default_sha=runtime.state("gh-audit-repo")["sha"],
+                )
             )
             runtime.task_manage(
                 TaskManageRequest(
@@ -1540,7 +1738,11 @@ class TestRuntimeSafety:
                 )
             )
             runtime.history_manage(
-                HistoryManageRequest(action="commit", full_history_complete=True)
+                HistoryManageRequest(
+                    action="commit",
+                    full_history_complete=True,
+                    default_sha=runtime.state("gh-audit-repo")["sha"],
+                )
             )
             planned = runtime.task_manage(
                 TaskManageRequest(
@@ -1596,7 +1798,11 @@ class TestRuntimeSafety:
                 )
             )
             runtime.history_manage(
-                HistoryManageRequest(action="commit", full_history_complete=True)
+                HistoryManageRequest(
+                    action="commit",
+                    full_history_complete=True,
+                    default_sha=runtime.state("gh-audit-repo")["sha"],
+                )
             )
             planned = runtime.task_manage(
                 TaskManageRequest(
@@ -1618,6 +1824,32 @@ class TestRuntimeSafety:
             assert selection["limit"] == 40
             assert selection["has_more"] is True
             assert len(selection["records"]) == 40
+            assert selection["next_cursor"]
+
+            continued = runtime.task_context(planned["task_ref"], selection["next_cursor"])[
+                "history"
+            ]["selection"]
+            assert continued["record_count"] == 1
+            assert continued["has_more"] is False
+            assert continued["next_cursor"] is None
+            first_keys = {(item["kind"], item["number"]) for item in selection["records"]}
+            assert (continued["records"][0]["kind"], continued["records"][0]["number"]) not in (
+                first_keys
+            )
+            with pytest.raises(ValueError, match="malformed"):
+                runtime.task_context(planned["task_ref"], "not-a-cursor")
+
+            other = runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    task={
+                        "logical_id": "discover-other",
+                        "assignment": {"mode": "discover", "area": "area/other"},
+                    },
+                )
+            )
+            with pytest.raises(ValueError, match="another task"):
+                runtime.task_context(other["task_ref"], selection["next_cursor"])
 
     def test_audit_task_context_selects_only_requested_python_packages(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-audit-inventory-context-") as directory:
@@ -1625,7 +1857,11 @@ class TestRuntimeSafety:
             self.initialize_audit(runtime)
             runtime.history_manage(HistoryManageRequest(action="prepare"))
             runtime.history_manage(
-                HistoryManageRequest(action="commit", full_history_complete=True)
+                HistoryManageRequest(
+                    action="commit",
+                    full_history_complete=True,
+                    default_sha=runtime.state("gh-audit-repo")["sha"],
+                )
             )
             state = runtime.state("gh-audit-repo")
             state["inventory"] = {
