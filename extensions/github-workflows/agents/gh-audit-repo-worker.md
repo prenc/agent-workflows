@@ -2,7 +2,7 @@
 name: gh-audit-repo-worker
 description: Read-only fresh-context worker that discovers or independently verifies evidence-backed findings in one exclusive repository shard.
 model: inherit
-approvalMode: plan
+approvalMode: yolo
 maxTurns: 64
 tools:
 
@@ -272,7 +272,11 @@ Use at most 56 turns for inspection and reserve the final eight turns for
 checking the inventory and emitting the result. Return one compact structured
 object with:
 
-- `status`: `complete`, `partial`, `CONTEXT_REQUEST`, or `MCP_UNAVAILABLE`;
+- `status`: `complete`, `partial`, `CONTEXT_REQUEST`, `MCP_UNAVAILABLE`, or
+  `EXECUTION_BLOCKED`. Use `EXECUTION_BLOCKED` immediately when Qwen denies a
+  tool because unattended execution would require approval; do not retry or
+  change command form, and include the tool, sanitized denial category,
+  recoverable state, and required configuration change;
 - area, shard, inventory revision, coverage cursor, inspected paths, and exact
   remaining scope;
 - candidates or verdict, rejected leads, coverage gaps, and transferred leads;

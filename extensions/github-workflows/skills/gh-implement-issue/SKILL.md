@@ -66,6 +66,17 @@ changes, worktree/branch reuse or creation, commits, pushes, and creation or
 update of the resolved PRs and their derived taxonomy labels. Merge, issue closure, issue taxonomy normalization,
 dependency changes, and heavy computation require separate authority.
 
+Complete one interactive preflight before starting or resuming material work.
+Resolve the invocation, every currently discoverable grouping, scope,
+dependency, network, scientific, security, or data-authority question, and the
+active approval mode there. Durable execution requires the parent Qwen session
+to be in YOLO mode; Plan mode may be used to discuss the preflight, but do not
+call `run_manage` `start` or `resume`, claim issues, prepare worktrees, or launch
+workers from Plan, default, auto-edit, or auto mode. Refresh target and claim
+state after any user delay and before the first mutation. The successful start
+or resume closes the question window; apply conservative runtime-policy
+defaults rather than asking during execution.
+
 ## Operating model
 
 Use GitHub MCP for GitHub records and mutations and local Git for repository
@@ -222,9 +233,9 @@ correctly.
 If hydration or classification determines that an issue is ambiguous,
 unsuitable, requires unresolved authority, or cannot enter any coherent unit,
 release this run's `in-progress` claim on that issue immediately and verify the
-result before continuing or stopping. Release unsuitable early claims before
-waiting for user clarification. Update the early ledger with the disposition
-and cleanup result.
+result before continuing or stopping. Do not ask during execution: record the
+blocked disposition, release unsuitable early claims, and continue independent
+units. Update the early ledger with the disposition and cleanup result.
 
 Require each resulting unit to fit one coherent eventual PR. Route an existing
 issue whose own accepted scope needs independently mergeable PRs to
@@ -287,8 +298,9 @@ foreign ownership. Do not
 update a stale tracked lock without scope or user authority. Reuse one lock
 only for worktrees whose dependency inputs are directly confirmed identical.
 On failure, remove only an incomplete worktree environment, restore the prior
-lock and verified `.venv` link state, preserve resumable state, and ask before
-network access. Retain isolated environments across rounds and suspension;
+lock and verified `.venv` link state, and preserve resumable state. Network
+access must have been authorized during interactive preflight; otherwise block
+the affected unit without asking during execution. Retain isolated environments across rounds and suspension;
 validate them on resume and remove them with their owning worktrees.
 
 Before each active round, refresh the unit and confirm its recorded claim. For
@@ -306,8 +318,9 @@ expected. Use `verification-only`, `unchanged`, and `false` only for an
 inherited ready PR undergoing non-mutating review; a proven gap returns
 `CORRECTION_NEEDED` and requires a new implementation assignment. Never say to
 keep the PR in its "current state." If the user's instruction forbids a required
-draft transition, stop for direction instead of launching a contradictory
-round.
+draft transition, do not launch a contradictory round. Record the affected unit
+as blocked, continue independent units, and suspend only when no safe
+independent progress remains.
 
 ## Stage 4: run bounded implementation rounds
 
@@ -370,8 +383,9 @@ owns a unit at a time.
 
 Each round has 128 turns: 120 working turns and eight reserved checkpoint
 turns. Workers return `DRAFT_READY_FOR_SUPERVISOR`, `CONTINUE_REQUESTED`,
-`SPLIT_REQUESTED`, `CORRECTION_NEEDED`, `BLOCKED`, `MCP_UNAVAILABLE`, or
-`NO_IMPLEMENTATION`. `MCP_UNAVAILABLE` suspends the complete workflow before
+`SPLIT_REQUESTED`, `CORRECTION_NEEDED`, `BLOCKED`, `MCP_UNAVAILABLE`,
+`EXECUTION_BLOCKED`, or `NO_IMPLEMENTATION`. `EXECUTION_BLOCKED` is reserved
+for a Qwen approval denial. `MCP_UNAVAILABLE` suspends the complete workflow before
 any further unit work.
 Review every checkpoint against every issue's accepted scope, unit cohesion,
 the complete base diff, validation, research semantics, and confidential-data
@@ -384,12 +398,19 @@ launch one worker per new unit within the concurrency limit. If the current
 diff already represents some issues, retain those issues and that diff in the
 current unit and split only untouched issues. Never copy or share an edited
 worktree between units. When changes entangle the proposed partitions, send a
-correction that restores one cohesive unit or escalate to the user when a safe
-partition requires a product, scientific, or scope decision.
+correction that restores one cohesive unit. If a safe partition requires a
+product, scientific, or scope decision not authorized during preflight,
+preserve valid partial work, block that unit without asking, and continue
+independent units.
 
 Continue the same task with one bounded objective, return an exact correction,
 advance to draft verification, or terminate and finalize. Two rounds blocked by the
-same explained cause trigger termination or user escalation.
+same explained cause terminate the affected unit without another question and
+suspend only when no safe independent progress remains. `EXECUTION_BLOCKED`
+does not receive a second round in the same invocation: record the attempt with
+`task_manage` action `fail` and note `execution-blocked`, continue independent
+units, then pause once when they are exhausted. A later YOLO invocation
+reconciles state before creating at most one new numbered attempt.
 
 ## Stage 5: supervisor verification of the draft
 

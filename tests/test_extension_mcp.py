@@ -8,6 +8,7 @@ import stat
 import subprocess
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
@@ -16,7 +17,11 @@ from mcp import Client
 from pydantic import ValidationError
 
 from github_workflows import feedback
-from github_workflows.mcp_server import _validation_issues, create_server
+from github_workflows.mcp_server import (
+    _request_invocation_id,
+    _validation_issues,
+    create_server,
+)
 from github_workflows.models import (
     AuditRecordRequest,
     KnowledgeRequest,
@@ -30,6 +35,91 @@ EXTENSION = ROOT / "extensions/github-workflows"
 
 
 class TestExtensionMcp:
+    @staticmethod
+    def invocation_context(session_id: str, prompt_id: str) -> SimpleNamespace:
+        request_context = SimpleNamespace(
+            meta={
+                "qwen-code/invocation": {
+                    "version": 1,
+                    "sessionId": session_id,
+                    "promptId": prompt_id,
+                }
+            }
+        )
+        return SimpleNamespace(request_context=request_context)
+
+    def test_qwen_invocation_identity_is_stable_only_within_one_prompt(self) -> None:
+        first = _request_invocation_id(self.invocation_context("session-a", "prompt-a"))
+        repeated = _request_invocation_id(self.invocation_context("session-a", "prompt-a"))
+        later = _request_invocation_id(self.invocation_context("session-a", "prompt-b"))
+
+        assert first is not None
+        assert first == repeated
+        assert first != later
+        assert _request_invocation_id(None) is None
+
+    async def test_execution_blocked_retry_uses_mcp_invocation_metadata(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="github-workflows-invocation-") as directory:
+            root = Path(directory)
+            workspace = root / "repo"
+            workspace.mkdir()
+            runtime = WorkflowRuntime(workspace, root / "qwen-project")
+            first_meta = self.invocation_context("session-a", "prompt-a").request_context.meta
+            later_meta = self.invocation_context("session-a", "prompt-b").request_context.meta
+            async with Client(create_server(runtime), raise_exceptions=False) as client:
+                await client.call_tool(
+                    "run_manage",
+                    {
+                        "action": "start",
+                        "workflow": "gh-curate-issues",
+                        "repository": "example/repo",
+                    },
+                )
+                planned = await client.call_tool(
+                    "task_manage",
+                    {
+                        "action": "plan",
+                        "workflow": "gh-curate-issues",
+                        "task": {"logical_id": "unit-a"},
+                    },
+                    meta=first_meta,
+                )
+                task_id = planned.structured_content["task_id"]
+                await client.call_tool(
+                    "task_manage",
+                    {
+                        "action": "mark_running",
+                        "workflow": "gh-curate-issues",
+                        "task_id": task_id,
+                    },
+                    meta=first_meta,
+                )
+                failed = await client.call_tool(
+                    "task_manage",
+                    {
+                        "action": "fail",
+                        "workflow": "gh-curate-issues",
+                        "task_id": task_id,
+                        "note": "execution-blocked",
+                    },
+                    meta=first_meta,
+                )
+                assert not failed.is_error
+
+                same_invocation = await client.call_tool(
+                    "task_manage",
+                    {"action": "retry", "workflow": "gh-curate-issues", "task_id": task_id},
+                    meta=first_meta,
+                )
+                assert same_invocation.is_error
+                retried = await client.call_tool(
+                    "task_manage",
+                    {"action": "retry", "workflow": "gh-curate-issues", "task_id": task_id},
+                    meta=later_meta,
+                )
+                assert not retried.is_error
+                assert retried.structured_content["task"]["attempt"] == 2
+
     @staticmethod
     def git(*arguments: str, cwd: Path) -> None:
         subprocess.run(
@@ -85,6 +175,7 @@ class TestExtensionMcp:
                 assert "n" in run_properties
                 assert "repository" in run_properties
                 assert "instructions" in run_properties
+                assert "confirmed_source_sha" in run_properties
                 for name in (
                     "task_manage",
                     "history_manage",
@@ -233,6 +324,20 @@ class TestExtensionMcp:
                 assert audit_request.invocation()["instructions"] == (
                     "Prioritize public CLI behavior"
                 )
+                with pytest.raises(ValidationError):
+                    RunManageRequest(
+                        action="start",
+                        workflow="gh-audit-repo",
+                        repository="example/repo",
+                        confirmed_source_sha="abc",
+                    )
+                with pytest.raises(ValueError, match="does not accept fields"):
+                    RunManageRequest(
+                        action="start",
+                        workflow="gh-curate-issues",
+                        repository="example/repo",
+                        confirmed_source_sha="0" * 40,
+                    )
                 KnowledgeRequest.model_validate({"action": "show"})
                 knowledge_request = KnowledgeRequest.model_validate(
                     {
@@ -1668,6 +1773,25 @@ class TestExtensionMcp:
             if line.startswith("  - ")
         }
         assert "web_fetch" in configured
+
+    def test_named_workers_use_unattended_modes_with_bounded_tools(self) -> None:
+        frontmatters = {
+            filename: (EXTENSION / "agents" / filename)
+            .read_text(encoding="utf-8")
+            .split("---", 2)[1]
+            for filename in (
+                "gh-audit-repo-worker.md",
+                "gh-curate-issues-worker.md",
+                "gh-implement-issue-worker.md",
+            )
+        }
+
+        assert all("approvalMode: yolo" in value for value in frontmatters.values())
+        assert "  - run_shell_command" in frontmatters["gh-audit-repo-worker.md"]
+        assert "  - run_shell_command" not in frontmatters["gh-curate-issues-worker.md"]
+        assert "EXECUTION_BLOCKED" in (EXTENSION / "references/github-runtime-policy.md").read_text(
+            encoding="utf-8"
+        )
 
     def test_feedback_skill_contract_is_consistent_across_clients(self) -> None:
         codex = (ROOT / "codex/skills/workflow-feedback/SKILL.md").read_text(encoding="utf-8")

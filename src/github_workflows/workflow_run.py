@@ -643,7 +643,14 @@ def audit_event(args: argparse.Namespace) -> None:
             raise ValueError("audit material-work concurrency is saturated")
         task["status"] = status
         task["updated_at"] = utc_now()
-        for name in ("result", "checkpoint", "report_status", "error", "note"):
+        for name in (
+            "result",
+            "checkpoint",
+            "report_status",
+            "error",
+            "note",
+            "execution_blocked_invocation",
+        ):
             if name in payload:
                 task[name] = payload[name]
         if status == "checkpointed":

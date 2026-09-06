@@ -479,13 +479,16 @@ class WorkflowRuntime:
             else self._cache_worktree_root()
         )
 
-    def _source_and_worktree(self, confirmed: bool) -> dict[str, Any]:
+    def _source_and_worktree(self, confirmed_sha: str | None) -> dict[str, Any]:
         source = self._invoke(workflow_run.audit_source, project_root=self.workspace)
-        if source.get("confirmation_required") and not confirmed:
+        source_sha = str(source["sha"])
+        if confirmed_sha is not None and confirmed_sha != source_sha:
+            raise ValueError("the audit source changed after confirmation; repeat source preflight")
+        if source.get("confirmation_required") and confirmed_sha is None:
             raise ValueError(
                 "the audit source is not main/master; obtain user confirmation and retry"
             )
-        sha = str(source["sha"])
+        sha = source_sha
         worktree = self._worktree_root() / f"gh-audit-repo-{sha[:7]}"
         if worktree.exists():
             actual = subprocess.run(
@@ -518,7 +521,11 @@ class WorkflowRuntime:
         worktree_venv = worktree / ".venv"
         if project_venv.is_dir() and not worktree_venv.exists():
             worktree_venv.symlink_to(project_venv, target_is_directory=True)
-        return {**source, "audit_worktree": str(worktree), "source_confirmed": confirmed}
+        return {
+            **source,
+            "audit_worktree": str(worktree),
+            "source_confirmed": confirmed_sha is not None,
+        }
 
     @staticmethod
     def _receipt(
@@ -532,6 +539,18 @@ class WorkflowRuntime:
             "changed": changed,
             **extra,
         }
+
+    @staticmethod
+    def _validate_execution_blocked_retry(
+        previous: dict[str, Any], invocation_id: str | None
+    ) -> None:
+        blocked_invocation = previous.get("execution_blocked_invocation")
+        if blocked_invocation is None:
+            return
+        if invocation_id is None:
+            raise ValueError("execution-blocked retry requires invocation context")
+        if blocked_invocation == invocation_id:
+            raise ValueError("execution-blocked tasks cannot be retried in the same invocation")
 
     @staticmethod
     def _run_ref(run_id: str) -> str:
@@ -895,7 +914,10 @@ class WorkflowRuntime:
                     "inputs": request.invocation(),
                 }
                 if request.workflow == "gh-audit-repo":
-                    inputs = {**inputs, **self._source_and_worktree(request.source_confirmed)}
+                    inputs = {
+                        **inputs,
+                        **self._source_and_worktree(request.confirmed_source_sha),
+                    }
                     self._discard_stale_run(
                         request.workflow,
                         retained_worktree=Path(str(inputs["audit_worktree"])).resolve(),
@@ -1073,14 +1095,16 @@ class WorkflowRuntime:
             )
         return summary
 
-    def task_manage(self, request: TaskManageRequest) -> dict[str, Any]:
+    def task_manage(
+        self, request: TaskManageRequest, *, invocation_id: str | None = None
+    ) -> dict[str, Any]:
         request_task_id = getattr(request, "task_id", None)
         if request_task_id is not None and not SAFE_ID.fullmatch(request_task_id):
             raise ValueError("task_id contains unsupported characters")
         with self.lock():
             state = self.state(request.workflow)
             if request.workflow != "gh-audit-repo":
-                return self._generic_task_manage(request, state)
+                return self._generic_task_manage(request, state, invocation_id=invocation_id)
             managed_task_id = request_task_id
             if request.action in {"plan", "retry"}:
                 attempt = 1
@@ -1088,6 +1112,7 @@ class WorkflowRuntime:
                     previous = state.get("tasks", {}).get(request.task_id)
                     if not isinstance(previous, dict):
                         raise ValueError("retry requires an existing task_id")
+                    self._validate_execution_blocked_retry(previous, invocation_id)
                     logical_id = str(previous["logical_id"])
                     attempt = (
                         max(
@@ -1214,6 +1239,10 @@ class WorkflowRuntime:
                         payload["report_status"] = report_status
                 if request.note:
                     payload["note"] = request.note
+                if request.action == "fail" and request.note == "execution-blocked":
+                    if invocation_id is None:
+                        raise ValueError("execution-blocked failure requires invocation context")
+                    payload["execution_blocked_invocation"] = invocation_id
                 try:
                     self._event(payload)
                 except Exception:
@@ -1229,7 +1258,11 @@ class WorkflowRuntime:
             )
 
     def _generic_task_manage(
-        self, request: TaskManageRequest, state: dict[str, Any]
+        self,
+        request: TaskManageRequest,
+        state: dict[str, Any],
+        *,
+        invocation_id: str | None = None,
     ) -> dict[str, Any]:
         if state.get("status") != "in-progress":
             raise ValueError("current generic workflow run is not active")
@@ -1246,6 +1279,7 @@ class WorkflowRuntime:
                     "abandoned",
                 }:
                     raise ValueError("retry requires a terminal existing task")
+                self._validate_execution_blocked_retry(previous, invocation_id)
                 logical_id = str(previous["logical_id"])
                 attempt = (
                     max(
@@ -1395,6 +1429,10 @@ class WorkflowRuntime:
                 )
             if request.note:
                 task["note"] = request.note
+            if request.action == "fail" and request.note == "execution-blocked":
+                if invocation_id is None:
+                    raise ValueError("execution-blocked failure requires invocation context")
+                task["execution_blocked_invocation"] = invocation_id
             if status in {"completed", "failed", "abandoned"} and request.task_id not in queue:
                 queue.append(request.task_id)
         state["revision"] += 1

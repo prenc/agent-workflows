@@ -61,6 +61,16 @@ Every new run creates durable state through
 state after reconciling live GitHub state; it may be
 combined only with `-n`.
 
+Complete one interactive preflight before starting or resuming material work.
+Resolve the invocation, every currently discoverable scope or authority
+question, and the active approval mode there. Durable execution requires the
+parent Qwen session to be in YOLO mode; Plan mode may be used to discuss the
+preflight, but do not call `run_manage` `start` or `resume`, create state, claim
+work, or launch workers from Plan, default, auto-edit, or auto mode. Refresh
+target state after any user delay and before starting. The successful start or
+resume closes the question window; apply conservative runtime-policy defaults
+rather than asking during execution.
+
 For a legacy invocation, replace `--refresh-index` with `--refresh-history`
 and identify rebuild or temporary-cache requests as internal recovery concerns
 before starting.
@@ -230,6 +240,11 @@ run under `../../references/github-mcp-suspension.md`. Preserve all completed re
 pending issue assignments for resume. An incomplete stored assignment may be
 corrected and reassigned; other worker failures are reported without omitting
 the issue.
+When a worker reports `EXECUTION_BLOCKED`, record that attempt with
+`task_manage` action `fail` and note `execution-blocked` and never retry it in
+the same invocation. Continue other queued issues; once no independent work
+remains, pause the run once. A later YOLO invocation reconciles GitHub and task
+state before creating at most one new numbered attempt.
 
 ## Stage 3: reconcile globally
 

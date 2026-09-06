@@ -372,6 +372,186 @@ class TestRuntimeSafety:
                 input=source,
             )
 
+    def test_audit_source_confirmation_is_bound_to_exact_head(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-source-confirmation-") as directory:
+            root = Path(directory)
+            runtime = self.make_runtime(root)
+            subprocess.run(
+                ["git", "switch", "-q", "-c", "topic"], cwd=runtime.workspace, check=True
+            )
+            confirmed_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=runtime.workspace,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+            with pytest.raises(ValueError, match="obtain user confirmation"):
+                runtime.run_manage(
+                    RunManageRequest(
+                        action="start",
+                        workflow="gh-audit-repo",
+                        repository="example/repo",
+                    )
+                )
+            subprocess.run(
+                ["git", "commit", "--allow-empty", "-q", "-m", "Changed source"],
+                cwd=runtime.workspace,
+                check=True,
+            )
+            with pytest.raises(ValueError, match="source changed after confirmation"):
+                runtime.run_manage(
+                    RunManageRequest(
+                        action="start",
+                        workflow="gh-audit-repo",
+                        repository="example/repo",
+                        confirmed_source_sha=confirmed_sha,
+                    )
+                )
+            assert not runtime.current("gh-audit-repo").exists()
+
+            current_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=runtime.workspace,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            with mock.patch.dict("os.environ", {"XDG_CACHE_HOME": str(root / "cache")}):
+                runtime.run_manage(
+                    RunManageRequest(
+                        action="start",
+                        workflow="gh-audit-repo",
+                        repository="example/repo",
+                        confirmed_source_sha=current_sha,
+                    )
+                )
+            state = runtime.state("gh-audit-repo")
+            assert state["sha"] == current_sha
+            assert state["source_confirmed"] is True
+
+    def test_standard_audit_source_starts_without_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-standard-source-") as directory:
+            root = Path(directory)
+            runtime = self.make_runtime(root)
+            subprocess.run(["git", "branch", "-M", "main"], cwd=runtime.workspace, check=True)
+
+            with mock.patch.dict("os.environ", {"XDG_CACHE_HOME": str(root / "cache")}):
+                runtime.run_manage(
+                    RunManageRequest(
+                        action="start",
+                        workflow="gh-audit-repo",
+                        repository="example/repo",
+                    )
+                )
+
+            state = runtime.state("gh-audit-repo")
+            assert state["branch"] == "main"
+            assert state["source_confirmed"] is False
+
+    def test_execution_blocked_task_requires_a_new_invocation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-execution-blocked-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            workflow = "gh-curate-issues"
+            runtime.run_manage(
+                RunManageRequest(
+                    action="start",
+                    workflow=workflow,
+                    repository="example/repo",
+                )
+            )
+            first = runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    workflow=workflow,
+                    task={"logical_id": "unit-a"},
+                )
+            )
+            runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    workflow=workflow,
+                    task={"logical_id": "unit-b"},
+                )
+            )
+            task_id = first["task_id"]
+            runtime.task_manage(
+                TaskManageRequest(action="mark_running", workflow=workflow, task_id=task_id)
+            )
+            runtime.task_manage(
+                TaskManageRequest(
+                    action="fail",
+                    workflow=workflow,
+                    task_id=task_id,
+                    note="execution-blocked",
+                ),
+                invocation_id="invocation-a",
+            )
+
+            with pytest.raises(ValueError, match="same invocation"):
+                runtime.task_manage(
+                    TaskManageRequest(action="retry", workflow=workflow, task_id=task_id),
+                    invocation_id="invocation-a",
+                )
+            runtime.task_manage(
+                TaskManageRequest(action="integration_begin", workflow=workflow, task_id=task_id)
+            )
+            runtime.task_manage(
+                TaskManageRequest(action="integration_end", workflow=workflow, task_id=task_id)
+            )
+            assert runtime.run_status(workflow)["scheduler"]["next_action"] == "launch-worker"
+
+            runtime.run_manage(RunManageRequest(action="pause", workflow=workflow))
+            runtime.run_manage(RunManageRequest(action="resume", workflow=workflow))
+            with pytest.raises(ValueError, match="same invocation"):
+                runtime.task_manage(
+                    TaskManageRequest(action="retry", workflow=workflow, task_id=task_id),
+                    invocation_id="invocation-a",
+                )
+            retried = runtime.task_manage(
+                TaskManageRequest(action="retry", workflow=workflow, task_id=task_id),
+                invocation_id="invocation-b",
+            )
+            assert retried["task"]["attempt"] == 2
+
+    def test_audit_execution_blocked_retry_recovers_in_a_later_invocation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-audit-execution-blocked-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            workflow = "gh-audit-repo"
+            self.initialize_audit(runtime)
+            planned = runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    workflow=workflow,
+                    task={"logical_id": "area-a"},
+                )
+            )
+            task_id = planned["task_id"]
+            runtime.task_manage(
+                TaskManageRequest(action="mark_running", workflow=workflow, task_id=task_id)
+            )
+            runtime.task_manage(
+                TaskManageRequest(
+                    action="fail",
+                    workflow=workflow,
+                    task_id=task_id,
+                    note="execution-blocked",
+                ),
+                invocation_id="invocation-a",
+            )
+
+            with pytest.raises(ValueError, match="same invocation"):
+                runtime.task_manage(
+                    TaskManageRequest(action="retry", workflow=workflow, task_id=task_id),
+                    invocation_id="invocation-a",
+                )
+            retried = runtime.task_manage(
+                TaskManageRequest(action="retry", workflow=workflow, task_id=task_id),
+                invocation_id="invocation-b",
+            )
+            assert retried["task"]["attempt"] == 2
+
     def test_fresh_start_cleanup_is_limited_to_previous_run_artifacts(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-fresh-start-") as directory:
             runtime = self.make_runtime(Path(directory))

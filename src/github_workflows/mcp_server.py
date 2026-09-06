@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from copy import deepcopy
@@ -253,6 +254,24 @@ def _request_provenance(context: Context[Any, Any] | None) -> dict[str, Any]:
             "version": params.client_info.version,
         }
     return result
+
+
+def _request_invocation_id(context: Context[Any, Any] | None) -> str | None:
+    """Return an opaque identity for the Qwen user-prompt invocation."""
+    if context is None:
+        return None
+    meta = context.request_context.meta
+    raw = meta.get("qwen-code/invocation") if isinstance(meta, dict) else None
+    if not isinstance(raw, dict) or raw.get("version") != 1:
+        return None
+    session_id = raw.get("sessionId")
+    prompt_id = raw.get("promptId")
+    if not isinstance(session_id, str) or not session_id.strip():
+        return None
+    if not isinstance(prompt_id, str) or not prompt_id.strip():
+        return None
+    material = f"{session_id}\0{prompt_id}".encode()
+    return hashlib.sha256(material).hexdigest()
 
 
 def _action_requirement(
@@ -514,7 +533,9 @@ def _public_call(operation: Any, *arguments: Any) -> Any:
 def _request_call(handler: Any, request_model: type[Any], /, **values: Any) -> Any:
     """Validate a flat public call through the internal action model."""
     payload = {
-        name: value for name, value in values.items() if value is not None and name != "runtime"
+        name: value
+        for name, value in values.items()
+        if value is not None and name not in {"runtime", "context", "invocation_id"}
     }
     return _public_call(lambda: handler(request_model.model_validate(payload)))
 
@@ -568,7 +589,7 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
         dry_run: bool | None = None,
         separate: bool | None = None,
         pending: JsonArrayArgument[list[str] | None] = None,
-        source_confirmed: bool | None = None,
+        confirmed_source_sha: str | None = None,
         note: str | None = None,
     ) -> dict[str, Any]:
         """Start, resume, checkpoint, direct, pause, abort, or finish a workflow run."""
@@ -597,9 +618,15 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
         task: JsonObjectArgument[TaskPlan | None] = None,
         report: JsonObjectArgument[dict[str, Any] | None] = None,
         note: str | None = None,
+        context: Context[Any, Any] | None = None,
     ) -> dict[str, Any]:
         """Plan a task or transition it; checkpoint and complete accept structured reports."""
-        return _request_call(runtime.task_manage, TaskManageRequest, **locals())
+        invocation_id = _request_invocation_id(context)
+        return _request_call(
+            lambda request: runtime.task_manage(request, invocation_id=invocation_id),
+            TaskManageRequest,
+            **locals(),
+        )
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     def task_context(task_ref: str) -> dict[str, Any]:

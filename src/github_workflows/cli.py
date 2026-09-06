@@ -6,6 +6,7 @@ import argparse
 import json
 import shutil
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -174,7 +175,12 @@ def run_workflow(args: argparse.Namespace) -> int:
             raise ValueError(f"{args.tool} requires a JSON request")
         model, method = REQUESTS[args.tool]
         request = model.model_validate(load_request(args.request))
-        result = getattr(runtime, method)(request)
+        handler = getattr(runtime, method)
+        result = (
+            handler(request, invocation_id=f"cli:{uuid.uuid4()}")
+            if method == "task_manage"
+            else handler(request)
+        )
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 

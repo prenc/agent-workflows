@@ -167,7 +167,24 @@ write.
 - `--regression-sweep` changes only resolved-issue regression coverage.
 - Closure is a supervisor publication action; workers remain read-only.
 
+Complete one interactive preflight before starting or resuming material work.
+Resolve the invocation, currently discoverable authority questions, and active
+approval mode there. Durable execution requires the parent Qwen session to be
+in YOLO mode; Plan mode may be used to discuss the preflight, but do not call
+`run_manage` `start` or `resume`, create state, or launch workers from Plan,
+default, auto-edit, or auto mode. The successful start or resume closes the
+question window. During execution, apply the conservative defaults in the
+runtime policy instead of asking questions.
+
 ## 1. Establish the snapshot and run state
+
+During preflight, use read-only Git inspection to capture the primary
+worktree's branch and full committed `HEAD`. `main` and `master` need no user
+confirmation. For another branch or detached `HEAD`, ask once whether that
+exact source is intended and collect any scope guidance in the same question.
+After an answer, refresh branch and `HEAD`; if either changed, remain in
+preflight and confirm the new source rather than carrying the old answer
+forward.
 
 Call `mcp__github_workflows__run_manage` with action `start`, workflow
 `gh-audit-repo`, `repository` as `OWNER/REPO`, and parsed invocation fields
@@ -181,11 +198,11 @@ excluded dirty-state counts, and immutable detached audit worktree.
 The audit source is the committed local `HEAD`; tracked modifications and
 untracked files in the primary worktree are outside the snapshot. Record their
 presence without opening excluded files. If the primary worktree is on a
-branch other than `main` or `master`, or is detached, pause before creating run
-state and ask the user to confirm that source and explain any intended scope or
-focus. Retry with `source_confirmed: true`; the tool stores confirmation and
-creates or validates the detached worktree. Use `.worktrees/` only when Git
-reports it ignored; otherwise the server uses a project-namespaced directory
+branch other than `main` or `master`, or is detached, pass the
+preflight-approved full SHA as `confirmed_source_sha`. The runtime compares it
+with a fresh local `HEAD` before creating run state or the detached worktree. A
+mismatch returns to preflight; never treat it as approval of the new source.
+Use `.worktrees/` only when Git reports it ignored; otherwise the server uses a project-namespaced directory
 under `${XDG_CACHE_HOME:-~/.cache}/agent-workflows/worktrees`. On `--resume`, call the same tool with
 action `resume` and pass `n`
 only when the user supplied it; the tool applies that change atomically.
@@ -493,6 +510,12 @@ entrypoint area. Candidates identify any matching open issue and recommend
 worker and the complete run under
 `../../references/github-mcp-suspension.md`; preserve all
 completed observations and pending assignments for resume.
+`EXECUTION_BLOCKED` is an approval-denial circuit breaker. Record the current
+attempt with `task_manage` action `fail` and note `execution-blocked`, do not retry it
+during this invocation, and continue independent queued shards or validations.
+When no independent material work remains, pause the run once with the blocking
+reason. A later YOLO invocation reconciles live state before creating at most
+one new numbered attempt.
 Every returned actionable candidate must cite current-SHA source symbols plus
 callers, tests/configuration, or other code evidence sufficient to prove
 reachability and impact.
@@ -504,7 +527,8 @@ Python-probe design rather than a general shell command.
 
 Workers have 56 working turns and eight reserved reporting turns within their
 64-turn limit. Return a compact structured result containing status
-(`complete`, `partial`, `CONTEXT_REQUEST`, or `MCP_UNAVAILABLE`), coverage
+(`complete`, `partial`, `CONTEXT_REQUEST`, `MCP_UNAVAILABLE`, or
+`EXECUTION_BLOCKED`), coverage
 cursor, remaining scope, candidates, rejected leads, gaps, documentation use,
 and validation proposals. Do not emit publication-ready issue bodies. If the
 shard cannot be completed safely within the budget, return `partial`; the

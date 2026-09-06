@@ -69,6 +69,7 @@ SAFE_ARGUMENT_NAMES = frozenset(
         "separate",
         "shard",
         "source",
+        "confirmed_source_sha",
         "source_confirmed",
         "state",
         "target",

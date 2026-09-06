@@ -102,7 +102,14 @@ class RunManageRequest(StrictRequest):
     dry_run: bool = False
     separate: bool = False
     pending: list[str] = Field(default_factory=list)
-    source_confirmed: bool = False
+    confirmed_source_sha: str | None = Field(
+        default=None,
+        pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+        description=(
+            "Exact full local HEAD approved during audit preflight. The runtime rejects "
+            "a changed source before creating run state or a worktree."
+        ),
+    )
     note: str | None = None
 
     @field_validator("n", mode="before")
@@ -144,7 +151,7 @@ class RunManageRequest(StrictRequest):
                 "regression_sweep",
                 "dry_run",
                 "separate",
-                "source_confirmed",
+                "confirmed_source_sha",
             }
         elif self.action == "resume":
             allowed = {"n"}
@@ -168,6 +175,7 @@ class RunManageRequest(StrictRequest):
                     "refresh_history",
                     "regression_sweep",
                     "dry_run",
+                    "confirmed_source_sha",
                 },
                 "gh-curate-issues": {
                     "targets",
@@ -176,7 +184,7 @@ class RunManageRequest(StrictRequest):
                 },
                 "gh-implement-issue": {"targets", "separate"},
             }[self.workflow]
-            common = {"repository", "n", "source_confirmed"}
+            common = {"repository", "n"}
             irrelevant = supplied - common - workflow_fields
             if irrelevant:
                 raise ValueError(f"{self.workflow} does not accept fields: {sorted(irrelevant)}")

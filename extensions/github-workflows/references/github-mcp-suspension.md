@@ -51,8 +51,10 @@ If the relevant flag is `false`, treat the failure as a repository-settings
 blocker rather than an MCP authentication or availability failure. Stop the
 affected workflow before retries, preserve its recoverable state, and report
 which repository feature must be enabled. Repository setting changes remain
-user-owned. After the user confirms the feature is enabled, refresh repository
-metadata and retry the original operation once.
+user-owned. Do not wait for confirmation inside an executing run; suspend and
+report once. During the next invocation's interactive preflight, after the user
+confirms the feature is enabled, refresh repository metadata and retry the
+original operation once.
 
 If the flag is `true`, or repository metadata cannot be read, retain the
 original error classification and continue with the applicable workflow or

@@ -2,7 +2,7 @@
 name: gh-implement-issue-worker
 description: Implement and validate one supervisor-resolved issue/PR unit, then commit, push, and maintain its draft pull request for supervisor review.
 model: inherit
-approvalMode: auto-edit
+approvalMode: yolo
 maxTurns: 128
 tools:
 
@@ -239,8 +239,12 @@ End every round with exactly one status:
   exact partition and per-issue rationale;
 - `CORRECTION_NEEDED` — the supervisor should return an exact correction
   objective;
-- `BLOCKED` — a named decision, permission, unsafe state, or unavailable
+- `BLOCKED` — a named authority decision, unsafe state, or unavailable
   requirement prevents progress;
+- `EXECUTION_BLOCKED` — Qwen denied a tool because unattended execution would
+  require approval; stop after the first denial without retrying or changing
+  command form, and report the tool, sanitized denial category, recoverable
+  state, and required configuration change;
 - `MCP_UNAVAILABLE` — the worker could not establish or retain required GitHub
   MCP access and the complete workflow must suspend;
 - `NO_IMPLEMENTATION` — evidence supports leaving the code unchanged.

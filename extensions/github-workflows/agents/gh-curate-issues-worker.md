@@ -2,7 +2,7 @@
 name: gh-curate-issues-worker
 description: Read-only worker that produces one complete, evidence-backed curation report for one open GitHub issue.
 model: inherit
-approvalMode: plan
+approvalMode: yolo
 maxTurns: 64
 tools:
 
@@ -151,6 +151,19 @@ Evidence source: MCP_UNAVAILABLE
 Failure: <failed required MCP read and concise error>
 Supervisor action: suspend and checkpoint the complete workflow
 ```
+
+For a Qwen approval denial, return instead:
+
+```text
+Issue: <number and URL>
+Evidence source: EXECUTION_BLOCKED
+Failure: <tool and sanitized approval-denial category>
+Recoverable state: <completed read-only work or none>
+Required configuration: unattended execution in YOLO mode
+Supervisor action: fail this attempt without retrying it in the current invocation
+```
+
+Stop after the first approval denial. Do not retry the call or change its form.
 
 Finish after this one report. The supervisor performs global reconciliation
 and every mutation.
