@@ -71,11 +71,11 @@ PHI, or PII.
 Preserve the current worktree and make one read call that matches the request.
 Use `feedback summary --json` for an aggregate overview. When record-level
 analysis is required, skip that preliminary call and use `feedback ls --all --json` directly (or `--limit 1` for only the newest record). From an
-`agent-workflows` checkout use its documented no-sync invocation; elsewhere use
-the installed executable, for example:
+`agent-workflows` checkout use its existing root environment directly;
+elsewhere use the installed executable, for example:
 
 ```sh
-uv run --no-sync agent-workflows feedback summary --json
+.venv/bin/agent-workflows feedback summary --json
 agent-workflows feedback summary --json
 ```
 

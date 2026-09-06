@@ -1558,14 +1558,20 @@ class TestExtensionMcp:
                     "isolated",
                     "UV_NO_SYNC",
                     "PYTHONPATH",
+                    "`.venv`",
+                    "directly",
                 )
             )
             assert "$PWD" not in document
             assert "PYTHONPATH=src" not in document
             assert all(term in document for term in ("assigned worktree", "absolute"))
 
-        assert all("uv run --no-sync" not in document for document in workflow_documents)
+        assert all("uv run" not in document for document in workflow_documents)
         assert all("UV_NO_SYNC=1" in document for document in workflow_documents)
+        assert all(
+            re.search(r"known to invoke\s+nested uv", document) for document in workflow_documents
+        )
+        assert all("UV_NO_SYNC=1` on every" not in document for document in workflow_documents)
 
         supervisor_documents = workflow_documents[:3]
         for document in supervisor_documents:

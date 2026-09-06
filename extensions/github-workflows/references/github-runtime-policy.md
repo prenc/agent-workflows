@@ -132,11 +132,10 @@ A shared assignment contains only project-relative source roots, for example:
 Before launching a command, the worker expands each assigned project-relative
 root against the verified assigned worktree and exports the resulting absolute
 `PYTHONPATH`. It does not derive paths from the current directory. For example,
-use `UV_NO_SYNC=1 PYTHONPATH=/absolute/assigned-worktree/src uv run <command>`
-for direct uv commands and the same environment prefix for Make or other
-wrappers. Do not add `--no-sync` when the environment variable is present. The
-worker never runs `uv sync`, `uv pip install`, `pip install`, or another
-environment writer.
+invoke the linked environment directly with
+`PYTHONPATH=/absolute/assigned-worktree/src .venv/bin/python -m pytest` or
+`PYTHONPATH=/absolute/assigned-worktree/src .venv/bin/pre-commit run --all-files`. Prefix `UV_NO_SYNC=1` only when a documented wrapper is known to
+invoke nested uv. The worker never runs `uv sync`, `uv pip install`, `pip install`, or another environment writer.
 
 For isolated mode, the supervisor stops the worker and classifies `uv.lock` as
 tracked, ignored, or absent before any mutation. For a tracked lock, first run
@@ -159,12 +158,12 @@ uv venv --python <primary-project>/.venv/bin/python .venv
 UV_OFFLINE=1 uv sync --frozen --no-python-downloads <groups-or-extras>
 ```
 
-Workers set `UV_NO_SYNC=1` on every command so child uv processes inherit it,
-invoke direct uv commands as `uv run` without `--no-sync`, and use no
-`PYTHONPATH` override. A worker that changes dependency inputs or discovers
-that shared mode is insufficient returns `CORRECTION_NEEDED`; the supervisor
-refreshes the lock and environment before another round. Dependency changes
-still require their ordinary authority.
+Workers invoke the worktree-local `.venv` interpreter and tools directly and
+use no `PYTHONPATH` override. Prefix `UV_NO_SYNC=1` only when a documented
+wrapper is known to invoke nested uv. A worker that changes dependency inputs
+or discovers that shared mode is insufficient returns `CORRECTION_NEEDED`; the
+supervisor refreshes the lock and environment before another round. Dependency
+changes still require their ordinary authority.
 
 Respect repository lock ownership. Preserve a tracked lock and include an
 authorized resulting lock change in the implementation. Keep an ignored lock

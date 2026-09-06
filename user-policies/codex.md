@@ -6,18 +6,24 @@ Determine the language and commands from repository instructions and root
 configuration; a `.venv` alone does not make a project Python. Use the native
 toolchain for non-Python projects.
 
-For Python projects, use `uv` for dependency management and the project-root
-`.venv`. Do not create another environment unless asked. If a dependency is
-missing, report it and suggest the appropriate repository or `uv` command.
+For Python projects, use `uv` for dependency and environment management and the
+project-root `.venv` for execution. Do not create another environment unless
+asked. If a dependency is missing, report it and suggest the appropriate
+repository or `uv` command.
 
-With a root `.venv` and `uv`, run Python commands and project executables via
-`uv run --no-sync`. Prefer documented repository wrappers; set `UV_NO_SYNC=1`
-for wrappers such as Make that may invoke uv. Never combine that environment
-variable with `uv run --no-sync`.
+Prefer documented repository wrappers whose behavior is understood. Otherwise,
+when a root `.venv` exists, invoke its interpreter and tools directly:
+`.venv/bin/python -m pytest`, `.venv/bin/python <script>`, or
+`.venv/bin/<tool>`. This avoids uv project discovery, synchronization, and cache
+access during routine execution. Use `uv` only for explicit dependency,
+environment, lock, packaging, or build operations. Set `UV_NO_SYNC=1` only for
+a wrapper known to invoke nested `uv`; ordinary direct `.venv` commands do not
+need it.
 
-If either `.venv` or `uv` is unavailable, follow the repository instructions
-and use the available project or system command without creating an
-environment solely to run it.
+If `.venv` is unavailable, follow the repository instructions and use the
+available project or system command without creating an environment solely to
+run it. The absence of `uv` matters only when an authorized uv-owned operation
+is required.
 
 ## Documentation Audience
 

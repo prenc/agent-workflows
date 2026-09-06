@@ -192,21 +192,21 @@ impossible check a completion gate. Return `CORRECTION_NEEDED` before editing
 when resolving the mismatch would require product, dependency, scientific, or
 scope judgment.
 
-Add focused tests where practical. In both Python modes, set `UV_NO_SYNC=1` on
-every command so child uv processes inherit it; invoke direct uv commands as
-`uv run` without `--no-sync`. In shared mode also set the absolute `PYTHONPATH`
-derived from the assigned worktree and relative roots. Never run `uv sync`,
-`uv pip install`, `pip install`, or another environment writer. If dependency
-inputs change, an import resolves outside the worktree, or assigned shared mode
-proves insufficient, preserve the work and return `CORRECTION_NEEDED` for
-supervisor reprovisioning.
+Add focused tests where practical. In both Python modes, invoke the assigned
+`.venv` interpreter and tools directly. Prefix `UV_NO_SYNC=1` only for a
+documented wrapper known to invoke nested uv. In shared mode also set the
+absolute `PYTHONPATH` derived from the assigned worktree and relative roots.
+Never run `uv sync`, `uv pip install`, `pip install`, or another environment
+writer. If dependency inputs change, an import resolves outside the worktree,
+or assigned shared mode proves insufficient, preserve the work and return
+`CORRECTION_NEEDED` for supervisor reprovisioning.
 
 Run the fastest relevant checks in either mode. Only in an implementation round,
 always run the repository's pre-commit command under the assigned environment.
 For a shared `src` layout, for example:
 
 ```bash
-UV_NO_SYNC=1 PYTHONPATH=/absolute/assigned-worktree/src uv run pre-commit run --all-files
+PYTHONPATH=/absolute/assigned-worktree/src .venv/bin/pre-commit run --all-files
 ```
 
 Review the complete diff from the supplied base for scope, unrelated files,

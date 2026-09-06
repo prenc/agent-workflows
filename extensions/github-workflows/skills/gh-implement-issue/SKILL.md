@@ -336,11 +336,11 @@ Put `execution_environment` in every assignment. It contains `mode: native`,
 existing project-relative source roots. Do not put absolute paths, lock
 contents, or environment details the worker can derive from the mode in the
 assignment. Record mode, lock ownership, and selected sync groups in the
-supervisor ledger. Every worker Python command sets `UV_NO_SYNC=1` so child uv
-processes inherit it; direct uv commands use `uv run` without `--no-sync`.
-In shared mode, the worker expands each assigned project-relative root against
-the verified assigned worktree and sets the resulting absolute `PYTHONPATH`;
-isolated mode has no `PYTHONPATH` override.
+supervisor ledger. Workers invoke the assigned `.venv` interpreter and tools
+directly. Prefix `UV_NO_SYNC=1` only for a documented wrapper known to invoke
+nested uv. In shared mode, the worker expands each assigned project-relative
+root against the verified assigned worktree and sets the resulting absolute
+`PYTHONPATH`; isolated mode has no `PYTHONPATH` override.
 
 Register the complete round assignment with
 `mcp__github_workflows__task_manage` using action `plan` and a typed `task`.

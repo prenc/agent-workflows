@@ -58,18 +58,18 @@ uv pip install --python .venv/bin/python -e '.[dev]'
 Then install the managed integrations and Git pre-commit hook:
 
 ```sh
-uv run --no-sync agent-workflows install --dev
+.venv/bin/agent-workflows install --dev
 ```
 
 For implementation work:
 
 1. Add or update tests in the owning subsystem. Run focused selectors first:
-   `uv run --no-sync pytest -q <selectors>`.
+   `.venv/bin/python -m pytest -q <selectors>`.
 2. Run the broader affected group after focused checks pass. Run the
-   full suite with `uv run --no-sync pytest -q` when the change crosses
+   full suite with `.venv/bin/python -m pytest -q` when the change crosses
    subsystems or affects shared runtime behavior.
-3. Run `uv run --no-sync pre-commit run --all-files` once code and
+3. Run `.venv/bin/pre-commit run --all-files` once code and
    documentation edits are complete. Inspect hook changes and rerun affected
    tests if a hook modifies files.
-4. Run `uv build` when changing packaging, dependencies, entry points, or
-   release artifacts. Do not generate or commit `uv.lock`.
+4. Run `uv build --no-cache` when changing packaging, dependencies, entry
+   points, or release artifacts. Do not generate or commit `uv.lock`.
