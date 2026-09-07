@@ -392,14 +392,21 @@ GitHub writes; the shared cache may still commit a completed synchronization.
 In an applying run, refresh the issue, labels, comments, locks, and linked PRs
 immediately before each operation and recompute when relevant state changed.
 
-Perform one final body write per issue. Verify title, visible canonical
-sections, accepted content, required outcomes, labels, and state once through MCP.
+Compute one complete desired state per issue and linked PR before mutation.
+When the live title, rendered body, labels, semantic status, and linked-PR
+taxonomy already match, record a true no-op and perform no GitHub write. Ignore
+semantically irrelevant whitespace and do not rewrite solely to reorder already
+accepted sections, re-submit a provenance marker, or probe marker visibility.
+For a materially differing unlocked issue, perform at most one final body write.
+Verify title, visible canonical sections, accepted content, required outcomes,
+labels, and state once through MCP.
 GitHub MCP issue-body reads may omit HTML comments; record marker verification
 as `unavailable-through-mcp-readback` while accepting matching visible
 semantics. Marker diagnostics do not create additional writes or probes.
 
-Apply issue and deduplicated PR-label mutations serially. Read each PR's labels
-back after mutation and verify the complete desired membership. Track every
+Apply only differing issue and deduplicated PR-label mutations serially. Never
+resubmit an identical complete label set. Read each PR's labels back after
+mutation and verify the complete desired membership. Track every
 write with its issue or PR, operation, purpose, and outcome. Commit the initial synchronized cache before worker
 analysis, including in dry-run mode. After successful GitHub mutations, use a
 short second optimistic transaction to refresh affected records. A failed

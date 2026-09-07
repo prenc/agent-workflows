@@ -155,10 +155,10 @@ round. Never change draft state in a `verification-only` round.
 
 When every issue is invalid, already complete elsewhere, obsolete,
 contradictory, or unsafe to implement, return `NO_IMPLEMENTATION` with
-per-issue evidence and concise proposed comments for supervisor review. When
-that disposition applies to only some issues, return `SPLIT_REQUESTED`, place
-those issues in a no-implementation partition, and preserve a cohesive
-implementation partition for the rest.
+per-issue evidence and routing to reassessment or curation; never propose a
+public comment. When that disposition applies to only some issues, return
+`SPLIT_REQUESTED`, place those issues in a no-implementation partition, and
+preserve a cohesive implementation partition for the rest.
 
 ## Implement or verify and validate
 

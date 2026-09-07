@@ -74,6 +74,11 @@ reviewed-execution boundary.
   inline checks under the shared runtime policy.
 - Never query CI, GitHub Actions, checks, check runs, commit statuses, or status
   rollups. Local validation and confirmed pushed SHA are the completion gates.
+- Keep public GitHub activity outcome-driven. Never add issue or PR conversation
+  comments. Do not rewrite an existing PR body, toggle draft state, push a new
+  commit, or rewrite labels when the live artifact already has the required
+  content and state. A verified no-op remains unchanged except for a missing
+  lifecycle label required by this workflow.
 
 ## 1. Resolve the work selection
 
@@ -111,8 +116,8 @@ the selected set intact. Read each issue body, labels, maintainer clarifications
 relationships, and implementation evidence needed for scope and compatibility.
 
 Resolve accepted scope from the issue body plus explicit maintainer
-clarifications. Then overlay any explicit scope correction or remaining-work
-statement from the authenticated user's unique managed reassessment comment
+clarifications. Then overlay any explicit premise or accepted-scope correction
+from the authenticated user's unique managed reassessment comment
 beginning with `<!-- codex:github-work-reassessment:v1 -->` or the legacy
 `<!-- codex:github-issue-reevaluation:v1 -->`; stop on more than one matching
 managed comment. The concise reassessment comment supplements the issue and
@@ -177,9 +182,30 @@ GitHub or repository state is mutated before this confirmation. A later
 confirmation selects scratch mode; repeat discovery only if remote state has
 changed.
 
+For one existing PR that is already ready for review, attempt a read-only
+verification fast path before claiming anything. It qualifies only when the PR
+head already contains the exact latest base, its body, linkage, draft state,
+and complete taxonomy already match the desired state, every accepted outcome
+is complete, and proportionate non-mutating validation against the immutable
+head passes. Use a detached or demonstrably matching clean worktree when local
+inspection is required. Any needed rebase, edit, push, body correction, draft
+transition, or taxonomy correction exits the fast path and proceeds through
+the normal claim and implementation flow.
+
+Immediately before completing the fast path, refresh every issue, the PR, base,
+relationships, labels, and head SHA. Stop without mutation on any drift or new
+`in-progress`. If `ready-to-merge` is already present, the pickup is a complete
+GitHub no-op. Otherwise transactionally claim every issue and the PR with
+`in-progress`, confirm the claims, and revalidate all non-lifecycle snapshot
+facts while holding them. Roll back every run-owned claim on drift or failure.
+After successful revalidation, replace PR `in-progress` with
+`ready-to-merge` in one complete-label update, read it back, then release and
+verify every issue claim. This finalization claim closes the race without
+rewriting the PR body, toggling draft state, pushing, or publishing a comment.
+
 ## 4. Claim and prepare the workspace
 
-Refresh every issue immediately before claiming. If any issue now has
+Skip this section only for the completed read-only fast path. Otherwise refresh every issue immediately before claiming. If any issue now has
 `in-progress`, stop without claiming the others. Otherwise create the exact
 canonical label only if missing, report definition drift without repairing it,
 and apply `in-progress` sequentially to every issue. Record each mutation.
@@ -259,6 +285,11 @@ editing it:
 git rebase <latest-base-sha>
 ```
 
+When GitHub or local history indicates merge conflicts, the rebase is the first
+mutation to the implementation branch. Do not make a code, test, PR-body, or
+metadata correction before resolving the latest-base rebase. Reassess the
+complete rebased result before deciding what further changes are necessary.
+
 Use `--autostash` only for verified unit-scoped uncommitted changes in a reused
 worktree; never create a manual stash. Stop when ownership of local changes or
 history is ambiguous.
@@ -320,7 +351,8 @@ a new PR exists, apply PR `in-progress` and confirm it.
 
 Build the PR description from [references/pr-template.md](references/pr-template.md).
 Preserve the Qwen marker when continuing a Qwen-owned PR. Begin a new Codex PR
-with `## Summary`.
+with `## Summary`. Omit optional sections that have no material content, and
+keep all validation information out of the PR description.
 
 Refresh every covered issue and confirm native linkage through
 `closed_by_pull_requests.references` or its MCP equivalent. When unavailable,
@@ -343,6 +375,11 @@ correctness issue remains: mark the PR ready for review, remove `partial` from
 the PR and every issue, remove all issue and PR `in-progress`, and apply PR
 `ready-to-merge`.
 
+If inherited work already satisfies all of those conditions, do not manufacture
+an implementation change or publish a success comment. Preserve matching PR
+content and metadata and apply only a missing `ready-to-merge` label after
+releasing this run's temporary claims.
+
 For a usable incomplete handoff, retain appropriate `partial` labels and remove
 all `in-progress` labels. Immediate continuation within the same active run may
 retain its recorded claims. Finalization removes every activity lock created by
@@ -362,7 +399,7 @@ this run's `in-progress`, reconcile `partial` from usable pushed work, and read
 the result back. Report any cleanup blocked by authentication, authorization,
 interruption, or another actor.
 
-Report selectors and complete resolution, mode, full issue set and anchor,
+Keep the user-facing report concise and omit empty categories. Report selectors and complete resolution, mode, full issue set and anchor,
 cohesion decision, reuse searches and candidate selection, issue/PR URLs,
 branch/worktree reuse or creation, confirmed remote-head state, accepted
 scope and completion per issue, inherited-work verification, changes, local

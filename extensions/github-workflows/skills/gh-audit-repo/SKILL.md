@@ -708,7 +708,9 @@ After an area's discovery and every candidate verification finish:
    `/gh-curate-issues`.
 
 7. Immediately before rendering or publishing any accepted candidate, reopen
-   every cited current-SHA symbol and repository-relative path. Revalidate each
+   every cited current-SHA symbol and repository-relative path. Keep line
+   numbers, line ranges, and commit-pinned line links out of published issue
+   text; retain exact locations only in private evidence. Revalidate each
    impact statement against that source, replace stale locations, and correct
    inaccurate claims. Reject or return the candidate to verification when the
    cited source or impact cannot be re-established. For `update-existing`,

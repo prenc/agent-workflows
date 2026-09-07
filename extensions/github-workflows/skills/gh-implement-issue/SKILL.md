@@ -162,7 +162,7 @@ With the early claims held, fetch complete issue scopes, labels, maintainer
 clarifications, native relationships, plausible implementation PRs, and
 existing PR bodies, commits, reviews, comments, heads/bases, and immutable SHAs.
 Establish accepted scope from the issue record and explicit maintainer
-clarifications. Overlay any explicit correction or remaining-work statement
+clarifications. Overlay any explicit premise or accepted-scope correction
 from the authenticated user's unique current managed reassessment beginning
 `<!-- codex:github-work-reassessment:v1 -->` or the legacy
 `<!-- codex:github-issue-reevaluation:v1 -->`; stop on more than one matching
@@ -498,9 +498,10 @@ no-implementation units.
 Use `NO_IMPLEMENTATION` only when no issue in the unit requires a code change.
 When it applies to only part of a multi-issue unit, process it as a
 `SPLIT_REQUESTED` per-issue disposition and continue the remaining cohesive
-issues. Verify the worker's evidence and optionally publish one concise comment
-on each affected issue before finalization. Issue state and terminal labels
-remain curator/maintainer responsibilities.
+issues. Verify the worker's evidence, publish no issue comment, and route any
+premise, scope, invalidity, or obsolescence conclusion to reassessment or
+curation in the final report. Issue state and terminal labels remain
+curator/maintainer responsibilities.
 
 A unit is finalized only after issue and PR reads confirm the intended status
 and derived taxonomy label state. If authentication, authorization, interruption, or a conflicting actor

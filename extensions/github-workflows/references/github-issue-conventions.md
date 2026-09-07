@@ -356,7 +356,9 @@ validation rather than issue requirements.
 
 Published issue titles, bodies, and comments must never expose absolute filesystem paths
 from an audit host, worktree, home directory, temporary directory, or workflow state. Cite
-source locations only as repository-relative paths, optionally with a symbol or line, such
-as `src/package/module.py:42` or `Package.method`. Convert absolute evidence paths to that
+source locations only as repository-relative paths, optionally with a named symbol, such as
+`src/package/module.py` or `Package.method`. Never publish line numbers, line ranges, or
+commit-pinned line links: they become misleading as active code moves. Keep exact lines and
+immutable SHAs in private workflow evidence. Convert absolute evidence paths to the public
 form before publication; if a path cannot be expressed relative to the audited repository,
 omit it from public text.

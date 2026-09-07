@@ -1701,6 +1701,95 @@ class TestExtensionMcp:
             assert "type" in content, name
             assert "priority" in content, name
 
+    def test_codex_workflows_avoid_non_actionable_public_chatter(self) -> None:
+        pickup = (ROOT / "codex/skills/gh-pickup-work/SKILL.md").read_text(encoding="utf-8")
+        reassessment = (ROOT / "codex/skills/gh-reassess-work/SKILL.md").read_text(encoding="utf-8")
+        comment_format = (
+            ROOT / "codex/skills/gh-reassess-work/references/comment-format.md"
+        ).read_text(encoding="utf-8")
+        pickup = " ".join(pickup.split())
+        reassessment = " ".join(reassessment.split())
+        comment_format = " ".join(comment_format.split())
+
+        assert all(
+            term in reassessment
+            for term in (
+                "transactionally claim every open graph node",
+                "compare every non-lifecycle snapshot fact",
+                "This applies to linked and unlinked PRs",
+                "sole durable GitHub mutation in the ordinary clean case is adding a missing PR",
+                "Delete this workflow's existing managed PR comment",
+                "deletion of an obsolete owned managed comment",
+                "Finalize PRs before issues",
+            )
+        )
+        assert all(
+            term in comment_format
+            for term in ("clean result", "Never post", "Delete an owned managed PR comment")
+        )
+        assert all(
+            term in pickup
+            for term in (
+                "Never add issue or PR conversation comments",
+                "do not manufacture an implementation change",
+                "apply only a missing `ready-to-merge` label",
+                "attempt a read-only verification fast path",
+                "complete GitHub no-op",
+                "transactionally claim every issue and the PR",
+                "replace PR `in-progress` with `ready-to-merge`",
+            )
+        )
+
+    def test_qwen_workflows_skip_non_actionable_github_mutations(self) -> None:
+        implementation = (EXTENSION / "skills/gh-implement-issue/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        worker = (EXTENSION / "agents/gh-implement-issue-worker.md").read_text(encoding="utf-8")
+        curator = (EXTENSION / "skills/gh-curate-issues/SKILL.md").read_text(encoding="utf-8")
+        implementation = " ".join(implementation.split())
+        worker = " ".join(worker.split())
+        curator = " ".join(curator.split())
+
+        assert "publish no issue comment" in implementation
+        assert "never propose a public comment" in worker
+        assert "complete desired state per issue and linked PR" in curator
+        assert "Never resubmit an identical complete label set" in curator
+        assert "record a true no-op and perform no GitHub write" in curator
+
+    def test_implementation_pr_template_omits_empty_and_validation_sections(self) -> None:
+        template = (EXTENSION / "references/github-pr-template.md").read_text(encoding="utf-8")
+        normalized = " ".join(template.split())
+        core_template = template.split("```markdown", 1)[1].split("```", 1)[0]
+
+        assert "Omit `Deviations / Non-goals`" in normalized
+        assert "Omit `Risks or follow-up`" in normalized
+        assert "Do not include validation information anywhere" in normalized
+        assert "Never include empty sections" in normalized
+        assert "None identified" not in core_template
+        assert "Closes #<issue>" in core_template
+        assert "repository-relative file" in normalized
+        assert "Never include line numbers, line ranges" in normalized
+        assert (ROOT / "codex/skills/gh-pickup-work/references/pr-template.md").resolve() == (
+            EXTENSION / "references/github-pr-template.md"
+        ).resolve()
+
+    def test_public_github_evidence_uses_stable_files_and_symbols(self) -> None:
+        issue_conventions = (EXTENSION / "references/github-issue-conventions.md").read_text(
+            encoding="utf-8"
+        )
+        reassessment_comments = (
+            ROOT / "codex/skills/gh-reassess-work/references/comment-format.md"
+        ).read_text(encoding="utf-8")
+        audit_worker = (EXTENSION / "agents/gh-audit-repo-worker.md").read_text(encoding="utf-8")
+
+        for document in (issue_conventions, reassessment_comments, audit_worker):
+            normalized = " ".join(document.split())
+            assert "line numbers" in normalized
+            assert "line ranges" in normalized
+            assert "commit-pinned line links" in normalized
+        assert "`src/package/module.py` or `Package.method`" in issue_conventions
+        assert "immutable SHAs in private workflow evidence" in issue_conventions
+
     def test_implementation_guidance_requires_evidence_based_validation_and_drafts(self) -> None:
         supervisor = (EXTENSION / "skills/gh-implement-issue/SKILL.md").read_text(encoding="utf-8")
         worker = (EXTENSION / "agents/gh-implement-issue-worker.md").read_text(encoding="utf-8")
