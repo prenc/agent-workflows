@@ -115,11 +115,17 @@ class Installer:
         self.args = args
         self.root = (root or repository_root()).resolve()
         self.home = Path.home()
-        self.cache = Path(os.environ.get("XDG_CACHE_HOME", str(self.home / ".cache"))).expanduser()
-        if not self.cache.is_absolute():
-            raise ValueError("XDG_CACHE_HOME must be an absolute path")
-        self.changes: list[str] = []
         self.warnings: list[str] = []
+        configured_cache = os.environ.get("XDG_CACHE_HOME")
+        self.cache = (
+            Path(configured_cache).expanduser()
+            if configured_cache is not None
+            else self.home / ".cache"
+        )
+        if not self.cache.is_absolute():
+            self.cache = self.home / ".cache"
+            self.warnings.append("ignoring non-absolute XDG_CACHE_HOME; using ~/.cache")
+        self.changes: list[str] = []
         self.changed_components: set[str] = set()
         self.mcp_changes: set[tuple[str, str]] = set()
         self.change_groups: dict[str, str] = {}

@@ -60,19 +60,25 @@ def test_dry_run_lists_only_required_changes(
 
 
 @pytest.mark.parametrize(
-    ("xdg_cache_home", "expected_cache"),
+    ("xdg_cache_home", "expected_cache", "expected_warning"),
     [
-        ("relative-cache", None),
-        ("", None),
-        ("~/skills-cache", "skills-cache"),
+        (
+            "relative-cache",
+            ".cache",
+            "[WARN] ignoring non-absolute XDG_CACHE_HOME; using ~/.cache\n",
+        ),
+        ("", ".cache", "[WARN] ignoring non-absolute XDG_CACHE_HOME; using ~/.cache\n"),
+        ("~/skills-cache", "skills-cache", ""),
     ],
 )
 def test_xdg_cache_home_never_yields_relative_checkout(
     repository: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
     xdg_cache_home: str,
-    expected_cache: str | None,
+    expected_cache: str,
+    expected_warning: str,
 ) -> None:
     home = tmp_path / "home"
     cwd = tmp_path / "cwd"
@@ -81,19 +87,15 @@ def test_xdg_cache_home_never_yields_relative_checkout(
     monkeypatch.setenv("XDG_CACHE_HOME", xdg_cache_home)
     monkeypatch.chdir(cwd)
 
-    if expected_cache is None:
-        with pytest.raises(ValueError, match="XDG_CACHE_HOME must be an absolute path"):
-            installation.Installer(arguments(), repository)
-        assert list(cwd.iterdir()) == []
-        return
-
     installer = installation.Installer(arguments(), repository)
 
     assert installer.cache == home / expected_cache
     assert installer.cache.is_absolute()
     installer.plan_polars()
+    installer.approve()
 
     assert "install the official Polars skill for Codex and Qwen" in installer.changes
+    assert capsys.readouterr().err == expected_warning
     assert not (cwd / "~").exists()
 
 
