@@ -232,6 +232,11 @@ The supervisor records every completed, failed, or abandoned attempt before
 interpreting its result, starts the corresponding integration event, validates
 and synthesizes available output, runs any material probe, and completes
 integration before launching more work.
+The normal worker sequence is `plan`, launch, immediately `mark_running` after
+the launch is accepted and before waiting, record the returned result, then
+`integration_begin`, integrate, and `integration_end`. If launch is rejected,
+record `abandon` while the task is still queued. These lifecycle calls are safe
+to repeat with the same task and report after an uncertain response.
 `mcp__github_workflows__run_manage` with action `finish` enforces that tasks and candidates
 are terminal, completed reports are integrated, validation files exactly match
 registered artifacts, pending work is empty, publication
@@ -274,7 +279,10 @@ count, completeness, last successful synchronization, and audited default SHA.
 Do not query records merely to infer cache metadata. Storage paths and
 transaction files are private server details.
 
-Prepare a staging copy with action `prepare`. On first use or automatic
+Prepare a staging copy with action `prepare`; repeating it resumes a valid
+staging transaction without discarding ingested records, and automatically
+recreates an empty interrupted transaction. If status reports an invalid
+transaction, call `abort` and then `prepare`. On first use or automatic
 recovery, enumerate every open and closed issue and every open,
 closed-unmerged, and merged pull request. Mark
 `full_history_complete` only after every page succeeds.
@@ -302,7 +310,8 @@ immutable default-branch SHA from the live repository read as `default_sha`.
 The server supplies the transaction generation and run timestamp, takes a short lock, and rejects a
 changed live generation. On conflict, prepare from the newer database, repeat
 incremental synchronization once, and retry. A second conflict blocks
-publication. Treat abandoned staging files as non-blocking artifacts.
+publication. Use the returned staging classification and recovery action rather
+than inferring transaction state from a prior interruption.
 
 Using paginated MCP list tools, maintain a compact inventory containing number,
 URL, title, labels, state, assignees, timestamps, and relevant pull-request refs.
@@ -501,6 +510,11 @@ Use the returned server-generated task ID and task reference, then launch one
 ```text
 Task ref: <task-ref-returned-by-task-manage>
 ```
+
+Copy the returned task reference exactly; never shorten or reconstruct it.
+After an accepted launch, immediately mark that task running before waiting.
+If the worker returns before that receipt is recorded, persist its result
+directly and let the server recover the missing start transition.
 
 Workers inspect the whole assigned shard and return structured candidates plus
 rejected leads and coverage gaps. A finding that belongs to shared runtime is

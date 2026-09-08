@@ -635,7 +635,7 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
         note: str | None = None,
         context: Context[Any, Any] | None = None,
     ) -> dict[str, Any]:
-        """Plan a task or transition it; checkpoint and complete accept structured reports."""
+        """Plan or transition a task; repeated matching lifecycle calls are idempotent."""
         invocation_id = _request_invocation_id(context)
         return _request_call(
             lambda request: runtime.task_manage(request, invocation_id=invocation_id),
@@ -645,7 +645,7 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     def task_context(task_ref: str, history_cursor: str | None = None) -> dict[str, Any]:
-        """Resolve a task and optionally continue its bounded history selection."""
+        """Resolve an exact returned task ref and optionally continue with an exact cursor."""
         return _public_call(runtime.task_context, task_ref, history_cursor)
 
     @mcp.tool(annotations=LOCAL_WRITE, structured_output=True)
@@ -659,7 +659,7 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
         full_history_complete: bool | None = None,
         default_sha: str | None = None,
     ) -> dict[str, Any]:
-        """Manage a compact GitHub index; details are discarded and read live when needed."""
+        """Manage a resumable compact GitHub index and report typed staging recovery state."""
         return _request_call(runtime.history_manage, HistoryManageRequest, **locals())
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)

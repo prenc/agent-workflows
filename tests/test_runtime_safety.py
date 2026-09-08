@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import subprocess
 import tempfile
@@ -937,6 +939,34 @@ class TestRuntimeSafety:
             runtime.history_manage(HistoryManageRequest(action="prepare"))
             assert work_db.is_file()
 
+    def test_history_status_classifies_recoverable_staging_states(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-history-recovery-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            absent = runtime.history_manage(HistoryManageRequest(action="status"))["history"]
+            assert (absent["staging_state"], absent["recovery_action"]) == (
+                "absent",
+                "prepare",
+            )
+            prepared = runtime.history_manage(HistoryManageRequest(action="prepare"))
+            assert prepared["history"]["staging_state"] == "valid"
+            resumed = runtime.history_manage(HistoryManageRequest(action="prepare"))
+            assert resumed["mode"] == "resume"
+            state = runtime.state("gh-audit-repo")
+            work_db = (
+                github_cache.repo_dir(runtime.project_dir, state["repository"])
+                / "staging"
+                / f"records-{state['run_id']}.sqlite3"
+            )
+            work_db.write_bytes(b"broken")
+            invalid = runtime.history_manage(HistoryManageRequest(action="status"))["history"]
+            assert (invalid["staging_state"], invalid["recovery_action"]) == (
+                "invalid",
+                "abort",
+            )
+            with pytest.raises(ValueError, match="abort, then prepare"):
+                runtime.history_manage(HistoryManageRequest(action="commit"))
+
     def test_history_ingest_payload_over_byte_cap_fails_typed(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-history-cap-") as directory:
             runtime = self.make_runtime(Path(directory))
@@ -1020,6 +1050,61 @@ class TestRuntimeSafety:
             assert runtime.state("gh-audit-repo")["scheduler"]["supervisor_activity"] is None
             with pytest.raises(ValidationError):
                 AuditRecordRequest(action="supervisor_finish", unexpected=True)
+
+    def test_queued_worker_result_recovers_start_and_repeated_report_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-start-recovery-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            planned = runtime.task_manage(
+                TaskManageRequest(action="plan", task={"logical_id": "accepted-worker"})
+            )
+            repeated_plan = runtime.task_manage(
+                TaskManageRequest(action="plan", task={"logical_id": "accepted-worker"})
+            )
+            assert repeated_plan["changed"] is False
+            assert repeated_plan["revision"] == planned["revision"]
+            runtime.run_manage(RunManageRequest(action="pause", workflow="gh-audit-repo"))
+            report = {"status": "complete", "summary": "worker returned before start receipt"}
+            completed = runtime.task_manage(
+                TaskManageRequest(action="complete", task_id=planned["task_id"], report=report)
+            )
+            assert completed["task"]["start_recovered_at"]
+            revision = completed["revision"]
+            repeated = runtime.task_manage(
+                TaskManageRequest(action="complete", task_id=planned["task_id"], report=report)
+            )
+            assert repeated["changed"] is False
+            assert repeated["revision"] == revision
+            with pytest.raises(ValueError, match="conflicting repeated"):
+                runtime.task_manage(
+                    TaskManageRequest(
+                        action="complete",
+                        task_id=planned["task_id"],
+                        report={"status": "complete", "summary": "different"},
+                    )
+                )
+
+    def test_generic_repeated_plan_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-plan-idempotent-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            workflow = "gh-curate-issues"
+            runtime.run_manage(
+                RunManageRequest(action="start", workflow=workflow, repository="example/repo")
+            )
+            task = {
+                "logical_id": "issue-1",
+                "assignment": self.curation_assignment(runtime, 1),
+            }
+            planned = runtime.task_manage(
+                TaskManageRequest(action="plan", workflow=workflow, task=task)
+            )
+
+            repeated = runtime.task_manage(
+                TaskManageRequest(action="plan", workflow=workflow, task=task)
+            )
+
+            assert repeated["changed"] is False
+            assert repeated["revision"] == planned["revision"]
 
     def test_run_lifecycle_cannot_be_bypassed_by_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-lifecycle-") as directory:
@@ -1224,7 +1309,7 @@ class TestRuntimeSafety:
             )
             artifact = runtime.current("gh-audit-repo") / "areas/task-1.json"
             revision = runtime.state("gh-audit-repo")["revision"]
-            with pytest.raises(ValueError, match="running or checkpointed"):
+            with pytest.raises(ValueError, match="conflicting repeated"):
                 runtime.task_manage(
                     TaskManageRequest(
                         action="complete",
@@ -1459,6 +1544,12 @@ class TestRuntimeSafety:
             assert runtime.state("gh-audit-repo")["shards"]["shard-core"]["status"] == "pending"
 
             runtime.task_manage(TaskManageRequest(action="mark_running", task_id="discover-core-1"))
+            assert (
+                runtime.task_manage(
+                    TaskManageRequest(action="mark_running", task_id="discover-core-1")
+                )["changed"]
+                is False
+            )
             assert runtime.state("gh-audit-repo")["shards"]["shard-core"]["status"] == "running"
             completed = runtime.task_manage(
                 TaskManageRequest(
@@ -1481,13 +1572,38 @@ class TestRuntimeSafety:
                     },
                 )
             )
+            with pytest.raises(ValueError, match="integration_begin"):
+                runtime.audit_record(
+                    AuditRecordRequest(action="supervisor_start", activity={"kind": "integration"})
+                )
             runtime.task_manage(
                 TaskManageRequest(action="integration_begin", task_id="discover-core-1")
             )
+            assert (
+                runtime.task_manage(
+                    TaskManageRequest(action="integration_begin", task_id="discover-core-1")
+                )["changed"]
+                is False
+            )
+            with pytest.raises(ValueError, match="integration_end"):
+                runtime.audit_record(AuditRecordRequest(action="supervisor_finish"))
             runtime.task_manage(
                 TaskManageRequest(action="integration_end", task_id="discover-core-1")
             )
+            assert (
+                runtime.task_manage(
+                    TaskManageRequest(action="integration_end", task_id="discover-core-1")
+                )["changed"]
+                is False
+            )
             assert runtime.state("gh-audit-repo")["shards"]["shard-core"]["status"] == "partial"
+            with pytest.raises(ValueError, match="task-owned"):
+                runtime.audit_record(
+                    AuditRecordRequest(
+                        action="shard",
+                        shard={"id": "shard-core", "status": "complete"},
+                    )
+                )
 
     def test_verify_assignment_fingerprint_is_server_owned_and_report_bound(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-verify-fingerprint-") as directory:
@@ -1780,11 +1896,6 @@ class TestRuntimeSafety:
                     },
                 )
             )
-            runtime.task_manage(
-                TaskManageRequest(
-                    action="mark_running", workflow=workflow, task_id=planned["task_id"]
-                )
-            )
             runtime.run_manage(RunManageRequest(action="pause", workflow=workflow))
 
             completed = runtime.task_manage(
@@ -1796,6 +1907,7 @@ class TestRuntimeSafety:
                 )
             )
             assert completed["task"]["status"] == "completed"
+            assert completed["task"]["start_recovered_at"]
             assert completed["allowed_actions"] == []
             assert completed["scheduler"]["next_action"] == "resume"
             for request in (
@@ -2050,7 +2162,40 @@ class TestRuntimeSafety:
             assert selection["limit"] == 40
             assert selection["has_more"] is True
             assert len(selection["records"]) == 40
-            assert selection["next_cursor"]
+            assert selection["next_cursor"].startswith("hc1.")
+
+            runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    task={
+                        "logical_id": "discover-core",
+                        "assignment": {
+                            "mode": "discover",
+                            "area": "area/shared-core",
+                            "focus": "changed focus",
+                        },
+                    },
+                )
+            )
+            with pytest.raises(ValueError, match="assignment has changed"):
+                runtime.task_context(planned["task_ref"], selection["next_cursor"])
+            runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    task={
+                        "logical_id": "discover-core",
+                        "assignment": {
+                            "mode": "discover",
+                            "area": "area/shared-core",
+                            "focus": "shared core",
+                        },
+                    },
+                )
+            )
+
+            runtime.task_manage(
+                TaskManageRequest(action="mark_running", task_id=planned["task_id"])
+            )
 
             continued = runtime.task_context(planned["task_ref"], selection["next_cursor"])[
                 "history"
@@ -2064,6 +2209,50 @@ class TestRuntimeSafety:
             )
             with pytest.raises(ValueError, match="malformed"):
                 runtime.task_context(planned["task_ref"], "not-a-cursor")
+            corrupt = selection["next_cursor"][:-1] + (
+                "0" if selection["next_cursor"][-1] != "0" else "1"
+            )
+            with pytest.raises(ValueError, match="corrupt"):
+                runtime.task_context(planned["task_ref"], corrupt)
+
+            query = hashlib.sha256(
+                json.dumps(
+                    {"links": [], "state": "open", "terms": "shared core shared core"},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            legacy_payload = {
+                "task_ref": planned["task_ref"],
+                "generation": 1,
+                "query": query,
+                "offset": 40,
+            }
+            legacy = (
+                base64.urlsafe_b64encode(
+                    json.dumps(legacy_payload, sort_keys=True, separators=(",", ":")).encode()
+                )
+                .decode()
+                .rstrip("=")
+            )
+            assert (
+                runtime.task_context(planned["task_ref"], legacy)["history"]["selection"][
+                    "record_count"
+                ]
+                == 1
+            )
+            invalid_offset_payload = {**legacy_payload, "offset": 1}
+            invalid_offset = (
+                base64.urlsafe_b64encode(
+                    json.dumps(
+                        invalid_offset_payload, sort_keys=True, separators=(",", ":")
+                    ).encode()
+                )
+                .decode()
+                .rstrip("=")
+            )
+            with pytest.raises(ValueError, match="offset is invalid"):
+                runtime.task_context(planned["task_ref"], invalid_offset)
 
             other = runtime.task_manage(
                 TaskManageRequest(
@@ -2076,6 +2265,17 @@ class TestRuntimeSafety:
             )
             with pytest.raises(ValueError, match="another task"):
                 runtime.task_context(other["task_ref"], selection["next_cursor"])
+
+            runtime.history_manage(HistoryManageRequest(action="prepare"))
+            runtime.history_manage(
+                HistoryManageRequest(
+                    action="commit",
+                    full_history_complete=True,
+                    default_sha=runtime.state("gh-audit-repo")["sha"],
+                )
+            )
+            with pytest.raises(ValueError, match="generation has changed"):
+                runtime.task_context(planned["task_ref"], selection["next_cursor"])
 
     def test_audit_task_context_selects_only_requested_python_packages(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-audit-inventory-context-") as directory:

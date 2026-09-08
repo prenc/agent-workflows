@@ -7,6 +7,7 @@ import base64
 import binascii
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -560,6 +561,15 @@ class WorkflowRuntime:
         }
 
     @staticmethod
+    def _same_canonical_json(left: Any, right: Any) -> bool:
+        try:
+            return json.dumps(
+                left, allow_nan=False, sort_keys=True, separators=(",", ":")
+            ) == json.dumps(right, allow_nan=False, sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
     def _validate_execution_blocked_retry(
         previous: dict[str, Any], invocation_id: str | None
     ) -> None:
@@ -923,7 +933,7 @@ class WorkflowRuntime:
     def _task_actions(task: dict[str, Any], scheduler: dict[str, Any]) -> list[str]:
         status = task.get("status")
         if status == "queued":
-            return ["plan", "mark_running", "abandon"]
+            return ["plan", "mark_running", "checkpoint", "complete", "fail", "abandon"]
         if status == "running":
             return ["checkpoint", "complete", "fail", "abandon"]
         if status == "checkpointed":
@@ -947,7 +957,7 @@ class WorkflowRuntime:
         if state.get("status") == "suspended":
             allowed_actions = (
                 ["checkpoint", "complete", "fail"]
-                if task.get("status") in {"running", "checkpointed"}
+                if task.get("status") in {"queued", "running", "checkpointed"}
                 else []
             )
         return {
@@ -1334,6 +1344,60 @@ class WorkflowRuntime:
             if request.workflow != "gh-audit-repo":
                 return self._generic_task_manage(request, state, invocation_id=invocation_id)
             managed_task_id = request_task_id
+            current_task = state.get("tasks", {}).get(request_task_id)
+
+            def unchanged() -> dict[str, Any]:
+                current = self.state("gh-audit-repo")
+                return self._receipt(
+                    "gh-audit-repo",
+                    current,
+                    False,
+                    **self._task_receipt_fields(
+                        "gh-audit-repo", current, cast(str, managed_task_id)
+                    ),
+                )
+
+            if isinstance(current_task, dict):
+                current_status = current_task.get("status")
+                if request.action == "mark_running" and current_status == "running":
+                    return unchanged()
+                if (
+                    request.action in {"checkpoint", "complete"}
+                    and current_status
+                    == {
+                        "checkpoint": "checkpointed",
+                        "complete": "completed",
+                    }[request.action]
+                ):
+                    reference = current_task.get(
+                        "checkpoint" if request.action == "checkpoint" else "result"
+                    )
+                    if self._same_canonical_json(
+                        self._task_report("gh-audit-repo", reference), request.report
+                    ):
+                        return unchanged()
+                    raise ValueError(f"conflicting repeated task {request.action} report")
+                if (
+                    request.action in {"fail", "abandon"}
+                    and current_status
+                    == {
+                        "fail": "failed",
+                        "abandon": "abandoned",
+                    }[request.action]
+                ):
+                    if current_task.get("note") == request.note:
+                        return unchanged()
+                    raise ValueError(f"conflicting repeated task {request.action}")
+                if request.action == "integration_begin":
+                    activity = state.get("scheduler", {}).get("supervisor_activity")
+                    if (
+                        isinstance(activity, dict)
+                        and activity.get("kind") == "integration"
+                        and activity.get("task_id") == request_task_id
+                    ):
+                        return unchanged()
+                if request.action == "integration_end" and current_task.get("integrated"):
+                    return unchanged()
             if request.action in {"plan", "retry"}:
                 attempt = 1
                 if request.action == "retry":
@@ -1376,13 +1440,19 @@ class WorkflowRuntime:
                             revised["assignment"], caller_supplied=True
                         )
                         self._validate_assignment_validations(state, revised["assignment"])
+                        managed_task_id = str(queued[0]["id"])
+                        compared = ("role", "unit", "assignment", "required")
+                        if all(
+                            name not in revised or queued[0].get(name) == revised[name]
+                            for name in compared
+                        ):
+                            return unchanged()
                         self._event(
                             {
                                 "type": "task-plan-update",
                                 "task": revised,
                             }
                         )
-                        managed_task_id = str(queued[0]["id"])
                         updated = self.state("gh-audit-repo")
                         return self._receipt(
                             "gh-audit-repo",
@@ -1446,14 +1516,26 @@ class WorkflowRuntime:
                     "task_id": request.task_id,
                     "status": status,
                 }
+                task = state.get("tasks", {}).get(request.task_id)
+                if (
+                    isinstance(task, dict)
+                    and task.get("status") == "queued"
+                    and request.action
+                    in {
+                        "checkpoint",
+                        "complete",
+                        "fail",
+                    }
+                ):
+                    payload["start_recovered"] = True
                 artifact_path: Path | None = None
                 if request.action in {"checkpoint", "complete"}:
-                    task = state.get("tasks", {}).get(request.task_id)
                     if not isinstance(task, dict) or task.get("status") not in {
+                        "queued",
                         "running",
                         "checkpointed",
                     }:
-                        raise ValueError("report requires a running or checkpointed task")
+                        raise ValueError("report requires an accepted worker task")
                     report_status = self._validate_audit_report(
                         task, request.report, request.action
                     )
@@ -1502,6 +1584,53 @@ class WorkflowRuntime:
         scheduler = state.setdefault("scheduler", {"limit": 3, "integration_queue": []})
         queue = scheduler.setdefault("integration_queue", [])
         managed_task_id = getattr(request, "task_id", None)
+
+        def unchanged() -> dict[str, Any]:
+            return self._receipt(
+                request.workflow,
+                state,
+                False,
+                **self._task_receipt_fields(request.workflow, state, cast(str, managed_task_id)),
+            )
+
+        current_task = tasks.get(managed_task_id)
+        if isinstance(current_task, dict):
+            current_status = current_task.get("status")
+            if request.action == "mark_running" and current_status == "running":
+                return unchanged()
+            if (
+                request.action in {"checkpoint", "complete"}
+                and current_status
+                == {
+                    "checkpoint": "checkpointed",
+                    "complete": "completed",
+                }[request.action]
+            ):
+                reference = current_task.get(
+                    "checkpoint" if request.action == "checkpoint" else "result"
+                )
+                if self._same_canonical_json(
+                    self._task_report(request.workflow, reference), request.report
+                ):
+                    return unchanged()
+                raise ValueError(f"conflicting repeated task {request.action} report")
+            if (
+                request.action in {"fail", "abandon"}
+                and current_status
+                == {
+                    "fail": "failed",
+                    "abandon": "abandoned",
+                }[request.action]
+            ):
+                if current_task.get("note") == request.note:
+                    return unchanged()
+                raise ValueError(f"conflicting repeated task {request.action}")
+            if request.action == "integration_begin":
+                activity = scheduler.get("supervisor_activity")
+                if isinstance(activity, dict) and activity.get("task_id") == managed_task_id:
+                    return unchanged()
+            if request.action == "integration_end" and current_task.get("integrated"):
+                return unchanged()
         if request.action in {"plan", "retry"}:
             if request.action == "retry":
                 previous = tasks.get(request.task_id)
@@ -1538,15 +1667,16 @@ class WorkflowRuntime:
                 if queued:
                     assignment = self._generic_task_assignment(request.workflow, plan.assignment)
                     task = queued[0]
-                    task.update(
-                        {
-                            "role": plan.role or "worker",
-                            "unit": plan.unit or logical_id,
-                            "assignment": assignment,
-                            "required": plan.required,
-                        }
-                    )
                     managed_task_id = str(task["id"])
+                    revised = {
+                        "role": plan.role or "worker",
+                        "unit": plan.unit or logical_id,
+                        "assignment": assignment,
+                        "required": plan.required,
+                    }
+                    if all(task.get(name) == value for name, value in revised.items()):
+                        return unchanged()
+                    task.update(revised)
                     state["revision"] += 1
                     state["updated_at"] = workflow_run.utc_now()
                     workflow_run.write_state(self.current(request.workflow), state)
@@ -1633,7 +1763,7 @@ class WorkflowRuntime:
                 "abandon": "abandoned",
             }[request.action]
             allowed = {
-                "queued": {"running", "abandoned"},
+                "queued": {"running", "checkpointed", "completed", "failed", "abandoned"},
                 "running": {"checkpointed", "completed", "failed", "abandoned"},
                 "checkpointed": {"running", "completed", "failed", "abandoned"},
             }
@@ -1645,6 +1775,8 @@ class WorkflowRuntime:
             ):
                 raise ValueError("generic workflow concurrency is saturated")
             task["status"] = status
+            if request.action in {"checkpoint", "complete", "fail"} and current_status == "queued":
+                task["start_recovered_at"] = workflow_run.utc_now()
             if request.action in {"checkpoint", "complete"}:
                 result_dir = self.current(request.workflow) / "results"
                 result_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1739,11 +1871,51 @@ class WorkflowRuntime:
 
     @staticmethod
     def _history_cursor(payload: dict[str, Any]) -> str:
-        rendered = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-        return base64.urlsafe_b64encode(rendered).decode().rstrip("=")
+        task_ref = str(payload["task_ref"])
+        _, run_ref, task_id = WorkflowRuntime._parse_task_ref(task_ref)
+        task_hash = hashlib.blake2s(task_id.encode(), digest_size=6).hexdigest()
+        query_hash = str(payload["query"])[:12]
+        body = ".".join(
+            (
+                "hc1",
+                run_ref,
+                task_hash,
+                str(payload["generation"]),
+                query_hash,
+                str(payload["offset"]),
+            )
+        )
+        checksum = hashlib.blake2s(body.encode(), digest_size=6).hexdigest()
+        return f"{body}.{checksum}"
 
     @staticmethod
     def _decode_history_cursor(cursor: str) -> dict[str, Any]:
+        if cursor.startswith("hc1."):
+            parts = cursor.split(".")
+            if len(parts) != 7:
+                raise ValueError("history_cursor is malformed or corrupt")
+            version, run_ref, task_hash, generation, query_hash, offset, checksum = parts
+            body = ".".join(parts[:-1])
+            expected_checksum = hashlib.blake2s(body.encode(), digest_size=6).hexdigest()
+            if not hmac.compare_digest(checksum, expected_checksum):
+                raise ValueError("history_cursor is malformed or corrupt")
+            if (
+                version != "hc1"
+                or not re.fullmatch(r"[0-9a-f]{12}", run_ref)
+                or not re.fullmatch(r"[0-9a-f]{12}", task_hash)
+                or not re.fullmatch(r"[0-9a-f]{12}", query_hash)
+                or not generation.isdigit()
+                or not offset.isdigit()
+            ):
+                raise ValueError("history_cursor is malformed or corrupt")
+            return {
+                "version": 1,
+                "run_ref": run_ref,
+                "task_hash": task_hash,
+                "generation": int(generation),
+                "query_hash": query_hash,
+                "offset": int(offset),
+            }
         try:
             padding = "=" * (-len(cursor) % 4)
             value = json.loads(base64.urlsafe_b64decode(cursor + padding))
@@ -1803,16 +1975,33 @@ class WorkflowRuntime:
         offset = 0
         if history_cursor is not None:
             cursor = self._decode_history_cursor(history_cursor)
-            expected = {
-                "task_ref": task_ref,
-                "generation": generation,
-                "query": query_fingerprint,
-            }
-            if any(cursor.get(key) != value for key, value in expected.items()):
-                raise ValueError("history_cursor is stale or belongs to another task")
+            if cursor.get("version") == 1:
+                _, run_ref, task_id = self._parse_task_ref(task_ref)
+                if cursor["run_ref"] != run_ref:
+                    raise ValueError("history_cursor belongs to another run")
+                task_hash = hashlib.blake2s(task_id.encode(), digest_size=6).hexdigest()
+                if cursor["task_hash"] != task_hash:
+                    raise ValueError("history_cursor belongs to another task")
+                if cursor["generation"] != generation:
+                    raise ValueError("history_cursor history generation has changed")
+                if cursor["query_hash"] != query_fingerprint[:12]:
+                    raise ValueError("history_cursor assignment has changed")
+            else:
+                if cursor.get("task_ref") != task_ref:
+                    raise ValueError("history_cursor belongs to another task or run")
+                if cursor.get("generation") != generation:
+                    raise ValueError("history_cursor history generation has changed")
+                if cursor.get("query") != query_fingerprint:
+                    raise ValueError("history_cursor assignment has changed")
             offset = cursor.get("offset")
-            if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
-                raise ValueError("history_cursor is malformed")
+            if (
+                isinstance(offset, bool)
+                or not isinstance(offset, int)
+                or offset <= 0
+                or offset % TASK_HISTORY_LIMIT
+                or offset > int(history.get("record_count") or 0)
+            ):
+                raise ValueError("history_cursor offset is invalid")
 
         def projected(queried: dict[str, Any]) -> list[dict[str, Any]]:
             return [
@@ -2067,7 +2256,16 @@ class WorkflowRuntime:
             live_db = github_cache.live_path(directory, "records")
 
             def cache_summary(database: Path, source: str) -> dict[str, Any]:
-                if not database.is_file():
+                classified = github_cache.database_state(database, repo, "records")
+                staging_fields = (
+                    {
+                        "staging_state": classified["staging_state"],
+                        "recovery_action": classified["recovery_action"],
+                    }
+                    if source == "staging"
+                    else {}
+                )
+                if classified["staging_state"] != "valid":
                     return {
                         "cache_source": source,
                         "cache_exists": False,
@@ -2076,9 +2274,9 @@ class WorkflowRuntime:
                         "full_history_complete": False,
                         "last_sync_at": None,
                         "default_sha": None,
+                        **staging_fields,
                     }
-                with github_cache.connect_readonly(database) as connection:
-                    validated = github_cache.validate(connection, repo, "records")
+                validated = classified
                 metadata = validated["metadata"]
                 return {
                     "cache_source": source,
@@ -2088,6 +2286,7 @@ class WorkflowRuntime:
                     "full_history_complete": metadata.get("full_history_complete") == "true",
                     "last_sync_at": metadata.get("last_sync_at") or None,
                     "default_sha": metadata.get("default_sha") or None,
+                    **staging_fields,
                 }
 
             def sync_receipt(history: dict[str, Any], status: str, **extra: Any) -> dict[str, Any]:
@@ -2116,11 +2315,15 @@ class WorkflowRuntime:
                 )
 
             if request.action == "status":
-                database = work_db if work_db.is_file() else live_db
-                source = "staging" if work_db.is_file() else "committed"
+                staging = github_cache.database_state(work_db, repo, "records")
+                use_staging = staging["staging_state"] == "valid"
+                database = work_db if use_staging else live_db
+                source = "staging" if use_staging else "committed"
                 history = {
                     **state.get("history", {}),
                     **cache_summary(database, source),
+                    "staging_state": staging["staging_state"],
+                    "recovery_action": staging["recovery_action"],
                 }
                 return self._receipt(
                     request.workflow,
@@ -2194,8 +2397,7 @@ class WorkflowRuntime:
                     "sync_status": "aborted",
                 }
                 return sync_receipt(history, "pending")
-            with github_cache.connect_readonly(work_db) as connection:
-                metadata = github_cache.validate(connection, repo, "records")["metadata"]
+            metadata = github_cache.require_valid_database(work_db, repo, "records")["metadata"]
             full_history_complete = request.full_history_complete
             if full_history_complete is None:
                 full_history_complete = metadata.get("full_history_complete") == "true"

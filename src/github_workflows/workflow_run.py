@@ -76,7 +76,7 @@ AUDIT_INTERNAL = {
     "inventory",
 }
 AUDIT_TRANSITIONS = {
-    "queued": {"running", "abandoned"},
+    "queued": {"running", "checkpointed", "completed", "failed", "abandoned"},
     "running": {"checkpointed", "completed", "failed", "abandoned"},
     "checkpointed": {"running", "completed", "failed", "abandoned"},
     "completed": set(),
@@ -635,14 +635,23 @@ def audit_event(args: argparse.Namespace) -> None:
         if status not in AUDIT_TASK_STATUSES:
             raise ValueError("unsupported task status")
         previous = task["status"]
-        if state["status"] == "suspended" and previous not in {"running", "checkpointed"}:
-            raise ValueError("late worker result requires a running or checkpointed task")
+        start_recovered = bool(payload.get("start_recovered"))
+        if (
+            state["status"] == "suspended"
+            and previous not in {"running", "checkpointed"}
+            and not (previous == "queued" and start_recovered)
+        ):
+            raise ValueError("late worker result requires an accepted worker task")
         if status not in AUDIT_TRANSITIONS[previous]:
             raise ValueError(f"invalid task transition: {previous} -> {status}")
+        if previous == "queued" and status != "running" and not start_recovered:
+            raise ValueError("queued worker results require start recovery")
         if status == "running" and audit_scheduler_status(state)["worker_slots"] < 1:
             raise ValueError("audit material-work concurrency is saturated")
         task["status"] = status
         task["updated_at"] = utc_now()
+        if start_recovered:
+            task["start_recovered_at"] = task["updated_at"]
         for name in (
             "result",
             "checkpoint",
@@ -718,6 +727,9 @@ def audit_event(args: argparse.Namespace) -> None:
         scheduler["supervisor_activity"] = None
         detail = {"task_id": task_id}
     elif event_type == "supervisor-start":
+        kind = require_string(payload.get("kind"), "supervisor activity kind")
+        if kind == "integration":
+            raise ValueError("integration must use task_manage integration_begin")
         if scheduler.get("supervisor_activity") is not None:
             raise ValueError("supervisor already has material work in progress")
         if scheduler["integration_queue"]:
@@ -725,7 +737,7 @@ def audit_event(args: argparse.Namespace) -> None:
         if audit_running_count(state) + 1 > scheduler["limit"]:
             raise ValueError("supervisor material work would exceed concurrency")
         scheduler["supervisor_activity"] = {
-            "kind": require_string(payload.get("kind"), "supervisor activity kind"),
+            "kind": kind,
             "unit": payload.get("unit"),
             "started_at": utc_now(),
         }
@@ -733,6 +745,8 @@ def audit_event(args: argparse.Namespace) -> None:
     elif event_type == "supervisor-complete":
         if scheduler.get("supervisor_activity") is None:
             raise ValueError("supervisor has no material work in progress")
+        if scheduler["supervisor_activity"].get("kind") == "integration":
+            raise ValueError("active integration must use task_manage integration_end")
         detail = {"kind": scheduler["supervisor_activity"]["kind"]}
         scheduler["supervisor_activity"] = None
     elif event_type == "shard-upsert":
@@ -740,6 +754,8 @@ def audit_event(args: argparse.Namespace) -> None:
         if not isinstance(shard, dict):
             raise ValueError("shard-upsert requires a shard object")
         shard_id = require_string(shard.get("id"), "shard id")
+        if any(discovery_shard_id(task) == shard_id for task in tasks.values()):
+            raise ValueError("task-owned shards may only be changed through task_manage")
         existing = state["shards"].get(shard_id, {})
         area = shard.get("area", existing.get("area"))
         status = shard.get("status", existing.get("status"))

@@ -166,7 +166,8 @@ live default SHA changed. Commit holds a short lock
 and succeeds only when the live generation still matches the prepared base. On
 conflict, abort, prepare from the new live generation, repeat the incremental
 refresh once, and retry. A second conflict blocks GitHub mutation and is
-reported. Treat abandoned staging files as non-locking artifacts.
+reported. Use the returned staging classification and recovery action rather
+than inferring transaction state from a prior interruption.
 
 When a GitHub MCP response reports `<persisted-output>`, pass every reported
 tool-result path as a typed `{kind, path}` entry in the `artifacts` list of a `history_manage` ingest
@@ -239,6 +240,12 @@ Use its returned server-generated task ID and task reference, then queue exactly
 ```text
 Task ref: <task-ref-returned-by-task-manage>
 ```
+
+Copy the task reference exactly. Immediately after the launch is accepted,
+call `task_manage` action `mark_running` before waiting. If launch fails, use
+`abandon` while the task remains queued. Record the worker result before
+interpreting it, then bracket synthesis with `integration_begin` and
+`integration_end`; identical lifecycle retries are safe.
 
 Each worker performs a targeted live `issue_read`, consults its complete
 candidate bundle, reads plausible GitHub matches as needed, and returns one

@@ -382,6 +382,11 @@ The spawn message contains exactly that line. Do not add the assignment, task ID
 or instructions to call supervisor-only workflow tools. Workers return their
 recoverable checkpoint in the final report; the supervisor alone persists that
 report through `task_manage` action `checkpoint` or `complete`.
+Copy the returned task reference exactly. Immediately after an accepted launch,
+call `task_manage` action `mark_running` before waiting; if launch fails, record
+`abandon` while the task is queued. Persist the returned result before
+interpreting it, then use `integration_begin` and `integration_end` around
+supervisor synthesis. Identical lifecycle retries are safe.
 
 Maintain a ledger containing unit, semantic task ID, task reference, anchor,
 issues, grouping rationale,

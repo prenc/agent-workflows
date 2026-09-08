@@ -227,6 +227,52 @@ class TestGithubCache:
         retried = self.parsed("prepare-records", *self.common(), "--run-id", "first")
         assert Path(retried["work_db"]) == work_db
 
+    def test_prepare_resumes_valid_staging_and_recovers_empty_staging(self) -> None:
+        prepared = self.parsed("prepare-records", *self.common(), "--run-id", "first")
+        self.parsed(*self.ingest_args(prepared["work_db"]))
+        resumed = self.parsed("prepare-records", *self.common(), "--run-id", "first")
+        assert resumed["mode"] == "resume"
+        queried = self.parsed(
+            "query-records", *self.common(), "--db", resumed["work_db"], "--terms", "Scoped"
+        )
+        assert [item["number"] for item in queried["records"]] == [1]
+
+        Path(resumed["work_db"]).write_bytes(b"")
+        recovered = self.parsed("prepare-records", *self.common(), "--run-id", "first")
+        assert recovered["mode"] == "recovered-empty"
+        assert Path(recovered["work_db"]).stat().st_size > 0
+
+    def test_rebuild_replaces_valid_staging_instead_of_resuming_it(self) -> None:
+        prepared = self.parsed("prepare-records", *self.common(), "--run-id", "first")
+        self.parsed(*self.ingest_args(prepared["work_db"]))
+
+        rebuilt = self.parsed("prepare-records", *self.common(), "--run-id", "first", "--rebuild")
+
+        assert rebuilt["mode"] == "rebuild"
+        queried = self.parsed(
+            "query-records", *self.common(), "--db", rebuilt["work_db"], "--terms", "Scoped"
+        )
+        assert queried["records"] == []
+
+    def test_invalid_staging_requires_abort_and_abort_does_not_follow_symlink(self) -> None:
+        prepared = self.parsed("prepare-records", *self.common(), "--run-id", "first")
+        work_db = Path(prepared["work_db"])
+        work_db.write_bytes(b"not sqlite")
+        failed = self.failed_call("prepare-records", *self.common(), "--run-id", "first")
+        assert failed.returncode == 2
+        assert "call abort, then prepare" in failed.stderr
+        self.call("abort", *self.common(), "--db", str(work_db))
+        assert not work_db.exists()
+
+        target = Path(self.temp.name) / "must-survive"
+        target.write_text("important", encoding="utf-8")
+        work_db.symlink_to(target)
+        refused = self.failed_call("abort", *self.common(), "--db", str(work_db))
+        assert refused.returncode == 2
+        assert "unsafe" in refused.stderr
+        assert work_db.is_symlink()
+        assert target.read_text(encoding="utf-8") == "important"
+
     def test_ingest_rejects_database_outside_prepared_staging(self) -> None:
         prepared = self.parsed("prepare-records", *self.common(), "--run-id", "first")
         work_db = prepared["work_db"]
@@ -287,6 +333,14 @@ class TestGithubCache:
             assert failed.returncode == 2
             assert "refusing to remove" in failed.stderr
             assert foreign.exists()
+
+    def test_abort_leaves_nfs_staging_artifacts_untouched(self) -> None:
+        prepared = self.parsed("prepare-records", *self.common(), "--run-id", "first")
+        artifact = Path(prepared["work_db"]).parent / ".nfs123"
+        artifact.write_bytes(b"busy")
+        failed = self.failed_call("abort", *self.common(), "--db", str(artifact))
+        assert failed.returncode == 2
+        assert artifact.read_bytes() == b"busy"
 
     def test_ingest_rejects_input_over_byte_cap(self) -> None:
         prepared = self.parsed("prepare-records", *self.common(), "--run-id", "first")

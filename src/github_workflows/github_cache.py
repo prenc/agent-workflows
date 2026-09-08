@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -132,8 +133,13 @@ def secure_directory(path: Path) -> None:
 
 
 def secure_file(path: Path) -> None:
-    if path.exists():
-        os.chmod(path, 0o600)
+    try:
+        details = path.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(details.st_mode) or stat.S_ISLNK(details.st_mode):
+        raise ValueError(f"refusing to secure a non-regular database: {path}")
+    os.chmod(path, 0o600, follow_symlinks=False)
 
 
 def connect(path: Path) -> sqlite3.Connection:
@@ -237,6 +243,60 @@ def validate(connection: sqlite3.Connection, repo: str, kind: str) -> dict[str, 
     return {"metadata": meta, "count": count}
 
 
+def database_state(path: Path, repo: str, kind: str) -> dict[str, Any]:
+    """Classify a transaction database without following unsafe filesystem entries."""
+    try:
+        details = path.lstat()
+    except FileNotFoundError:
+        return {"staging_state": "absent", "recovery_action": "prepare"}
+    safe_regular = (
+        stat.S_ISREG(details.st_mode)
+        and not stat.S_ISLNK(details.st_mode)
+        and details.st_uid == os.getuid()
+    )
+    if not safe_regular:
+        return {
+            "staging_state": "invalid",
+            "recovery_action": "inspect",
+            "safe_to_abort": False,
+        }
+    if details.st_size == 0:
+        return {
+            "staging_state": "empty",
+            "recovery_action": "prepare",
+            "safe_to_abort": True,
+        }
+    try:
+        with connect_readonly(path) as connection:
+            checked = validate(connection, repo, kind)
+    except (OSError, ValueError, sqlite3.DatabaseError):
+        return {
+            "staging_state": "invalid",
+            "recovery_action": "abort",
+            "safe_to_abort": True,
+        }
+    return {
+        "staging_state": "valid",
+        "recovery_action": "resume",
+        "safe_to_abort": True,
+        **checked,
+    }
+
+
+def require_valid_database(path: Path, repo: str, kind: str) -> dict[str, Any]:
+    classified = database_state(path, repo, kind)
+    state = classified["staging_state"]
+    if state == "valid":
+        return classified
+    if state == "absent":
+        raise ValueError("staging database does not exist; call prepare")
+    if state == "empty":
+        raise ValueError("staging database is empty; call prepare to recover it")
+    if classified.get("safe_to_abort"):
+        raise ValueError("staging database is invalid; call abort, then prepare")
+    raise ValueError("staging database is an unsafe filesystem entry and requires inspection")
+
+
 def live_path(directory: Path, kind: str) -> Path:
     return directory / RECORDS_DB
 
@@ -268,10 +328,34 @@ def prepare_database(args: argparse.Namespace, kind: str) -> None:
     staging = directory / "staging"
     secure_directory(staging)
     work = staging / f"{kind}-{run_id}.sqlite3"
-    if work.exists():
-        raise RuntimeError(f"staging database already exists: {work}")
+    prior = database_state(work, args.repo, kind)
+    if prior["staging_state"] == "valid":
+        if args.rebuild:
+            work.unlink()
+        else:
+            meta = prior["metadata"]
+            print(
+                json.dumps(
+                    {
+                        "persistent": True,
+                        "mode": "resume",
+                        "live_db": str(live),
+                        "work_db": str(work),
+                        "base_generation": int(meta.get("generation", "0")),
+                    },
+                    indent=2,
+                )
+            )
+            return
+    recovered_empty = prior["staging_state"] == "empty"
+    if recovered_empty:
+        work.unlink()
+    elif prior["staging_state"] == "invalid":
+        if prior.get("safe_to_abort"):
+            raise RuntimeError("staging database is invalid; call abort, then prepare")
+        raise RuntimeError("staging database is an unsafe filesystem entry and requires inspection")
     base_generation = 0
-    mode = "new"
+    mode = "recovered-empty" if recovered_empty else "new"
     reuse_live = live.exists() and not args.rebuild
     if reuse_live:
         stored_repo = None
@@ -297,12 +381,12 @@ def prepare_database(args: argparse.Namespace, kind: str) -> None:
             os.replace(live, backup)
             secure_file(backup)
             reuse_live = False
-            mode = "recovery"
+            mode = "recovered-empty" if recovered_empty else "recovery"
         else:
             shutil.copy2(live, work)
             with connect(work) as connection, connection:
                 compact_existing_records(connection)
-            mode = "reuse"
+            mode = "recovered-empty" if recovered_empty else "reuse"
     if not reuse_live:
         with connect(work) as connection:
             initialize_records(connection, args.repo)
@@ -464,7 +548,7 @@ def ingest_records(args: argparse.Namespace) -> None:
     items = [
         normalize_record(item, args.kind, args.source, fetched_at) for item in record_list(payload)
     ]
-    db = args.db.resolve()
+    db = args.db
     if getattr(args, "no_cache", False):
         if not is_no_cache_database(db):
             raise ValueError(
@@ -473,10 +557,9 @@ def ingest_records(args: argparse.Namespace) -> None:
     else:
         run_id = validated_run_id(args.run_id)
         staging = (repo_dir(args.cache_root, args.repo) / "staging").resolve()
-        if db.parent != staging or db.name != f"records-{run_id}.sqlite3":
+        if db.parent.resolve() != staging or db.name != f"records-{run_id}.sqlite3":
             raise ValueError("database path does not match the prepared staging transaction")
-    with connect_readonly(db) as connection:
-        validate(connection, args.repo, "records")
+    require_valid_database(db, args.repo, "records")
     with connect(db) as connection:
         with connection:
             for item in items:
@@ -641,9 +724,10 @@ def commit_database(args: argparse.Namespace, kind: str) -> None:
     run_id = validated_run_id(args.run_id)
     directory = repo_dir(args.cache_root, args.repo)
     staging = (directory / "staging").resolve()
-    work = args.db.resolve()
-    if work.parent != staging or work.name != f"{kind}-{run_id}.sqlite3":
+    work = args.db
+    if work.parent.resolve() != staging or work.name != f"{kind}-{run_id}.sqlite3":
         raise ValueError("staging database path does not match this transaction")
+    require_valid_database(work, args.repo, kind)
     lock = directory / "commit.lock"
     descriptor = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
     try:
@@ -682,10 +766,14 @@ def commit_database(args: argparse.Namespace, kind: str) -> None:
 
 
 def abort_database(args: argparse.Namespace) -> None:
-    path = args.db.resolve()
+    path = args.db
     staging = (repo_dir(args.cache_root, args.repo) / "staging").resolve()
     no_cache = is_no_cache_database(path)
-    if path.parent == staging or no_cache:
+    staging_name = re.fullmatch(r"records-([A-Za-z0-9][A-Za-z0-9._-]{0,127})\.sqlite3", path.name)
+    if (path.parent.resolve() == staging and staging_name) or no_cache:
+        classified = database_state(path, args.repo, "records")
+        if classified["staging_state"] != "absent" and not classified.get("safe_to_abort"):
+            raise ValueError("refusing to remove an unsafe staging filesystem entry")
         path.unlink(missing_ok=True)
         if no_cache:
             path.parent.rmdir()
