@@ -48,11 +48,10 @@ only when separately requested.
 ## Record feedback
 
 Use `mcp__github_workflows__workflow_feedback`. General or instruction friction
-needs only `message`; a named worker also supplies its exact `task_ref`. When a
-failed github-workflows call offers `error_ref`, pass it instead of repeating
-the payload. Use `tool` only for a Qwen-native or external tool, or a confusing
-successful call the server could not observe. Never combine `error_ref` and
-`tool`.
+needs only `message`; a named worker also supplies its exact `task_ref`. Qwen
+attaches the conversation and tool-call locator automatically. Use `tool` only
+for a Qwen-native or external tool, or a confusing successful call the server
+could not identify from nearby transcript context.
 
 Record distinct friction caused or obscured by a workflow, tool API, active
 instruction, or agent interface: missing capabilities, confusing schemas,
@@ -100,11 +99,13 @@ when they share a demonstrated root cause and required correction. Report each
 group's IDs, evidence, confidence, consequence, proposed change, and expected
 disposition. A zero-item queue is a successful no-op.
 
-If the sanitized record is insufficient, explain the missing evidence.
-Ask the user before calling `agent-feedback trace` or opening
-any Qwen transcript. After permission, inspect only rows tied to the exact
-feedback and origin call IDs.
-Never scan, reproduce, or summarize the complete conversation.
+If the sanitized record is insufficient, run `agent-feedback trace <ref>`,
+which defaults to the three preceding tool interactions without payloads. If
+that is insufficient, retry with `--detail context` to include bounded visible
+user and assistant text. Never expose hidden reasoning. Ask the user before
+using `--detail data`; it adds bounded, sanitized payloads for those same tool
+calls. Inspect only the returned window and never scan, reproduce, or summarize
+the complete conversation.
 
 ## Implement authorized groups
 

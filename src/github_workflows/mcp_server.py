@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
+from difflib import get_close_matches
 from importlib.metadata import PackageNotFoundError, version
 from typing import Annotated, Any, Literal
 
@@ -16,12 +18,18 @@ from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field, ValidationError
 
-from . import feedback
 from .models import (
+    RUN_ACTION_FIELDS,
+    RUN_START_WORKFLOW_FIELDS,
     AreaDefinition,
     AuditRecordRequest,
     CandidateRecordValue,
+    FeedbackMessage,
+    FeedbackTaskRef,
+    FeedbackToolName,
+    FullSha,
     HistoryArtifact,
+    HistoryLimit,
     HistoryManageRequest,
     HistoryQueryRequest,
     HistoryRecord,
@@ -30,10 +38,13 @@ from .models import (
     KnowledgeFinding,
     KnowledgeRequest,
     LinkedRecord,
+    NonBlankString,
     PhaseRecord,
+    PositiveInteger,
     ProbeRequest,
     ProgramProbe,
     PublishRequest,
+    RepositoryName,
     RunManageRequest,
     ShardRecordValue,
     SupervisorActivityValue,
@@ -61,57 +72,33 @@ type JsonArrayArgument[T] = Annotated[
     Field(description="Send a JSON array value; do not JSON-encode it as a string."),
 ]
 
-ACTION_REQUIREMENTS: dict[str, tuple[str, dict[str, tuple[str, ...]]]] = {
-    "run_manage": ("action", {"start": ("repository",)}),
-    "task_manage": (
-        "action",
-        {
-            "plan": ("task",),
-            "retry": ("task_id",),
-            "mark_running": ("task_id",),
-            "checkpoint": ("task_id", "report"),
-            "complete": ("task_id", "report"),
-            "fail": ("task_id",),
-            "abandon": ("task_id",),
-            "integration_begin": ("task_id",),
-            "integration_end": ("task_id",),
-        },
-    ),
-    "audit_inventory": (
-        "action",
-        {
-            "program": ("programs",),
-            "record_declared": ("facts",),
-            "record_context": ("fact",),
-        },
-    ),
-    "audit_knowledge": (
-        "action",
-        {
-            "reconcile": ("areas",),
-            "update": ("area", "findings"),
-            "context": ("area",),
-        },
-    ),
-    "audit_probe": ("kind", {"pytest": ("selectors",), "python": ("code",)}),
-    "audit_record": (
-        "action",
-        {
-            "phase": ("phase",),
-            "shard": ("shard",),
-            "candidate": ("candidate",),
-            "verdict": ("verdict",),
-            "limitation": ("limitation",),
-            "pending": ("pending",),
-            "head_drift": ("head_drift",),
-            "supervisor_start": ("activity",),
-        },
-    ),
-    "audit_publish": (
-        "action",
-        {"begin": ("operation",), "finish": ("receipt",)},
-    ),
+ACTION_REQUEST_MODELS: dict[str, type[Any]] = {
+    "task_manage": TaskManageRequest,
+    "history_manage": HistoryManageRequest,
+    "audit_inventory": InventoryRequest,
+    "audit_knowledge": KnowledgeRequest,
+    "audit_probe": ProbeRequest,
+    "audit_record": AuditRecordRequest,
+    "audit_publish": PublishRequest,
 }
+SIMPLE_REQUEST_MODELS: dict[str, type[Any]] = {
+    "workflow_feedback": WorkflowFeedbackRequest,
+    "run_manage": RunManageRequest,
+    "history_query": HistoryQueryRequest,
+}
+SCHEMA_CONSTRAINT_KEYS = (
+    "exclusiveMaximum",
+    "exclusiveMinimum",
+    "maxItems",
+    "maxLength",
+    "maxProperties",
+    "maximum",
+    "minItems",
+    "minLength",
+    "minProperties",
+    "minimum",
+    "pattern",
+)
 
 
 @dataclass(frozen=True)
@@ -189,6 +176,18 @@ def _validation_issues(error: ValidationError, arguments: dict[str, Any]) -> lis
             requirement = f"must contain at least {context.get('min_length', 1)} characters"
         elif kind == "string_too_long":
             requirement = f"must contain at most {context.get('max_length')} characters"
+        elif kind == "string_pattern_mismatch":
+            pattern = context.get("pattern")
+            if pattern == r"\S":
+                requirement = "must not be blank"
+            elif pattern == r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$":
+                requirement = "must be a full 40- or 64-character lowercase hexadecimal SHA"
+            elif pattern == r"^[^/\s]+/[^/\s]+$":
+                requirement = "must use OWNER/REPO form"
+            elif pattern == r"^err-[0-9a-f]{12}$":
+                requirement = "must use err- followed by 12 lowercase hexadecimal characters"
+            else:
+                requirement = "has an invalid format"
         elif kind in {"value_error", "assertion_error"}:
             requirement = detail["msg"].removeprefix("Value error, ")
             if field == "request":
@@ -203,10 +202,31 @@ def _validation_issues(error: ValidationError, arguments: dict[str, Any]) -> lis
 
 
 def _render_validation_error(error: ValidationError, arguments: dict[str, Any]) -> str:
-    messages = [
+    issues = _validation_issues(error, arguments)
+    discriminator = "action" if "action" in arguments else "kind" if "kind" in arguments else None
+    discriminator_value = arguments.get(discriminator) if discriminator is not None else None
+    missing = [issue.field for issue in issues if issue.kind == "missing"]
+    rejected = [issue.field for issue in issues if issue.kind == "extra_forbidden"]
+    messages: list[str] = []
+    if missing:
+        fields = ", ".join(missing)
+        messages.append(
+            f"{discriminator}={discriminator_value} requires {fields}"
+            if discriminator_value is not None
+            else f"required: {fields}"
+        )
+    if rejected:
+        fields = ", ".join(rejected)
+        messages.append(
+            f"{discriminator}={discriminator_value} does not accept {fields}"
+            if discriminator_value is not None
+            else f"not accepted: {fields}"
+        )
+    messages.extend(
         f"{issue.field} {issue.requirement}".strip()
-        for issue in _validation_issues(error, arguments)
-    ]
+        for issue in issues
+        if issue.kind not in {"missing", "extra_forbidden"}
+    )
     return "; ".join(messages) or "request is invalid"
 
 
@@ -254,6 +274,20 @@ def _request_provenance(context: Context[Any, Any] | None) -> dict[str, Any]:
             "name": params.client_info.name,
             "version": params.client_info.version,
         }
+    meta = request_context.meta
+    raw = meta.get("qwen-code/invocation") if isinstance(meta, dict) else None
+    if isinstance(raw, dict) and raw.get("version") == 1:
+        session_id = raw.get("sessionId")
+        prompt_id = raw.get("promptId")
+        if all(isinstance(value, str) and value.strip() for value in (session_id, prompt_id)):
+            conversation = {
+                "client": "qwen",
+                "session_id": session_id,
+                "prompt_id": prompt_id,
+            }
+            if request_context.request_id is not None:
+                conversation["mcp_request_id"] = str(request_context.request_id)
+            result["conversation"] = conversation
     return result
 
 
@@ -276,61 +310,188 @@ def _request_invocation_id(context: Context[Any, Any] | None) -> str | None:
 
 
 def _action_requirement(
-    discriminator: str, action: str, required: tuple[str, ...]
+    discriminator: str,
+    action: str,
+    required: list[str],
+    constraints: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
+    then: dict[str, Any] = {}
+    if required:
+        # Qwen's draft-07 validator renders a dependency as one grouped error,
+        # rather than reporting only the first missing member of ``required``.
+        then["dependencies"] = {discriminator: required}
+    if constraints:
+        then["properties"] = constraints
     return {
         "if": {
             "properties": {discriminator: {"const": action}},
             "required": [discriminator],
         },
-        # Qwen's draft-07 validator renders a dependency as one grouped error,
-        # rather than reporting only the first missing member of ``required``.
-        "then": {"dependencies": {discriminator: list(required)}},
+        "then": then,
     }
 
 
-def _direct_structured_schema(
-    schema: dict[str, Any], definitions: dict[str, Any]
-) -> dict[str, Any] | None:
-    candidates = [schema]
-    selected: dict[str, Any] | None = None
-    kind: Literal["object", "array"] | None = None
+def _non_null_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    variants = schema.get("anyOf")
+    if not isinstance(variants, list):
+        return deepcopy(schema)
+    non_null = [
+        variant
+        for variant in variants
+        if isinstance(variant, dict) and variant.get("type") != "null"
+    ]
+    if len(non_null) == 1 and len(non_null) != len(variants):
+        return deepcopy(non_null[0])
+    return deepcopy(schema)
+
+
+def _direct_argument_schema(schema: dict[str, Any], definitions: dict[str, Any]) -> dict[str, Any]:
+    selected = _non_null_schema(schema)
     description = schema.get("description")
-    visited_references: set[str] = set()
-    while candidates:
-        candidate = candidates.pop(0)
-        if description is None:
-            description = candidate.get("description")
-        nested = candidate.get("anyOf")
-        if isinstance(nested, list):
-            candidates.extend(item for item in nested if isinstance(item, dict))
-            continue
-        candidate_kind = candidate.get("type")
-        if candidate_kind in {"object", "array"}:
-            selected = deepcopy(candidate)
-            kind = candidate_kind
+    visited: set[str] = set()
+    reference = selected.get("$ref")
+    while (
+        isinstance(reference, str) and reference.startswith("#/$defs/") and reference not in visited
+    ):
+        visited.add(reference)
+        resolved = definitions.get(reference.removeprefix("#/$defs/"))
+        if not isinstance(resolved, dict):
             break
-        reference = candidate.get("$ref")
-        if (
-            isinstance(reference, str)
-            and reference.startswith("#/$defs/")
-            and reference not in visited_references
-        ):
-            visited_references.add(reference)
-            resolved = definitions.get(reference.removeprefix("#/$defs/"))
-            if isinstance(resolved, dict):
-                candidates.append(resolved)
-    if selected is None or kind is None:
-        return None
-    requirement = f"Send a JSON {kind} value; do not JSON-encode it as a string."
-    selected["description"] = (
-        description
-        if isinstance(description, str) and requirement in description
-        else f"{description} {requirement}"
-        if description
-        else requirement
-    )
+        if description is None:
+            description = resolved.get("description")
+        selected = _non_null_schema(resolved)
+        reference = selected.get("$ref")
+    kind = selected.get("type")
+    if kind in {"object", "array"}:
+        requirement = f"Send a JSON {kind} value; do not JSON-encode it as a string."
+        selected["description"] = (
+            description
+            if isinstance(description, str) and requirement in description
+            else f"{description} {requirement}"
+            if description
+            else requirement
+        )
+    elif description is not None:
+        selected["description"] = description
+    if schema.get("default") is not None:
+        selected["default"] = schema["default"]
     return selected
+
+
+def _schema_constraints(schema: dict[str, Any]) -> dict[str, Any]:
+    direct = _non_null_schema(schema)
+    return {key: direct[key] for key in SCHEMA_CONSTRAINT_KEYS if key in direct}
+
+
+def _merge_model_constraints(properties: dict[str, Any], request_model: type[Any]) -> None:
+    model_properties = request_model.model_json_schema().get("properties", {})
+    for field in properties.keys() & model_properties.keys():
+        properties[field].update(_schema_constraints(model_properties[field]))
+
+
+def _action_variants(request_model: type[Any]) -> tuple[str, dict[str, dict[str, Any]]]:
+    schema = request_model.model_json_schema()
+    discriminator = schema["discriminator"]["propertyName"]
+    definitions = schema.get("$defs", {})
+    variants: dict[str, dict[str, Any]] = {}
+    for action, reference in schema["discriminator"]["mapping"].items():
+        variants[action] = definitions[reference.removeprefix("#/$defs/")]
+    return discriminator, variants
+
+
+def _add_field_dependencies(
+    result: dict[str, Any],
+    discriminator: str,
+    action_fields: dict[str, set[str] | frozenset[str]],
+) -> None:
+    all_actions = set(action_fields)
+    field_actions: defaultdict[str, set[str]] = defaultdict(set)
+    for action, fields in action_fields.items():
+        for field in fields:
+            field_actions[field].add(action)
+    dependencies = result.setdefault("dependencies", {})
+    for field, actions in sorted(field_actions.items()):
+        if field not in result.get("properties", {}) or actions == all_actions:
+            continue
+        allowed = sorted(actions)
+        discriminator_schema = {"const": allowed[0]} if len(allowed) == 1 else {"enum": allowed}
+        dependencies[field] = {
+            "properties": {discriminator: discriminator_schema},
+            "required": [discriminator],
+        }
+
+
+def _add_action_model_contract(result: dict[str, Any], request_model: type[Any]) -> None:
+    discriminator, variants = _action_variants(request_model)
+    global_required = set(result.get("required", []))
+    action_fields: dict[str, set[str]] = {}
+    for action, variant in variants.items():
+        variant_properties = variant.get("properties", {})
+        action_fields[action] = set(variant_properties) - {discriminator}
+        required = sorted(set(variant.get("required", [])) - global_required - {discriminator})
+        constraints = {
+            field: selected
+            for field, property_schema in variant_properties.items()
+            if field in result.get("properties", {})
+            and (selected := _schema_constraints(property_schema))
+        }
+        if required or constraints:
+            result.setdefault("allOf", []).append(
+                _action_requirement(discriminator, action, required, constraints)
+            )
+    _add_field_dependencies(result, discriminator, action_fields)
+
+
+def _field_value_dependency(
+    result: dict[str, Any], field: str, discriminator: str, values: set[str]
+) -> None:
+    allowed = sorted(values)
+    value_schema = {"const": allowed[0]} if len(allowed) == 1 else {"enum": allowed}
+    dependency = result.setdefault("dependencies", {}).setdefault(
+        field, {"properties": {}, "required": []}
+    )
+    dependency.setdefault("properties", {})[discriminator] = value_schema
+    required = dependency.setdefault("required", [])
+    if discriminator not in required:
+        required.append(discriminator)
+
+
+def _prune_definitions(schema: dict[str, Any]) -> None:
+    definitions = schema.get("$defs")
+    if not isinstance(definitions, dict):
+        return
+
+    def references(value: Any) -> set[str]:
+        if isinstance(value, dict):
+            found = {
+                reference.removeprefix("#/$defs/").split("/", 1)[0]
+                for reference in [value.get("$ref")]
+                if isinstance(reference, str) and reference.startswith("#/$defs/")
+            }
+            for key, nested in value.items():
+                if key != "$defs":
+                    found.update(references(nested))
+            return found
+        if isinstance(value, list):
+            found: set[str] = set()
+            for nested in value:
+                found.update(references(nested))
+            return found
+        return set()
+
+    retained = references(schema)
+    pending = list(retained)
+    while pending:
+        name = pending.pop()
+        for dependency in references(definitions.get(name)) - retained:
+            retained.add(dependency)
+            pending.append(dependency)
+    if retained:
+        schema["$defs"] = {
+            name: definition for name, definition in definitions.items() if name in retained
+        }
+    else:
+        schema.pop("$defs", None)
 
 
 def _public_input_schema(name: str, schema: dict[str, Any]) -> dict[str, Any]:
@@ -340,9 +501,10 @@ def _public_input_schema(name: str, schema: dict[str, Any]) -> dict[str, Any]:
     properties = result.get("properties", {})
     definitions = result.get("$defs", {})
     for field, property_schema in list(properties.items()):
-        direct = _direct_structured_schema(property_schema, definitions)
-        if direct is not None:
-            properties[field] = direct
+        properties[field] = _direct_argument_schema(property_schema, definitions)
+    request_model = SIMPLE_REQUEST_MODELS.get(name)
+    if request_model is not None:
+        _merge_model_constraints(properties, request_model)
     if name == "run_manage":
         properties["targets"]["description"] = (
             "Requested issue or pull-request references; required and non-empty when starting "
@@ -355,13 +517,9 @@ def _public_input_schema(name: str, schema: dict[str, Any]) -> dict[str, Any]:
             "as a string."
         )
     conditions = result.setdefault("allOf", [])
-    contract = ACTION_REQUIREMENTS.get(name)
-    if contract is not None:
-        discriminator, requirements = contract
-        conditions.extend(
-            _action_requirement(discriminator, action, required)
-            for action, required in requirements.items()
-        )
+    action_model = ACTION_REQUEST_MODELS.get(name)
+    if action_model is not None:
+        _add_action_model_contract(result, action_model)
     if name == "history_manage":
         conditions.append(
             {
@@ -385,20 +543,6 @@ def _public_input_schema(name: str, schema: dict[str, Any]) -> dict[str, Any]:
                 },
             }
         )
-        for field, action in (
-            ("source", "ingest"),
-            ("default_sha", "commit"),
-            ("full_history_complete", "commit"),
-        ):
-            conditions.append(
-                {
-                    "if": {"required": [field]},
-                    "then": {
-                        "properties": {"action": {"const": action}},
-                        "required": ["action"],
-                    },
-                }
-            )
     if name == "history_query":
         conditions.append(
             {
@@ -421,6 +565,16 @@ def _public_input_schema(name: str, schema: dict[str, Any]) -> dict[str, Any]:
             }
         )
     if name == "run_manage":
+        _add_field_dependencies(result, "action", RUN_ACTION_FIELDS)
+        field_workflows: defaultdict[str, set[str]] = defaultdict(set)
+        for workflow, fields in RUN_START_WORKFLOW_FIELDS.items():
+            for field in sorted(fields):
+                field_workflows[field].add(workflow)
+        field_workflows["pending"].update({"gh-curate-issues", "gh-implement-issue"})
+        field_workflows["outcome"].update({"gh-curate-issues", "gh-implement-issue"})
+        for field, workflows in sorted(field_workflows.items()):
+            _field_value_dependency(result, field, "workflow", workflows)
+        conditions.append(_action_requirement("action", "start", ["repository"], {}))
         conditions.append(
             {
                 "if": {
@@ -441,43 +595,49 @@ def _public_input_schema(name: str, schema: dict[str, Any]) -> dict[str, Any]:
                 },
             }
         )
+        conditions.extend(
+            (
+                {
+                    "if": {
+                        "properties": {"action": {"const": "directive"}},
+                        "required": ["action"],
+                    },
+                    "then": {
+                        "properties": {"workflow": {"const": "gh-audit-repo"}},
+                        "required": ["workflow"],
+                    },
+                },
+                {
+                    "if": {
+                        "properties": {"outcome": {"const": "blocked"}},
+                        "required": ["outcome"],
+                    },
+                    "then": {
+                        "required": ["note"],
+                        "properties": {
+                            "note": {"type": "string", "minLength": 1, "pattern": r"\S"}
+                        },
+                    },
+                },
+            )
+        )
     if not conditions:
         result.pop("allOf", None)
+    _prune_definitions(result)
     return result
 
 
 class WorkflowMCPServer(MCPServer[Any]):
     """Keep SDK and model diagnostics out of agent-facing tool results."""
 
-    def __init__(self, name: str, *, failures: feedback.FailureRegistry) -> None:
-        super().__init__(name)
-        self.failures = failures
-
     def _failure_message(
         self,
         name: str,
-        arguments: dict[str, Any],
         message: str,
-        context: Context[Any, Any] | None,
-        *,
-        failure_kind: str,
     ) -> str:
         if name == "workflow_feedback":
             return message
-        try:
-            reference = self.failures.record(
-                tool=name,
-                arguments=arguments,
-                failure_kind=failure_kind,
-                provenance=_request_provenance(context),
-            )
-        except Exception:  # pragma: no cover - feedback must never obscure the original failure
-            LOGGER.exception("Unable to retain MCP failure context")
-            return message
-        return (
-            f'{message} Consider workflow_feedback(message="what was confusing", '
-            f'error_ref="{reference}") if this is confusing or repeated API friction.'
-        )
+        return f'{message} If unclear, call workflow_feedback(message="what was confusing").'
 
     async def list_tools(self) -> list[Any]:
         tools = await super().list_tools()
@@ -501,16 +661,16 @@ class WorkflowMCPServer(MCPServer[Any]):
                 unknown = sorted(set(arguments) - set(properties))
                 if unknown:
                     if len(unknown) == 1:
-                        raise ToolError(f"{unknown[0]} is not accepted")
-                    raise ToolError(f"fields are not accepted: {', '.join(unknown)}")
+                        field = unknown[0]
+                        suggestion = get_close_matches(field, properties, n=1, cutoff=0.75)
+                        hint = f"; did you mean {suggestion[0]}?" if suggestion else ""
+                        raise ToolError(f"{field} is not accepted{hint}")
+                    raise ToolError(f"not accepted: {', '.join(unknown)}")
             return await super().call_tool(name, arguments, context)
         except UnexpectedToolError as error:
             message = self._failure_message(
                 name,
-                arguments,
                 "Internal tool failure; inspect server logs.",
-                context,
-                failure_kind="internal",
             )
             raise UnexpectedToolError(message) from error
         except ToolError as error:
@@ -527,10 +687,7 @@ class WorkflowMCPServer(MCPServer[Any]):
             raise ToolError(
                 self._failure_message(
                     name,
-                    arguments,
                     message,
-                    context,
-                    failure_kind="validation" if validation is not None else "domain",
                 )
             ) from error
 
@@ -557,24 +714,19 @@ def _request_call(handler: Any, request_model: type[Any], /, **values: Any) -> A
 
 def create_server(runtime: WorkflowRuntime) -> MCPServer:
     """Create a server whose tools operate on one validated workspace."""
-    mcp = WorkflowMCPServer(
-        "github-workflows",
-        failures=feedback.FailureRegistry(runtime.feedback_private_paths()),
-    )
+    mcp = WorkflowMCPServer("github-workflows")
 
     @mcp.tool(annotations=APPEND_WRITE, structured_output=True)
     def workflow_feedback(
-        message: str,
-        task_ref: str | None = None,
-        error_ref: str | None = None,
-        tool: str | None = None,
+        message: FeedbackMessage,
+        task_ref: FeedbackTaskRef | None = None,
+        tool: FeedbackToolName | None = None,
         context: Context[Any, Any] | None = None,
     ) -> dict[str, Any]:
-        """Record PHI-free friction; send a message, task_ref, error_ref, or tool name."""
+        """Record PHI-free friction; send a message and optional task_ref or tool name."""
         values = {
             "message": message,
             "task_ref": task_ref,
-            "error_ref": error_ref,
             "tool": tool,
         }
 
@@ -582,11 +734,9 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
             request = WorkflowFeedbackRequest.model_validate(
                 {name: value for name, value in values.items() if value is not None}
             )
-            failure_context = mcp.failures.resolve(error_ref) if error_ref is not None else None
             return runtime.workflow_feedback(
                 request,
                 provenance=_request_provenance(context),
-                failure_context=failure_context,
             )
 
         return _public_call(record)
@@ -595,16 +745,16 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
     def run_manage(
         action: Literal["start", "resume", "checkpoint", "directive", "pause", "abort", "finish"],
         workflow: WorkflowName,
-        repository: str | None = None,
-        n: int | None = None,
+        repository: RepositoryName | None = None,
+        n: PositiveInteger | None = None,
         targets: JsonArrayArgument[list[str] | None] = None,
-        instructions: str | None = None,
+        instructions: NonBlankString | None = None,
         refresh_history: bool | None = None,
         regression_sweep: bool | None = None,
         dry_run: bool | None = None,
         separate: bool | None = None,
         pending: JsonArrayArgument[list[str] | None] = None,
-        confirmed_source_sha: str | None = None,
+        confirmed_source_sha: FullSha | None = None,
         outcome: Literal["complete", "blocked"] | None = None,
         note: str | None = None,
     ) -> dict[str, Any]:
@@ -630,7 +780,7 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
             "integration_end",
         ],
         workflow: WorkflowName = "gh-audit-repo",
-        task_id: str | None = None,
+        task_id: NonBlankString | None = None,
         task: JsonObjectArgument[TaskPlan | None] = None,
         report: JsonObjectArgument[dict[str, Any] | None] = None,
         note: str | None = None,
@@ -645,7 +795,9 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
         )
 
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
-    def task_context(task_ref: str, history_cursor: str | None = None) -> dict[str, Any]:
+    def task_context(
+        task_ref: NonBlankString, history_cursor: NonBlankString | None = None
+    ) -> dict[str, Any]:
         """Resolve an exact returned task ref and optionally continue with an exact cursor."""
         return _public_call(runtime.task_context, task_ref, history_cursor)
 
@@ -655,10 +807,10 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
         workflow: WorkflowName = "gh-audit-repo",
         records: JsonArrayArgument[list[HistoryRecord] | None] = None,
         artifacts: JsonArrayArgument[list[HistoryArtifact] | None] = None,
-        source: str | None = None,
+        source: NonBlankString | None = None,
         fetched_at: str | None = None,
         full_history_complete: bool | None = None,
-        default_sha: str | None = None,
+        default_sha: FullSha | None = None,
     ) -> dict[str, Any]:
         """Manage a resumable compact GitHub index and report typed staging recovery state."""
         return _request_call(runtime.history_manage, HistoryManageRequest, **locals())
@@ -666,12 +818,12 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
     @mcp.tool(annotations=READ_ONLY, structured_output=True)
     def history_query(
         workflow: WorkflowName = "gh-audit-repo",
-        terms: str | None = None,
+        terms: NonBlankString | None = None,
         kind: Literal["issue", "pull"] | None = None,
         state: Literal["open", "closed"] | None = None,
-        cutoff: str | None = None,
+        cutoff: NonBlankString | None = None,
         linked: JsonArrayArgument[list[LinkedRecord] | None] = None,
-        limit: int | None = None,
+        limit: HistoryLimit | None = None,
     ) -> dict[str, Any]:
         """Search a bounded, selector-based GitHub history view."""
         return _request_call(runtime.history_query, HistoryQueryRequest, **locals())
@@ -682,7 +834,7 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
             "initialize", "refresh", "status", "program", "record_declared", "record_context"
         ],
         programs: JsonArrayArgument[list[ProgramProbe] | None] = None,
-        request_id: str | None = None,
+        request_id: NonBlankString | None = None,
         facts: JsonObjectArgument[dict[str, Any] | None] = None,
         fact: JsonObjectArgument[InventoryContextFact | None] = None,
     ) -> dict[str, Any]:
@@ -692,7 +844,7 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
     @mcp.tool(annotations=LOCAL_WRITE, structured_output=True)
     def audit_knowledge(
         action: Literal["reconcile", "update", "context", "show"],
-        area: str | None = None,
+        area: NonBlankString | None = None,
         areas: JsonArrayArgument[list[AreaDefinition] | None] = None,
         findings: JsonArrayArgument[list[KnowledgeFinding] | None] = None,
         versions: JsonObjectArgument[dict[str, str] | None] = None,
@@ -703,10 +855,10 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
     @mcp.tool(annotations=LOCAL_WRITE, structured_output=True)
     def audit_probe(
         kind: Literal["pytest", "python"],
-        probe_id: str,
-        candidate_id: str,
+        probe_id: NonBlankString,
+        candidate_id: NonBlankString,
         selectors: JsonArrayArgument[list[str] | None] = None,
-        code: str | None = None,
+        code: NonBlankString | None = None,
     ) -> dict[str, Any]:
         """Run and record one candidate probe, returning bounded output directly."""
         return _request_call(runtime.audit_probe, ProbeRequest, **locals())
@@ -728,7 +880,7 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
         shard: JsonObjectArgument[ShardRecordValue | None] = None,
         candidate: JsonObjectArgument[CandidateRecordValue | None] = None,
         verdict: JsonObjectArgument[VerdictRecordValue | None] = None,
-        limitation: str | None = None,
+        limitation: NonBlankString | None = None,
         pending: JsonArrayArgument[list[str] | None] = None,
         head_drift: JsonObjectArgument[dict[str, Any] | None] = None,
         activity: JsonObjectArgument[SupervisorActivityValue | None] = None,
@@ -739,10 +891,10 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
     @mcp.tool(annotations=CONTROL_WRITE, structured_output=True)
     def audit_publish(
         action: Literal["begin", "finish", "uncertain", "failed"],
-        candidate_id: str,
+        candidate_id: NonBlankString,
         operation: Literal["create", "update", "no-op", "close", "dry-run"] | None = None,
         receipt: JsonObjectArgument[dict[str, Any] | None] = None,
-        error: str | None = None,
+        error: NonBlankString | None = None,
     ) -> dict[str, Any]:
         """Begin publication or record its typed finish, uncertain, or failed outcome."""
         return _request_call(runtime.audit_publish, PublishRequest, **locals())

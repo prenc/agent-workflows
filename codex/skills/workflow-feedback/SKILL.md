@@ -98,11 +98,13 @@ when they share a demonstrated root cause and required correction. Report each
 group's IDs, evidence, confidence, consequence, proposed change, and expected
 disposition. A zero-item queue is a successful no-op.
 
-If the sanitized record is insufficient, explain the missing evidence.
-Ask the user before calling `agent-feedback trace` or opening
-any Qwen transcript. After permission, inspect only rows tied to the exact
-feedback and origin call IDs.
-Never scan, reproduce, or summarize the complete conversation.
+If the sanitized record is insufficient, run `agent-feedback trace <ref>`,
+which defaults to the three preceding tool interactions without payloads. If
+that is insufficient, retry with `--detail context` to include bounded visible
+user and assistant text. Never expose hidden reasoning. Ask the user before
+using `--detail data`; it adds bounded, sanitized payloads for those same tool
+calls. Inspect only the returned window and never scan, reproduce, or summarize
+the complete conversation.
 
 ## Implement authorized groups
 

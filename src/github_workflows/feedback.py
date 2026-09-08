@@ -9,22 +9,23 @@ import os
 import re
 import stat
 import subprocess
-import threading
-import time
+import textwrap
 import unicodedata
 import uuid
-from collections import OrderedDict
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 MAX_RECORD_BYTES = 8 * 1024
-MAX_FAILURE_BYTES = 4 * 1024
-FAILURE_LIMIT = 128
-FAILURE_TTL_SECONDS = 60 * 60
 SHORT_REF_LENGTH = 8
+TRACE_TOOL_LIMIT = 3
+TRACE_ROW_LIMIT = 12
+TRACE_MESSAGE_LIMIT = 4
+TRACE_MESSAGE_BYTES = 1024
+TRACE_CONTEXT_BYTES = 4 * 1024
+TRACE_PAYLOAD_BYTES = 4 * 1024
+TRACE_DATA_BYTES = 16 * 1024
 SAFE_SELECTOR_ARGUMENTS = frozenset({"action", "kind", "method", "workflow"})
 SAFE_ARGUMENT_NAMES = frozenset(
     {
@@ -297,66 +298,6 @@ def _encoded_size(value: Mapping[str, Any]) -> int:
     return len(json.dumps(value, sort_keys=True, separators=(",", ":")).encode())
 
 
-class FailureRegistry:
-    """Keep bounded, sanitized MCP failures available for optional feedback."""
-
-    def __init__(
-        self,
-        private_paths: list[tuple[Path, str]],
-        *,
-        limit: int = FAILURE_LIMIT,
-        ttl_seconds: float = FAILURE_TTL_SECONDS,
-    ) -> None:
-        self.replacements = _replacements(private_paths)
-        self.limit = limit
-        self.ttl_seconds = ttl_seconds
-        self._items: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
-        self._lock = threading.Lock()
-
-    def _prune(self, now: float) -> None:
-        while self._items:
-            reference, (created, _value) = next(iter(self._items.items()))
-            if now - created <= self.ttl_seconds and len(self._items) <= self.limit:
-                break
-            self._items.pop(reference)
-
-    def record(
-        self,
-        *,
-        tool: str,
-        arguments: Mapping[str, Any],
-        failure_kind: str,
-        provenance: Mapping[str, Any] | None = None,
-    ) -> str:
-        """Return a short reference to one sanitized failure snapshot."""
-        value = {
-            "tool": tool,
-            "origin": {
-                "failure_kind": failure_kind,
-                "invocation": _safe_invocation(arguments),
-            },
-            "provenance": _sanitize(dict(provenance or {}), self.replacements),
-        }
-        if _encoded_size(value) > MAX_FAILURE_BYTES:
-            value["provenance"] = {"omitted": "automatic failure provenance exceeded limit"}
-        if _encoded_size(value) > MAX_FAILURE_BYTES:  # pragma: no cover - fixed fields are bounded
-            raise ValueError("automatic failure snapshot exceeds internal limit")
-        reference = f"err-{uuid.uuid4().hex[:12]}"
-        now = time.monotonic()
-        with self._lock:
-            self._items[reference] = (now, value)
-            self._prune(now)
-        return reference
-
-    def resolve(self, reference: str) -> dict[str, Any] | None:
-        """Return one unexpired failure snapshot without consuming it."""
-        now = time.monotonic()
-        with self._lock:
-            self._prune(now)
-            item = self._items.get(reference)
-            return deepcopy(item[1]) if item is not None else None
-
-
 def append(
     *,
     message: str,
@@ -451,7 +392,7 @@ def append_manual(*, message: str, tool: str | None, workspace: Path) -> dict[st
     )
 
 
-def compact_records(
+def list_records(
     *,
     repository: str | None = None,
     workflow: str | None = None,
@@ -460,7 +401,7 @@ def compact_records(
     cutoff: str | None = None,
     limit: int | None = 50,
 ) -> list[dict[str, Any]]:
-    """Return newest matching records with globally resolvable short references."""
+    """Return newest matching complete records with resolvable short references."""
     if status not in {"open", "closed", "all"}:
         raise ValueError("feedback status must be open, closed, or all")
     if limit is not None and limit < 1:
@@ -490,7 +431,29 @@ def compact_records(
         }
         for record in selected
     ]
-    return _compact_list_records(selected_records)
+    return selected_records
+
+
+def compact_records(
+    *,
+    repository: str | None = None,
+    workflow: str | None = None,
+    sources: list[str] | None = None,
+    status: str = "open",
+    cutoff: str | None = None,
+    limit: int | None = 50,
+) -> list[dict[str, Any]]:
+    """Return bounded metadata for the newest matching records."""
+    return _compact_list_records(
+        list_records(
+            repository=repository,
+            workflow=workflow,
+            sources=sources,
+            status=status,
+            cutoff=cutoff,
+            limit=limit,
+        )
+    )
 
 
 def _compact_list_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -686,6 +649,128 @@ def _qwen_home() -> Path:
     return home
 
 
+FEEDBACK_ID = re.compile(r"^fb-[0-9a-f]{12}$")
+PROTECTED_TRACE_PATH = re.compile(
+    r"(?:^|[/\\])(?:data|\.env(?:\.[^/\\]+)?|\.envrc|credentials|id_rsa|id_ed25519)(?:$|[/\\])",
+    re.IGNORECASE,
+)
+PROTECTED_TRACE_SUFFIX = re.compile(r"\.(?:key|pem|p12|pfx)(?:$|[\s'\"])", re.IGNORECASE)
+
+
+def _hook_feedback_id(value: Any, *, depth: int = 0) -> str | None:
+    """Extract the feedback ID from the bounded shapes returned by Qwen tool hooks."""
+    if depth > 5:
+        return None
+    if isinstance(value, Mapping):
+        direct = value.get("feedback_id")
+        if isinstance(direct, str) and FEEDBACK_ID.fullmatch(direct):
+            return direct
+        for key in (
+            "structuredContent",
+            "structured_content",
+            "output",
+            "content",
+            "response",
+            "text",
+        ):
+            if key in value and (found := _hook_feedback_id(value[key], depth=depth + 1)):
+                return found
+    elif isinstance(value, list):
+        for item in value[:8]:
+            if found := _hook_feedback_id(item, depth=depth + 1):
+                return found
+    elif isinstance(value, str) and len(value) <= MAX_RECORD_BYTES * 2:
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        return _hook_feedback_id(decoded, depth=depth + 1)
+    return None
+
+
+def _portable_transcript(path_value: Any, root: Path) -> str:
+    if not isinstance(path_value, str) or not path_value.strip():
+        raise ValueError("feedback hook requires a transcript path")
+    path = Path(path_value).expanduser()
+    if not path.is_absolute():
+        raise ValueError("feedback transcript path must be absolute")
+    metadata = path.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise ValueError("feedback transcript must be a regular non-symlink file")
+    resolved_root = root.resolve()
+    resolved = path.resolve(strict=True)
+    try:
+        relative = resolved.relative_to(resolved_root)
+    except ValueError as error:
+        raise ValueError("feedback transcript must be under QWEN_HOME") from error
+    if (
+        not relative.parts
+        or relative.parts[0] != "projects"
+        or not any(part in {"chats", "subagents"} for part in relative.parts)
+    ):
+        raise ValueError("feedback transcript must be a Qwen project transcript")
+    return f"$QWEN_HOME/{relative.as_posix()}"
+
+
+def _locator_text(payload: Mapping[str, Any], name: str, *, required: bool = False) -> str | None:
+    value = payload.get(name)
+    if value is None and not required:
+        return None
+    if not isinstance(value, str) or not value.strip() or len(value) > 512:
+        raise ValueError(f"feedback hook {name} must be a bounded non-empty string")
+    return value.strip()
+
+
+def attach_qwen_locator(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Attach exact Qwen hook locators to one already-recorded feedback item."""
+    if payload.get("hook_event_name") != "PostToolUse":
+        raise ValueError("feedback locator hook requires PostToolUse")
+    if payload.get("tool_name") != "mcp__github_workflows__workflow_feedback":
+        raise ValueError("feedback locator hook received the wrong tool")
+    feedback_id = _hook_feedback_id(payload.get("tool_response"))
+    if feedback_id is None:
+        raise ValueError("feedback locator hook response has no feedback ID")
+    session_id = _locator_text(payload, "session_id", required=True)
+    transcript = _portable_transcript(payload.get("transcript_path"), _qwen_home())
+    additions = {
+        "client": "qwen",
+        "session_id": session_id,
+        "transcript": transcript,
+        "agent_id": _locator_text(payload, "agent_id"),
+        "tool_use_id": _locator_text(payload, "tool_use_id", required=True),
+        "tool_call_id": _locator_text(payload, "tool_call_id"),
+    }
+    additions = {key: value for key, value in additions.items() if value is not None}
+
+    path = storage_path()
+    if not path.is_file():
+        raise ValueError("feedback locator hook could not find the feedback store")
+    with _locked(path, exclusive=True):
+        records = _read(path)
+        record = _find_record(records, feedback_id)
+        provenance = record.setdefault("provenance", {})
+        if not isinstance(provenance, dict):
+            raise ValueError("feedback record has invalid provenance")
+        conversation = provenance.setdefault("conversation", {})
+        if not isinstance(conversation, dict):
+            raise ValueError("feedback record has invalid conversation provenance")
+        existing_session = conversation.get("session_id")
+        if existing_session is not None and existing_session != session_id:
+            raise ValueError("feedback hook session does not match the recorded session")
+        conflicts = [
+            key
+            for key, value in additions.items()
+            if key in conversation and conversation[key] != value
+        ]
+        if conflicts:
+            raise ValueError(f"feedback hook locator conflicts on {', '.join(sorted(conflicts))}")
+        conversation.update(additions)
+        if _encoded_size(record) > MAX_RECORD_BYTES:
+            raise ValueError("feedback locator would exceed the record limit")
+        _rewrite(path, records)
+    return {"attached": True, "feedback_id": feedback_id}
+
+
 def _candidate_transcripts(feedback_id: str, root: Path) -> list[Path]:
     projects = root / "projects"
     if not projects.is_dir():
@@ -715,14 +800,24 @@ def _candidate_transcripts(feedback_id: str, root: Path) -> list[Path]:
                         matches.append(path)
                 except OSError:
                     continue
-        return matches
+        return [path for path in matches if _valid_transcript_candidate(path, root)]
     if result.returncode not in {0, 1}:
         raise RuntimeError("could not search Qwen transcripts")
+    matches = [Path(line) for line in result.stdout.splitlines() if line]
     return [
-        Path(line)
-        for line in result.stdout.splitlines()
-        if line and any(part in {"chats", "subagents"} for part in Path(line).parts)
+        path
+        for path in matches
+        if any(part in {"chats", "subagents"} for part in path.parts)
+        and _valid_transcript_candidate(path, root)
     ]
+
+
+def _valid_transcript_candidate(path: Path, root: Path) -> bool:
+    try:
+        _portable_transcript(str(path), root)
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def _parts(record: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -748,52 +843,7 @@ def _result_from_parts(record: Mapping[str, Any]) -> dict[str, Any] | None:
 
 
 def _result_feedback_id(result: Mapping[str, Any]) -> str | None:
-    response = result.get("response")
-    output = response.get("output") if isinstance(response, Mapping) else None
-    if not isinstance(output, str):
-        return None
-    try:
-        payload = json.loads(output)
-    except json.JSONDecodeError:
-        return None
-    value = payload.get("feedback_id") if isinstance(payload, dict) else None
-    return value if isinstance(value, str) else None
-
-
-def _normalize_tool_name(name: Any) -> str:
-    rendered = str(name or "")
-    return rendered.rsplit("__", 1)[-1] if rendered.startswith("mcp__") else rendered
-
-
-def _origin_trace(
-    transcript: list[dict[str, Any]],
-    result_index: int,
-    *,
-    error_ref: str | None,
-    tool: str | None,
-) -> dict[str, Any] | None:
-    for item in reversed(transcript[:result_index]):
-        result = _result_from_parts(item)
-        if result is None:
-            continue
-        name = result.get("name")
-        response = result.get("response")
-        call_id = result.get("id")
-        if name == "mcp__github_workflows__workflow_feedback":
-            continue
-        if error_ref is not None and error_ref in json.dumps(response, sort_keys=True):
-            return {
-                "match": "exact-error-ref",
-                "tool": name,
-                "tool_call_id": call_id,
-            }
-        if (
-            error_ref is None
-            and tool is not None
-            and _normalize_tool_name(name) == _normalize_tool_name(tool)
-        ):
-            return {"match": "nearest-tool", "tool": name, "tool_call_id": call_id}
-    return None
+    return _hook_feedback_id(result.get("response"))
 
 
 def _read_transcript(path: Path) -> list[dict[str, Any]]:
@@ -812,13 +862,181 @@ def _read_transcript(path: Path) -> list[dict[str, Any]]:
     return transcript
 
 
-def trace(feedback_id: str) -> dict[str, Any]:
-    """Locate the feedback call in Qwen transcripts without returning conversation data."""
+def _stored_transcript(record: Mapping[str, Any], root: Path) -> Path | None:
+    provenance = record.get("provenance")
+    conversation = provenance.get("conversation") if isinstance(provenance, Mapping) else None
+    value = conversation.get("transcript") if isinstance(conversation, Mapping) else None
+    if not isinstance(value, str) or not value.startswith("$QWEN_HOME/"):
+        return None
+    candidate = root / value.removeprefix("$QWEN_HOME/")
+    try:
+        portable = _portable_transcript(str(candidate), root)
+    except (OSError, ValueError):
+        return None
+    return candidate if portable == value else None
+
+
+def _trace_paths(record: Mapping[str, Any], feedback_id: str, root: Path) -> list[Path]:
+    direct = _stored_transcript(record, root)
+    if direct is not None:
+        try:
+            with direct.open(encoding="utf-8", errors="replace") as stream:
+                if any(feedback_id in line for line in stream):
+                    return [direct]
+        except OSError:
+            pass
+    return _candidate_transcripts(feedback_id, root)
+
+
+def _find_call(
+    transcript: list[dict[str, Any]], before: int, call_id: str
+) -> tuple[int, dict[str, Any]] | None:
+    for index in range(before - 1, -1, -1):
+        if call := _call_from_parts(transcript[index], call_id):
+            return index, call
+    return None
+
+
+def _result_failed(result: Mapping[str, Any]) -> bool:
+    response = result.get("response")
+    return bool(
+        result.get("isError")
+        or result.get("is_error")
+        or (isinstance(response, Mapping) and (response.get("isError") or response.get("is_error")))
+    )
+
+
+def _recent_tools(transcript: list[dict[str, Any]], before: int) -> list[dict[str, Any]]:
+    interactions: list[dict[str, Any]] = []
+    for result_index in range(before - 1, -1, -1):
+        result = _result_from_parts(transcript[result_index])
+        if result is None or result.get("name") == "mcp__github_workflows__workflow_feedback":
+            continue
+        call_id = str(result.get("id") or "")
+        found = _find_call(transcript, result_index, call_id) if call_id else None
+        call_index, call = found if found is not None else (result_index, {})
+        interactions.append(
+            {
+                "tool": result.get("name") or call.get("name"),
+                "tool_call_id": call_id or None,
+                "timestamp": transcript[result_index].get("timestamp"),
+                "status": "error" if _result_failed(result) else "success",
+                "_call_index": call_index,
+                "_args": call.get("args"),
+                "_response": result.get("response"),
+            }
+        )
+        if len(interactions) == TRACE_TOOL_LIMIT:
+            break
+    interactions.reverse()
+    return interactions
+
+
+def _truncate_text(value: str, limit: int) -> str:
+    encoded = value.encode()
+    if len(encoded) <= limit:
+        return value
+    return encoded[: max(0, limit - 3)].decode(errors="ignore").rstrip() + "..."
+
+
+def _visible_context(
+    transcript: list[dict[str, Any]], before: int, replacements: list[tuple[str, str]]
+) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    total = 0
+    for item in transcript[max(0, before - TRACE_ROW_LIMIT) : before]:
+        message = item.get("message")
+        role = message.get("role") if isinstance(message, Mapping) else None
+        if role not in {"user", "assistant", "model"}:
+            continue
+        texts: list[str] = []
+        for part in _parts(item):
+            if any(key in part for key in ("thought", "thoughtSignature", "reasoning")):
+                continue
+            value = part.get("text")
+            if isinstance(value, str) and value.strip():
+                texts.append(value.strip())
+        if not texts:
+            continue
+        text = str(_sanitize("\n".join(texts), replacements))
+        remaining = TRACE_CONTEXT_BYTES - total
+        if remaining <= 0:
+            break
+        text = _truncate_text(text, min(TRACE_MESSAGE_BYTES, remaining))
+        total += len(text.encode())
+        messages.append(
+            {
+                "role": "assistant" if role == "model" else role,
+                "timestamp": item.get("timestamp"),
+                "text": text,
+            }
+        )
+    return messages[-TRACE_MESSAGE_LIMIT:]
+
+
+def _protected_trace_value(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        return any(_protected_trace_value(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_protected_trace_value(item) for item in value)
+    return isinstance(value, str) and bool(
+        PROTECTED_TRACE_PATH.search(value) or PROTECTED_TRACE_SUFFIX.search(value)
+    )
+
+
+def _trace_payload(value: Any, replacements: list[tuple[str, str]]) -> Any:
+    if _protected_trace_value(value):
+        return {"omitted": "payload references a protected path"}
+    sanitized = _sanitize(value, replacements)
+    size = len(json.dumps(sanitized, sort_keys=True, default=str).encode())
+    if size > TRACE_PAYLOAD_BYTES:
+        return {"truncated": True, "type": _value_kind(value), "bytes": size}
+    return sanitized
+
+
+def _public_tools(
+    interactions: list[dict[str, Any]], detail: str, replacements: list[tuple[str, str]]
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    total = 0
+    for interaction in interactions:
+        item = {
+            key: value
+            for key, value in interaction.items()
+            if not key.startswith("_") and value is not None
+        }
+        if detail == "data":
+            protected = _protected_trace_value(
+                [interaction.get("_args"), interaction.get("_response")]
+            )
+            if protected:
+                omitted = {"omitted": "interaction references a protected path"}
+                item["input"] = omitted
+                item["response"] = omitted
+            else:
+                for public, private in (("input", "_args"), ("response", "_response")):
+                    payload = _trace_payload(interaction.get(private), replacements)
+                    size = len(json.dumps(payload, sort_keys=True, default=str).encode())
+                    if total + size > TRACE_DATA_BYTES:
+                        item[public] = {"omitted": "trace data limit reached"}
+                    else:
+                        item[public] = payload
+                        total += size
+        result.append(item)
+    return result
+
+
+def trace(feedback_id: str, *, detail: str = "tools") -> dict[str, Any]:
+    """Return progressively detailed context around an exact Qwen feedback call."""
+    if detail not in {"tools", "context", "data"}:
+        raise ValueError("feedback trace detail must be tools, context, or data")
     record = find(feedback_id)
     actual_id = str(record["feedback_id"])
     root = _qwen_home()
     matches: list[dict[str, Any]] = []
-    for path in _candidate_transcripts(actual_id, root):
+    provenance = record.get("provenance")
+    locator = provenance.get("conversation") if isinstance(provenance, Mapping) else None
+    for path in _trace_paths(record, actual_id, root):
         try:
             transcript = _read_transcript(path)
         except OSError:
@@ -832,56 +1050,29 @@ def trace(feedback_id: str) -> dict[str, Any]:
             ):
                 continue
             call_id = str(result.get("id") or "")
-            feedback_call = next(
-                (
-                    call
-                    for prior in reversed(transcript[:index])
-                    if (call := _call_from_parts(prior, call_id)) is not None
-                ),
-                None,
-            )
-            call_arguments = feedback_call.get("args") if feedback_call else None
-            error_ref = (
-                call_arguments.get("error_ref")
-                if isinstance(call_arguments, Mapping)
-                and isinstance(call_arguments.get("error_ref"), str)
-                else None
-            )
-            if error_ref is None:
-                origin = record.get("origin")
-                error_ref = (
-                    origin.get("error_ref")
-                    if isinstance(origin, Mapping) and isinstance(origin.get("error_ref"), str)
-                    else None
-                )
-            try:
-                relative = path.relative_to(root)
-                display_path = (
-                    f"$QWEN_HOME/{relative}"
-                    if os.environ.get("QWEN_HOME")
-                    else f"~/.qwen/{relative}"
-                )
-            except ValueError:
-                display_path = str(path)
+            found = _find_call(transcript, index, call_id) if call_id else None
+            call_index = found[0] if found is not None else index
+            relative = path.resolve().relative_to(root.resolve())
+            display_path = f"$QWEN_HOME/{relative.as_posix()}"
+            interactions = _recent_tools(transcript, call_index)
+            replacements = _replacements([(root, "$QWEN_HOME"), (Path.home(), "<home>")])
             match: dict[str, Any] = {
                 "timestamp": item.get("timestamp"),
-                "session_id": item.get("sessionId"),
-                "agent_id": item.get("agentId"),
+                "session_id": (locator or {}).get("session_id") or item.get("sessionId"),
+                "prompt_id": (locator or {}).get("prompt_id"),
+                "agent_id": (locator or {}).get("agent_id") or item.get("agentId"),
+                "mcp_request_id": (locator or {}).get("mcp_request_id"),
+                "feedback_tool_use_id": (locator or {}).get("tool_use_id"),
                 "feedback_tool_call_id": call_id or None,
                 "transcript": display_path,
+                "tools": _public_tools(interactions, detail, replacements),
             }
-            origin_trace = _origin_trace(
-                transcript,
-                index,
-                error_ref=error_ref,
-                tool=record.get("tool") if isinstance(record.get("tool"), str) else None,
-            )
-            if origin_trace is not None:
-                match["origin"] = origin_trace
+            if detail in {"context", "data"}:
+                match["messages"] = _visible_context(transcript, call_index, replacements)
             matches.append({key: value for key, value in match.items() if value is not None})
     if not matches:
         raise ValueError("feedback was not found in Qwen transcripts")
-    return {"feedback_id": actual_id, "matches": matches}
+    return {"feedback_id": actual_id, "detail": detail, "matches": matches}
 
 
 def find(feedback_id: str) -> dict[str, Any]:
@@ -1115,20 +1306,6 @@ def _display_time(value: Any) -> str:
     return localized.strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
-def _display_date(value: Any) -> str:
-    try:
-        parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
-        return str(value or "-")
-    try:
-        localized = parsed.astimezone()
-        if localized.tzinfo is None or not localized.tzname():
-            raise ValueError("system timezone is unavailable")
-    except (OSError, ValueError):
-        localized = parsed.astimezone(FALLBACK_EDT)
-    return localized.strftime("%Y-%m-%d")
-
-
 def _one_line(value: Any) -> str:
     raw = str(value or "-")
     visible = "".join(
@@ -1151,30 +1328,84 @@ def _bounded(value: Any, width: int) -> str:
     return rendered if len(rendered) <= width else rendered[: max(1, width - 1)] + "…"
 
 
-def format_compact_records(records: list[dict[str, Any]], *, width: int) -> str:
-    """Render each compact feedback record on exactly one line."""
+def _metadata_widths(headers: list[str], rows: list[list[str]], width: int) -> list[int]:
+    """Size columns to their content, shrinking payload columns only when needed."""
+    widths = [
+        max(len(header), *(len(row[index]) for row in rows)) for index, header in enumerate(headers)
+    ]
+    minimums = [len(header) for header in headers]
+    overflow = max(0, sum(widths) + 2 * (len(widths) - 1) - width)
+    for group in ((2, 3, 4), (0, 1)):
+        while overflow:
+            active = [index for index in group if widths[index] > minimums[index]]
+            if not active:
+                break
+            share = max(1, (overflow + len(active) - 1) // len(active))
+            for index in active:
+                reduction = min(share, widths[index] - minimums[index], overflow)
+                widths[index] -= reduction
+                overflow -= reduction
+                if not overflow:
+                    break
+    return widths
+
+
+def format_table(records: list[dict[str, Any]], *, width: int) -> str:
+    """Render readable metadata followed by each complete wrapped summary."""
     if not records:
         return "No feedback recorded."
     width = max(width, 100)
-    lines: list[str] = []
+    headers = ["ID", "WHEN (LOCAL)", "REPOSITORY", "CONTEXT", "SOURCE"]
+    rows: list[tuple[list[str], str]] = []
     for record in records:
-        status = _one_line(record.get("status"))
-        disposition = record.get("disposition")
-        if disposition:
-            status = f"{status}/{_one_line(disposition)}"
-        line = "  ".join(
+        provenance = record.get("provenance")
+        task = provenance.get("task") if isinstance(provenance, dict) else None
+        task_id = task.get("id") if isinstance(task, dict) else None
+        workflow = record.get("workflow")
+        context = (
+            str(task_id)
+            if width < 120 and task_id
+            else "/".join(str(item) for item in (workflow, task_id) if item) or "-"
+        )
+        rows.append(
             (
-                _one_line(record.get("ref") or record.get("feedback_id")),
-                _one_line(_display_date(record.get("timestamp"))),
-                _one_line(record.get("repository")),
-                _one_line(record.get("workflow")),
-                _one_line(record.get("source")),
-                status,
-                _one_line(record.get("summary")),
+                [
+                    _one_line(record.get("ref") or record.get("feedback_id")),
+                    _one_line(_display_time(record.get("timestamp"))),
+                    _one_line(record.get("repository")),
+                    _one_line(context),
+                    _one_line(source_name(record)),
+                ],
+                _one_line(record.get("message")),
             )
         )
-        lines.append(_bounded(line, width))
-    return "\n".join(lines)
+    widths = _metadata_widths(headers, [metadata for metadata, _summary in rows], width)
+    rendered = [
+        "  ".join(
+            _bounded(value, size).ljust(size) for value, size in zip(headers, widths, strict=True)
+        ),
+        "  ".join("-" * size for size in widths),
+    ]
+    summary_prefix = "  Summary: "
+    summary_indent = " " * len(summary_prefix)
+    for metadata, summary in rows:
+        rendered.append(
+            "  ".join(
+                _bounded(value, size).ljust(size)
+                for value, size in zip(metadata, widths, strict=True)
+            ).rstrip()
+        )
+        wrapped = textwrap.wrap(
+            summary,
+            width=max(20, width - len(summary_prefix)),
+            break_long_words=False,
+            break_on_hyphens=False,
+        ) or [""]
+        rendered.append(summary_prefix + wrapped[0])
+        rendered.extend(summary_indent + line for line in wrapped[1:])
+        rendered.append("")
+    rendered.pop()
+    return "\n".join(line.rstrip() for line in rendered)
 
 
 def format_feedback_summary(summary: Mapping[str, Any]) -> str:
@@ -1223,8 +1454,11 @@ def format_feedback_summary(summary: Mapping[str, Any]) -> str:
 
 
 def format_trace(result: Mapping[str, Any]) -> str:
-    """Render transcript locators without conversation content."""
-    lines = [f"Feedback: {_one_line(result['feedback_id'])}"]
+    """Render bounded progressive transcript context for a human."""
+    lines = [
+        f"Feedback: {_one_line(result['feedback_id'])}",
+        f"Detail: {_one_line(result.get('detail', 'tools'))}",
+    ]
     for index, match in enumerate(result.get("matches", []), 1):
         if index > 1:
             lines.append("")
@@ -1232,17 +1466,36 @@ def format_trace(result: Mapping[str, Any]) -> str:
             (
                 f"Transcript: {_one_line(match.get('transcript', '-'))}",
                 f"Session: {_one_line(match.get('session_id', '-'))}",
+                f"Prompt: {_one_line(match.get('prompt_id', '-'))}",
                 f"Agent: {_one_line(match.get('agent_id', '-'))}",
+                f"Tool use: {_one_line(match.get('feedback_tool_use_id', '-'))}",
                 f"Feedback call: {_one_line(match.get('feedback_tool_call_id', '-'))}",
                 f"Recorded: {_one_line(_display_time(match.get('timestamp')))}",
             )
         )
-        origin = match.get("origin")
-        if isinstance(origin, Mapping):
-            lines.append(
-                "Origin: "
-                f"{_one_line(origin.get('tool', '-'))} "
-                f"{_one_line(origin.get('tool_call_id', '-'))} "
-                f"({_one_line(origin.get('match', '-'))})"
+        tools = match.get("tools")
+        if isinstance(tools, list):
+            lines.append("Recent tools:")
+            for tool in tools:
+                if not isinstance(tool, Mapping):
+                    continue
+                lines.append(
+                    f"- {_one_line(tool.get('tool', '-'))} "
+                    f"{_one_line(tool.get('tool_call_id', '-'))} "
+                    f"({_one_line(tool.get('status', '-'))})"
+                )
+                if "input" in tool:
+                    rendered = json.dumps(tool["input"], sort_keys=True)
+                    lines.append(f"  Input: {_one_line(rendered)}")
+                if "response" in tool:
+                    rendered = json.dumps(tool["response"], sort_keys=True)
+                    lines.append(f"  Response: {_one_line(rendered)}")
+        messages = match.get("messages")
+        if isinstance(messages, list):
+            lines.append("Visible context:")
+            lines.extend(
+                f"- {_one_line(message.get('role', '-'))}: {_one_line(message.get('text', ''))}"
+                for message in messages
+                if isinstance(message, Mapping)
             )
     return "\n".join(lines)

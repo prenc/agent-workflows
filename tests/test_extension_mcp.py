@@ -13,6 +13,7 @@ from typing import Any
 from unittest import mock
 
 import pytest
+from jsonschema import Draft7Validator
 from mcp import Client
 from pydantic import ValidationError
 
@@ -281,7 +282,6 @@ class TestExtensionMcp:
                 assert set(feedback_properties) == {
                     "message",
                     "task_ref",
-                    "error_ref",
                     "tool",
                 }
                 assert tools["workflow_feedback"].annotations.idempotent_hint is False
@@ -292,10 +292,14 @@ class TestExtensionMcp:
                 assert "repository" in run_properties
                 assert "instructions" in run_properties
                 assert "confirmed_source_sha" in run_properties
-                assert set(run_properties["outcome"]["anyOf"][0]["enum"]) == {
+                assert set(run_properties["outcome"]["enum"]) == {
                     "complete",
                     "blocked",
                 }
+                for tool in tools.values():
+                    for property_schema in tool.input_schema.get("properties", {}).values():
+                        assert "anyOf" not in property_schema
+                        assert property_schema.get("default", object()) is not None
                 for name in (
                     "task_manage",
                     "history_manage",
@@ -415,8 +419,7 @@ class TestExtensionMcp:
                 ingest_contract = next(
                     condition["then"]
                     for condition in tools["history_manage"].input_schema["allOf"]
-                    if condition.get("if", {}).get("properties", {}).get("action", {}).get("const")
-                    == "ingest"
+                    if "oneOf" in condition.get("then", {})
                 )
                 assert [branch["required"] for branch in ingest_contract["oneOf"]] == [
                     ["records"],
@@ -461,7 +464,7 @@ class TestExtensionMcp:
                         repository="example/repo",
                         confirmed_source_sha="abc",
                     )
-                with pytest.raises(ValueError, match="does not accept fields"):
+                with pytest.raises(ValueError, match="does not accept"):
                     RunManageRequest(
                         action="start",
                         workflow="gh-curate-issues",
@@ -618,6 +621,182 @@ class TestExtensionMcp:
                 )
                 assert not finished.is_error
 
+    async def test_public_schemas_reject_static_argument_mistakes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="github-workflows-schema-") as directory:
+            root = Path(directory)
+            workspace = root / "repo"
+            workspace.mkdir()
+            runtime = WorkflowRuntime(workspace, root / "qwen-project")
+            tools = {tool.name: tool for tool in await create_server(runtime).list_tools()}
+
+        invalid = [
+            (
+                "workflow_feedback",
+                {
+                    "message": "Conflicting context",
+                    "error_ref": "err-0123456789ab",
+                },
+            ),
+            (
+                "run_manage",
+                {
+                    "action": "start",
+                    "workflow": "gh-implement-issue",
+                    "repository": "example/repo",
+                    "targets": ["#1"],
+                    "pending": [],
+                },
+            ),
+            (
+                "run_manage",
+                {
+                    "action": "finish",
+                    "workflow": "gh-implement-issue",
+                    "outcome": "blocked",
+                },
+            ),
+            (
+                "run_manage",
+                {
+                    "action": "start",
+                    "workflow": "gh-audit-repo",
+                    "repository": "example/repo",
+                    "separate": True,
+                },
+            ),
+            (
+                "run_manage",
+                {
+                    "action": "start",
+                    "workflow": "gh-audit-repo",
+                    "repository": "example/repo",
+                    "n": 0,
+                },
+            ),
+            (
+                "run_manage",
+                {
+                    "action": "start",
+                    "workflow": "gh-audit-repo",
+                    "repository": "example/repo",
+                    "confirmed_source_sha": "abc",
+                },
+            ),
+            (
+                "run_manage",
+                {
+                    "action": "start",
+                    "workflow": "gh-audit-repo",
+                    "repository": "example/repo",
+                    "note": None,
+                },
+            ),
+            (
+                "task_manage",
+                {"action": "plan", "task": {"logical_id": "task-1"}, "report": {}},
+            ),
+            (
+                "history_manage",
+                {"action": "commit", "records": []},
+            ),
+            (
+                "history_manage",
+                {
+                    "action": "ingest",
+                    "records": [{"kind": "issue", "number": 1}],
+                    "artifacts": [{"kind": "issue", "path": "issue.json"}],
+                },
+            ),
+            ("history_manage", {"action": "commit", "default_sha": "abc"}),
+            ("history_query", {}),
+            ("history_query", {"state": None}),
+            ("history_query", {"state": "open", "limit": 0}),
+            ("audit_inventory", {"action": "status", "facts": {}}),
+            ("audit_knowledge", {"action": "show", "findings": []}),
+            (
+                "audit_probe",
+                {
+                    "kind": "python",
+                    "probe_id": "probe-1",
+                    "candidate_id": "candidate-1",
+                    "code": "pass",
+                    "selectors": ["tests"],
+                },
+            ),
+            (
+                "audit_record",
+                {"action": "supervisor_finish", "phase": {"name": "source"}},
+            ),
+            (
+                "audit_publish",
+                {
+                    "action": "failed",
+                    "candidate_id": "candidate-1",
+                    "error": "publication failed",
+                    "receipt": {},
+                },
+            ),
+        ]
+        valid = [
+            ("workflow_feedback", {"message": "Clear workflow friction"}),
+            (
+                "run_manage",
+                {
+                    "action": "start",
+                    "workflow": "gh-implement-issue",
+                    "repository": "example/repo",
+                    "targets": ["#1"],
+                },
+            ),
+            (
+                "run_manage",
+                {"action": "checkpoint", "workflow": "gh-curate-issues", "pending": []},
+            ),
+            (
+                "run_manage",
+                {
+                    "action": "finish",
+                    "workflow": "gh-implement-issue",
+                    "outcome": "blocked",
+                    "note": "Maintainer input is required",
+                },
+            ),
+            ("task_manage", {"action": "plan", "task": {"logical_id": "task-1"}}),
+            (
+                "history_manage",
+                {"action": "ingest", "records": [{"kind": "issue", "number": 1}]},
+            ),
+            ("history_manage", {"action": "commit", "default_sha": "a" * 40}),
+            ("history_query", {"state": "open", "limit": 100}),
+            ("audit_inventory", {"action": "program", "programs": [{"name": "python"}]}),
+            ("audit_knowledge", {"action": "update", "area": "area/core", "findings": []}),
+            (
+                "audit_probe",
+                {
+                    "kind": "python",
+                    "probe_id": "probe-1",
+                    "candidate_id": "candidate-1",
+                    "code": "pass",
+                },
+            ),
+            ("audit_record", {"action": "pending", "pending": []}),
+            (
+                "audit_publish",
+                {"action": "uncertain", "candidate_id": "candidate-1", "receipt": {}},
+            ),
+        ]
+        for tool in tools.values():
+            Draft7Validator.check_schema(tool.input_schema)
+        for tool_name, arguments in invalid:
+            assert list(Draft7Validator(tools[tool_name].input_schema).iter_errors(arguments)), (
+                tool_name,
+                arguments,
+            )
+        for tool_name, arguments in valid:
+            assert not list(
+                Draft7Validator(tools[tool_name].input_schema).iter_errors(arguments)
+            ), (tool_name, arguments)
+
     @pytest.mark.parametrize("targets", [[""], ["   "], ["#5", "\t"]])
     def test_run_manage_rejects_blank_target_references(self, targets: list[str]) -> None:
         with pytest.raises(ValueError, match="targets must contain only non-blank references"):
@@ -650,7 +829,9 @@ class TestExtensionMcp:
             ) as client:
                 unknown = await client.call_tool("run_manage", {**base, "target": ["#5"]})
                 assert unknown.is_error
-                assert unknown.content[0].text.startswith("target is not accepted")
+                assert unknown.content[0].text.startswith(
+                    "target is not accepted; did you mean targets?"
+                )
                 assert not runtime.current(workflow).exists()
 
                 malformed = await client.call_tool("run_manage", {**base, "targets": 5})
@@ -676,7 +857,7 @@ class TestExtensionMcp:
                 )
                 assert start_pending.is_error
                 assert start_pending.content[0].text.startswith(
-                    "start does not accept fields: ['pending']"
+                    "action=start does not accept pending"
                 )
                 assert not runtime.current(workflow).exists()
 
@@ -800,6 +981,18 @@ class TestExtensionMcp:
                     {"action": "reconcile"},
                 )
                 assert missing.is_error
+                mismatched = await client.call_tool(
+                    "audit_probe",
+                    {
+                        "kind": "python",
+                        "probe_id": "probe-1",
+                        "candidate_id": "candidate-1",
+                        "selectors": ["tests"],
+                    },
+                )
+                assert mismatched.content[0].text.startswith(
+                    "kind=python requires code; kind=python does not accept selectors"
+                )
                 invalid_calls = [
                     ("run_manage", {}),
                     ("run_status", {}),
@@ -818,7 +1011,6 @@ class TestExtensionMcp:
                 internal_diagnostic = re.compile(
                     r"validation errors?|input_(?:value|type)|errors\.pydantic|Traceback"
                 )
-                failure_reference = None
                 for tool_name, arguments in invalid_calls:
                     result = await client.call_tool(tool_name, arguments)
                     assert result.is_error
@@ -826,20 +1018,21 @@ class TestExtensionMcp:
                     message = result.content[0].text
                     assert "\n" not in message
                     assert internal_diagnostic.search(message) is None
-                    references = re.findall(r'error_ref="(err-[0-9a-f]{12})"', message)
+                    assert "Consider workflow_feedback" not in message
                     if tool_name == "workflow_feedback":
-                        assert references == []
+                        assert "If unclear" not in message
                     else:
-                        assert len(references) == 1
-                        failure_reference = failure_reference or references[0]
+                        assert message.endswith(
+                            'If unclear, call workflow_feedback(message="what was confusing").'
+                        )
 
-                assert failure_reference is not None
+                qwen_meta = self.invocation_context(
+                    "session-feedback", "prompt-feedback"
+                ).request_context.meta
                 recorded = await client.call_tool(
                     "workflow_feedback",
-                    {
-                        "message": "The rejected request was difficult to correct",
-                        "error_ref": failure_reference,
-                    },
+                    {"message": "The rejected request was difficult to correct"},
+                    meta=qwen_meta,
                 )
                 assert not recorded.is_error
                 assert recorded.structured_content["context_attached"] is True
@@ -848,19 +1041,13 @@ class TestExtensionMcp:
                     == recorded.structured_content["feedback_id"][-8:]
                 )
                 stored = feedback.find(recorded.structured_content["feedback_id"])
-                assert stored["tool"]
                 assert stored["provenance"]["client"]["name"]
                 assert stored["provenance"]["server_version"]
-
-                expired = await client.call_tool(
-                    "workflow_feedback",
-                    {
-                        "message": "A failure reference was no longer available",
-                        "error_ref": "err-000000000000",
-                    },
-                )
-                assert not expired.is_error
-                assert expired.structured_content["context_attached"] is False
+                conversation = stored["provenance"]["conversation"]
+                assert conversation["client"] == "qwen"
+                assert conversation["session_id"] == "session-feedback"
+                assert conversation["prompt_id"] == "prompt-feedback"
+                assert conversation["mcp_request_id"]
                 assert not (await client.call_tool("run_manage", request)).is_error
                 replaced = await client.call_tool("run_manage", request)
                 assert not replaced.is_error
@@ -880,7 +1067,9 @@ class TestExtensionMcp:
                     item.text for item in crashed.content if hasattr(item, "text")
                 )
                 assert sentinel not in public_crash
-                assert re.search(r'error_ref="err-[0-9a-f]{12}"', public_crash)
+                assert public_crash.endswith(
+                    'If unclear, call workflow_feedback(message="what was confusing").'
+                )
                 assert any(record.exc_info for record in caplog.records)
 
     def test_task_references_disambiguate_workflows_and_reject_stale_runs(self) -> None:
@@ -1754,6 +1943,11 @@ class TestExtensionMcp:
         assert "run_shell_command" in configured_hook["matcher"]
         hook_command = configured_hook["hooks"][0]["command"]
         assert "${extensionPath}" in hook_command
+        locator_hook = hooks["hooks"]["PostToolUse"][0]
+        assert locator_hook["matcher"] == "^mcp__github_workflows__workflow_feedback$"
+        assert locator_hook["hooks"][0]["command"].endswith(
+            "agent-workflows _feedback-locator-hook"
+        )
         assert (EXTENSION / "hooks/guard-audit-boundary.py").stat().st_mode & 0o111
         assert "${extensionPath}" in server["command"]
         assert (
@@ -1904,6 +2098,9 @@ class TestExtensionMcp:
     def test_implementation_guidance_requires_evidence_based_validation_and_drafts(self) -> None:
         supervisor = (EXTENSION / "skills/gh-implement-issue/SKILL.md").read_text(encoding="utf-8")
         worker = (EXTENSION / "agents/gh-implement-issue-worker.md").read_text(encoding="utf-8")
+        runtime_policy = (EXTENSION / "references/github-runtime-policy.md").read_text(
+            encoding="utf-8"
+        )
 
         for document in (supervisor, worker):
             assert all(
@@ -1920,16 +2117,9 @@ class TestExtensionMcp:
                 )
             )
 
-        assert all(
-            term in supervisor
-            for term in (
-                "object/null `anyOf` error",
-                "do not infer a payload-size limit",
-                "compact native structured object",
-                "checking nested object and array boundaries",
-                "corrected retry also fails",
-            )
-        )
+        assert "Omit optional" in runtime_policy
+        assert "explicit `null` is not accepted" in runtime_policy
+        assert "no workflow call occurred" in runtime_policy
         assert all(
             term in supervisor
             for term in ("GIT_TERMINAL_PROMPT=0", "push --dry-run", "exact remote")
@@ -2196,7 +2386,9 @@ class TestExtensionMcp:
                     "agent-feedback close --input <JSON|file|->",
                     "do not wrap it in a `resolutions` object",
                     "Prefer `--input -` with stdin",
-                    "Ask the user before calling `agent-feedback trace`",
+                    "defaults to the three preceding tool interactions",
+                    "Ask the user before",
+                    "using `--detail data`",
                     "permanent removal",
                     "commits, pushes, installation",
                     "MCP restart",

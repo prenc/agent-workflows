@@ -52,10 +52,13 @@ retains its canonical `fb-` ID for storage and transcript correlation.
 `feedback show <ref>...` returns complete records. Repeat `--source <name>` on
 `ls` to include one or more normalized tool sources.
 Use `feedback trace <feedback-id>`
-to locate the exact Qwen session and tool call without printing conversation
-content. Feedback stores PHI-free summaries and bounded call shapes only; raw
-tool arguments, responses, prompts, and source-data excerpts remain exclusively
-in the Qwen transcript.
+to locate the exact Qwen session, prompt, transcript, and feedback call. It
+shows the three preceding tool interactions without payloads by default;
+`--detail context` adds bounded visible conversation text and `--detail data`
+adds bounded sanitized payloads. Hidden reasoning is never returned. Feedback
+stores only the PHI-free summary and durable locator; transcript content remains
+in the Qwen transcript. Codex and manual CLI feedback remain unlinked until
+their clients expose reliable conversation metadata.
 Close reviewed records with `feedback close <feedback-id> [<feedback-id> ...]`, optionally
 selecting a disposition and a short PHI-free note; default lists
 show bounded metadata and summaries with the local date as one record per line;

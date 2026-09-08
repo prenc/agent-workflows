@@ -15,6 +15,66 @@ from pydantic import (
 )
 
 WorkflowName = Literal["gh-audit-repo", "gh-curate-issues", "gh-implement-issue"]
+NON_BLANK_PATTERN = r"\S"
+FULL_SHA_PATTERN = r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+REPOSITORY_PATTERN = r"^[^/\s]+/[^/\s]+$"
+
+type NonBlankString = Annotated[str, Field(pattern=NON_BLANK_PATTERN)]
+type PositiveInteger = Annotated[int, Field(strict=True, ge=1)]
+type HistoryLimit = Annotated[int, Field(strict=True, ge=1, le=100)]
+type FullSha = Annotated[str, Field(pattern=FULL_SHA_PATTERN)]
+type RepositoryName = Annotated[str, Field(pattern=REPOSITORY_PATTERN)]
+type FeedbackMessage = Annotated[
+    str,
+    Field(min_length=1, max_length=2000, pattern=NON_BLANK_PATTERN),
+]
+type FeedbackTaskRef = Annotated[
+    str,
+    Field(min_length=1, max_length=400, pattern=NON_BLANK_PATTERN),
+]
+type FeedbackToolName = Annotated[
+    str,
+    Field(min_length=1, max_length=200, pattern=NON_BLANK_PATTERN),
+]
+
+RUN_ACTION_FIELDS: dict[str, frozenset[str]] = {
+    "start": frozenset(
+        {
+            "repository",
+            "n",
+            "targets",
+            "instructions",
+            "refresh_history",
+            "regression_sweep",
+            "dry_run",
+            "separate",
+            "confirmed_source_sha",
+            "acknowledge_pending_publication",
+            "note",
+        }
+    ),
+    "resume": frozenset({"n", "note"}),
+    "checkpoint": frozenset({"pending", "note"}),
+    "directive": frozenset({"n", "instructions", "note"}),
+    "pause": frozenset({"note"}),
+    "abort": frozenset({"note"}),
+    "finish": frozenset({"outcome", "note"}),
+}
+
+RUN_START_WORKFLOW_FIELDS: dict[WorkflowName, frozenset[str]] = {
+    "gh-audit-repo": frozenset(
+        {
+            "instructions",
+            "refresh_history",
+            "regression_sweep",
+            "dry_run",
+            "confirmed_source_sha",
+            "acknowledge_pending_publication",
+        }
+    ),
+    "gh-curate-issues": frozenset({"targets", "refresh_history", "dry_run"}),
+    "gh-implement-issue": frozenset({"targets", "separate"}),
+}
 
 
 class StrictRequest(BaseModel):
@@ -32,47 +92,32 @@ class ExtensibleRecord(BaseModel):
 class WorkflowFeedbackRequest(StrictRequest):
     """One concise workflow or instruction observation with optional tool context."""
 
-    message: str = Field(
-        min_length=1,
-        max_length=2000,
+    message: FeedbackMessage = Field(
         description=(
             "Observed friction and consequence. For instruction friction, name the known "
             "layer or project-relative section without copying the complete instruction context."
         ),
     )
-    task_ref: str | None = Field(
+    task_ref: FeedbackTaskRef | None = Field(
         default=None,
-        min_length=1,
-        max_length=400,
         description="Exact worker task reference returned by task_context, when available.",
     )
-    error_ref: str | None = Field(
+    tool: FeedbackToolName | None = Field(
         default=None,
-        pattern=r"^err-[0-9a-f]{12}$",
-        description="Short reference included in a failed github-workflows MCP call.",
-    )
-    tool: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=200,
         description=(
-            "Native or external tool name when no MCP error_ref is available; never put "
-            "PHI, PII, prompts, or payload values in the feedback message."
+            "Native or external tool name for a confusing interaction; never put PHI, PII, "
+            "prompts, or payload values in the feedback message."
         ),
     )
 
-    @model_validator(mode="after")
-    def one_tool_context_source(self) -> WorkflowFeedbackRequest:
-        if self.error_ref is not None and self.tool is not None:
-            raise ValueError("error_ref cannot be combined with tool")
-        return self
-
-    @field_validator("message", "tool")
+    @field_validator("message", "tool", mode="before")
     @classmethod
-    def non_blank_text(cls, value: str | None) -> str | None:
-        if value is not None and not value.strip():
-            raise ValueError("text must not be blank")
-        return value.strip() if value is not None else None
+    def non_blank_text(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            if not value.strip():
+                raise ValueError("text must not be blank")
+            return value.strip()
+        return value
 
 
 class ActionRequest:
@@ -93,18 +138,17 @@ class RunManageRequest(StrictRequest):
 
     action: Literal["start", "resume", "checkpoint", "directive", "pause", "abort", "finish"]
     workflow: WorkflowName
-    repository: str | None = None
-    n: int | None = None
+    repository: RepositoryName | None = None
+    n: PositiveInteger | None = None
     targets: list[str] = Field(default_factory=list)
-    instructions: str | None = None
+    instructions: NonBlankString | None = None
     refresh_history: bool = False
     regression_sweep: bool = False
     dry_run: bool = False
     separate: bool = False
     pending: list[str] = Field(default_factory=list)
-    confirmed_source_sha: str | None = Field(
+    confirmed_source_sha: FullSha | None = Field(
         default=None,
-        pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
         description=(
             "Exact full local HEAD approved during audit preflight. The runtime rejects "
             "a changed source before creating run state or a worktree."
@@ -123,13 +167,6 @@ class RunManageRequest(StrictRequest):
             raise ValueError(f"{info.field_name} must be a positive integer")
         return value
 
-    @field_validator("instructions")
-    @classmethod
-    def non_empty_instructions(cls, value: str | None) -> str | None:
-        if value is not None and not value.strip():
-            raise ValueError("instructions must not be blank")
-        return value
-
     @field_validator("targets")
     @classmethod
     def non_blank_targets(cls, value: list[str]) -> list[str]:
@@ -139,8 +176,7 @@ class RunManageRequest(StrictRequest):
 
     @model_validator(mode="after")
     def validate_action_fields(self) -> RunManageRequest:
-        control = {"action", "workflow", "note", "outcome"}
-        supplied = self.model_fields_set - control
+        supplied = self.model_fields_set - {"action", "workflow"}
         if self.outcome is not None:
             if self.action != "finish":
                 raise ValueError("outcome is accepted only when finishing a workflow")
@@ -151,54 +187,23 @@ class RunManageRequest(StrictRequest):
         if self.action == "start":
             if not self.repository:
                 raise ValueError("start requires repository in OWNER/REPO form")
-            allowed = {
-                "repository",
-                "n",
-                "targets",
-                "instructions",
-                "refresh_history",
-                "regression_sweep",
-                "dry_run",
-                "separate",
-                "confirmed_source_sha",
-                "acknowledge_pending_publication",
-            }
-        elif self.action == "resume":
-            allowed = {"n"}
         elif self.action == "checkpoint":
-            allowed = {"pending"}
             if self.workflow == "gh-audit-repo" and "pending" in supplied:
                 raise ValueError("audit pending state must use audit_record")
         elif self.action == "directive":
             if self.workflow != "gh-audit-repo":
                 raise ValueError("directives are supported only by repository audits")
-            allowed = {"n", "instructions"}
-        else:
-            allowed = set()
+        allowed = RUN_ACTION_FIELDS[self.action]
         unexpected = supplied - allowed
         if unexpected:
-            raise ValueError(f"{self.action} does not accept fields: {sorted(unexpected)}")
+            fields = ", ".join(sorted(unexpected))
+            raise ValueError(f"action={self.action} does not accept {fields}")
         if self.action == "start":
-            workflow_fields = {
-                "gh-audit-repo": {
-                    "instructions",
-                    "refresh_history",
-                    "regression_sweep",
-                    "dry_run",
-                    "confirmed_source_sha",
-                    "acknowledge_pending_publication",
-                },
-                "gh-curate-issues": {
-                    "targets",
-                    "refresh_history",
-                    "dry_run",
-                },
-                "gh-implement-issue": {"targets", "separate"},
-            }[self.workflow]
-            common = {"repository", "n"}
-            irrelevant = supplied - common - workflow_fields
+            common = {"repository", "n", "note"}
+            irrelevant = supplied - common - RUN_START_WORKFLOW_FIELDS[self.workflow]
             if irrelevant:
-                raise ValueError(f"{self.workflow} does not accept fields: {sorted(irrelevant)}")
+                fields = ", ".join(sorted(irrelevant))
+                raise ValueError(f"workflow={self.workflow} does not accept {fields}")
             if self.workflow == "gh-implement-issue" and not self.targets:
                 raise ValueError("gh-implement-issue start requires at least one target")
         return self
@@ -240,7 +245,7 @@ class RunManageRequest(StrictRequest):
 class TaskPlan(StrictRequest):
     """One logical worker assignment; attempt identity is server-owned."""
 
-    logical_id: str
+    logical_id: NonBlankString
     role: str | None = None
     unit: str | None = None
     assignment: dict[str, Any] = Field(
@@ -272,7 +277,7 @@ class TaskPlanRequest(StrictRequest):
 class TaskRetryRequest(StrictRequest):
     action: Literal["retry"]
     workflow: WorkflowName = "gh-audit-repo"
-    task_id: str
+    task_id: NonBlankString
     task: TaskPlan | None = None
     note: str | None = None
 
@@ -280,14 +285,14 @@ class TaskRetryRequest(StrictRequest):
 class TaskTransitionRequest(StrictRequest):
     action: Literal["mark_running", "fail", "abandon"]
     workflow: WorkflowName = "gh-audit-repo"
-    task_id: str
+    task_id: NonBlankString
     note: str | None = None
 
 
 class TaskCheckpointRequest(StrictRequest):
     action: Literal["checkpoint"]
     workflow: WorkflowName = "gh-audit-repo"
-    task_id: str
+    task_id: NonBlankString
     report: dict[str, Any] = Field(description="Compact continuation report to retain atomically.")
     note: str | None = None
 
@@ -295,7 +300,7 @@ class TaskCheckpointRequest(StrictRequest):
 class TaskReportRequest(StrictRequest):
     action: Literal["complete"]
     workflow: WorkflowName = "gh-audit-repo"
-    task_id: str
+    task_id: NonBlankString
     report: dict[str, Any] = Field(
         description="Complete structured worker report to retain atomically."
     )
@@ -305,7 +310,7 @@ class TaskReportRequest(StrictRequest):
 class TaskIntegrationRequest(StrictRequest):
     action: Literal["integration_begin", "integration_end"]
     workflow: WorkflowName = "gh-audit-repo"
-    task_id: str
+    task_id: NonBlankString
     note: str | None = None
 
 
@@ -345,7 +350,7 @@ class HistoryRecord(ExtensibleRecord):
 
 class HistoryArtifact(StrictRequest):
     kind: Literal["issue", "pull"]
-    path: str
+    path: NonBlankString
 
 
 class HistoryPrepareRequest(StrictRequest):
@@ -363,7 +368,7 @@ class HistoryIngestRequest(StrictRequest):
     workflow: WorkflowName = "gh-audit-repo"
     records: list[HistoryRecord] = Field(default_factory=list, max_length=100)
     artifacts: list[HistoryArtifact] = Field(default_factory=list, max_length=100)
-    source: str = "github-mcp"
+    source: NonBlankString = "github-mcp"
     fetched_at: str | None = None
 
     @model_validator(mode="after")
@@ -378,9 +383,8 @@ class HistoryCommitRequest(StrictRequest):
     workflow: WorkflowName = "gh-audit-repo"
     fetched_at: str | None = None
     full_history_complete: bool | None = None
-    default_sha: str | None = Field(
+    default_sha: FullSha | None = Field(
         default=None,
-        pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
         description="Full immutable default-branch SHA represented by this committed history.",
     )
 
@@ -413,12 +417,12 @@ class HistoryQueryRequest(StrictRequest):
     """Search the committed GitHub history cache."""
 
     workflow: WorkflowName = "gh-audit-repo"
-    terms: str = ""
+    terms: NonBlankString = ""
     kind: Literal["issue", "pull"] | None = None
     state: Literal["open", "closed"] | None = None
-    cutoff: str | None = None
+    cutoff: NonBlankString | None = None
     linked: list[LinkedRecord] = Field(default_factory=list)
-    limit: int = Field(default=25, ge=1, le=100)
+    limit: HistoryLimit = 25
 
 
 class InventorySimpleRequest(StrictRequest):
@@ -426,9 +430,9 @@ class InventorySimpleRequest(StrictRequest):
 
 
 class ProgramProbe(StrictRequest):
-    name: str
+    name: NonBlankString
     arguments: list[str] = Field(default_factory=list)
-    request_id: str | None = None
+    request_id: NonBlankString | None = None
 
 
 class InventoryProgramRequest(StrictRequest):
@@ -444,16 +448,16 @@ class InventoryDeclaredRequest(StrictRequest):
 
 
 class InventoryContextFact(ExtensibleRecord):
-    kind: str
-    name: str
-    detail: str
+    kind: NonBlankString
+    name: NonBlankString
+    detail: NonBlankString
     observed: str | None = None
     disposition: Literal["confirmed", "disproved", "unavailable"] | None = None
 
 
 class InventoryContextRequest(StrictRequest):
     action: Literal["record_context"]
-    request_id: str | None = None
+    request_id: NonBlankString | None = None
     fact: InventoryContextFact
 
 
@@ -481,7 +485,7 @@ BoundaryList = Annotated[
 
 
 class AreaDefinition(StrictRequest):
-    area: str = Field(description="Canonical area/<slug> identifier.")
+    area: NonBlankString = Field(description="Canonical area/<slug> identifier.")
     title: str | None = None
     description: str
     paths: list[str]
@@ -499,7 +503,7 @@ class AreaDefinition(StrictRequest):
 
 class KnowledgeShowRequest(StrictRequest):
     action: Literal["show"]
-    area: str | None = None
+    area: NonBlankString | None = None
 
 
 class KnowledgeReconcileRequest(StrictRequest):
@@ -508,12 +512,12 @@ class KnowledgeReconcileRequest(StrictRequest):
 
 
 class KnowledgeFinding(StrictRequest):
-    title: str
-    question: str
-    kind: str
-    method: str
-    observed_result: str
-    conclusion: str
+    title: NonBlankString
+    question: NonBlankString
+    kind: NonBlankString
+    method: NonBlankString
+    observed_result: NonBlankString
+    conclusion: NonBlankString
     disposition: Literal["confirmed", "disproved"]
     evidence_paths: list[str] = Field(default_factory=list)
     dependencies: dict[str, str] = Field(default_factory=dict)
@@ -521,13 +525,13 @@ class KnowledgeFinding(StrictRequest):
 
 class KnowledgeContextRequest(StrictRequest):
     action: Literal["context"]
-    area: str
+    area: NonBlankString
     versions: dict[str, str] = Field(default_factory=dict)
 
 
 class KnowledgeUpdateRequest(StrictRequest):
     action: Literal["update"]
-    area: str
+    area: NonBlankString
     findings: list[KnowledgeFinding]
 
 
@@ -546,16 +550,16 @@ class KnowledgeRequest(ActionRequest, RootModel[KnowledgeAction]):
 
 class PytestProbeRequest(StrictRequest):
     kind: Literal["pytest"]
-    probe_id: str
-    candidate_id: str
+    probe_id: NonBlankString
+    candidate_id: NonBlankString
     selectors: list[str] = Field(min_length=1)
 
 
 class PythonProbeRequest(StrictRequest):
     kind: Literal["python"]
-    probe_id: str
-    candidate_id: str
-    code: str = Field(min_length=1)
+    probe_id: NonBlankString
+    candidate_id: NonBlankString
+    code: NonBlankString
 
 
 ProbeAction = Annotated[PytestProbeRequest | PythonProbeRequest, Field(discriminator="kind")]
@@ -606,7 +610,7 @@ class CandidateRecordValue(IdentifiedAuditValue):
 
 
 class VerdictRecordValue(ExtensibleRecord):
-    candidate_id: str = Field(min_length=1)
+    candidate_id: NonBlankString
 
     @model_validator(mode="before")
     @classmethod
@@ -638,7 +642,7 @@ class AuditVerdictRequest(StrictRequest):
 
 class AuditLimitationRequest(StrictRequest):
     action: Literal["limitation"]
-    limitation: str = Field(min_length=1)
+    limitation: NonBlankString
 
 
 class AuditPendingRequest(StrictRequest):
@@ -654,8 +658,7 @@ class AuditObjectRequest(StrictRequest):
 class SupervisorActivityValue(StrictRequest):
     """One exclusive material activity performed by the audit supervisor."""
 
-    kind: str = Field(
-        min_length=1,
+    kind: NonBlankString = Field(
         description="Stable short name for the supervisor activity being started.",
     )
     unit: str | None = Field(
@@ -693,26 +696,26 @@ class AuditRecordRequest(ActionRequest, RootModel[AuditRecordAction]):
 
 class PublishBeginRequest(StrictRequest):
     action: Literal["begin"]
-    candidate_id: str
+    candidate_id: NonBlankString
     operation: Literal["create", "update", "no-op", "close", "dry-run"]
 
 
 class PublishFinishRequest(StrictRequest):
     action: Literal["finish"]
-    candidate_id: str
+    candidate_id: NonBlankString
     receipt: dict[str, Any] = Field(min_length=1)
 
 
 class PublishUncertainRequest(StrictRequest):
     action: Literal["uncertain"]
-    candidate_id: str
+    candidate_id: NonBlankString
     receipt: dict[str, Any] = Field(default_factory=dict)
 
 
 class PublishFailedRequest(StrictRequest):
     action: Literal["failed"]
-    candidate_id: str
-    error: str = Field(min_length=1)
+    candidate_id: NonBlankString
+    error: NonBlankString
 
 
 PublishAction = Annotated[

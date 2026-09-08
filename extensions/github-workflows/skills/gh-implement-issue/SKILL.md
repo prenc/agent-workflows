@@ -372,12 +372,6 @@ Use an empty `validation_plan` only when preflight found no safe repository-owne
 test, formatter, interpreter, or compiler command, and record that limitation;
 never invent a command merely to make the list non-empty.
 Repository identity, documentation, and reference paths are server-derived.
-If client-side validation rejects `task` with an object/null `anyOf` error
-before the MCP call starts, do not infer a payload-size limit or repeat the
-identical call. Rebuild `task` once as a compact native structured object,
-checking nested object and array boundaries while preserving the assignment
-contract. If that corrected retry also fails, report the client validation
-limitation and stop rather than progressively splitting the assignment.
 Use its returned server-generated task ID and task reference, then launch
 `gh-implement-issue-worker` with fresh context and:
 

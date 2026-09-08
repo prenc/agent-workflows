@@ -1,5 +1,16 @@
 {
   "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "^mcp__github_workflows__workflow_feedback$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${extensionPath}/../../.venv/bin/agent-workflows _feedback-locator-hook"
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "(read_file|grep_search|glob|run_shell_command|mcp__github__issue_write|mcp__github__add_issue_comment)",

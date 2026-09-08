@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import re
@@ -16,6 +17,7 @@ from github_workflows import feedback
 from github_workflows.cli import (
     build_agent_feedback_parser,
     build_parser,
+    main,
     run_agent_feedback,
     run_feedback,
 )
@@ -335,82 +337,6 @@ def test_concurrent_feedback_appends_complete_json_lines(cache: Path) -> None:
     assert len(feedback.read_records()) == 12
 
 
-def test_failure_registry_sanitizes_bounds_and_expires(tmp_path: Path) -> None:
-    private = tmp_path / "workspace"
-    clock = 10.0
-    registry = feedback.FailureRegistry([(private, "<workspace>")], limit=2, ttl_seconds=5)
-    with mock.patch.object(feedback.time, "monotonic", side_effect=lambda: clock):
-        first = registry.record(
-            tool="run_manage",
-            arguments={
-                "action": "start",
-                "candidate_id": {"body": "private nested content"},
-                "instructions": "private user prompt",
-                "records": [{"body": "private issue body"}],
-                "path": str(private / "src"),
-                "token": "private",
-            },
-            failure_kind="validation",
-        )
-        stored = registry.resolve(first)
-        assert stored is not None
-        assert stored["origin"] == {
-            "failure_kind": "validation",
-            "invocation": {
-                "argument_types": {
-                    "action": "string",
-                    "candidate_id": "object",
-                    "instructions": "string",
-                    "records": "array",
-                },
-                "selectors": {"action": "start"},
-                "omitted": ["candidate_id", "instructions", "records"],
-                "complete": False,
-                "unknown_argument_count": 2,
-            },
-        }
-
-        registry.record(tool="run_status", arguments={}, failure_kind="domain")
-        third = registry.record(tool="task_manage", arguments={}, failure_kind="internal")
-        assert registry.resolve(first) is None
-        assert registry.resolve(third) is not None
-
-        clock = 16.0
-        assert registry.resolve(third) is None
-
-
-def test_failure_registry_omits_argument_values(tmp_path: Path) -> None:
-    registry = feedback.FailureRegistry([(tmp_path, "<workspace>")])
-    reference = registry.record(
-        tool="task_manage",
-        arguments={"report": "x" * feedback.MAX_FAILURE_BYTES},
-        failure_kind="validation",
-    )
-
-    stored = registry.resolve(reference)
-    assert stored is not None
-    assert stored["origin"]["invocation"] == {
-        "argument_types": {"report": "string"},
-        "complete": False,
-        "omitted": ["report"],
-    }
-
-
-def test_failure_registry_bounds_the_complete_snapshot(tmp_path: Path) -> None:
-    registry = feedback.FailureRegistry([(tmp_path, "<workspace>")])
-    reference = registry.record(
-        tool="task_manage",
-        arguments={"action": "complete"},
-        failure_kind="validation",
-        provenance={"client": {"name": "qwen"}},
-    )
-
-    stored = registry.resolve(reference)
-    assert stored is not None
-    assert feedback._encoded_size(stored) <= feedback.MAX_FAILURE_BYTES
-    assert stored["origin"]["invocation"]["complete"] is True
-
-
 def test_failed_append_restores_previous_file_length(cache: Path) -> None:
     append_feedback(message="Existing feedback")
     path = feedback.storage_path()
@@ -488,16 +414,17 @@ def test_failed_feedback_remove_preserves_the_store(cache: Path) -> None:
     assert feedback.find(str(result["feedback_id"]))["message"] == "Keep this item"
 
 
-def test_feedback_cli_lists_compact_records_and_shows_context(
+def test_feedback_cli_lists_readable_records_and_shows_context(
     cache: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     result = append_feedback()
     list_args = build_parser().parse_args(["feedback", "ls"])
     assert run_feedback(list_args) == 0
     table = capsys.readouterr().out
+    assert "WHEN (LOCAL)" in table
     assert "example/repo" in table
     assert "run-1" not in table
-    assert "The schema rejected a structured report" in table
+    assert "Summary: The schema rejected a structured report" in table
     assert "report must be an object" not in table
 
     list_args.json_output = True
@@ -548,6 +475,11 @@ def test_agent_feedback_cli_returns_json_without_format_flags(
 def test_agent_feedback_is_a_standalone_command() -> None:
     assert build_agent_feedback_parser().prog == "agent-feedback"
     assert "agent-feedback" not in build_parser().format_help()
+    assert build_agent_feedback_parser().parse_args(["trace", "12345678"]).detail == "tools"
+    assert (
+        build_parser().parse_args(["feedback", "trace", "12345678", "--detail", "data"]).detail
+        == "data"
+    )
 
 
 @pytest.mark.parametrize(
@@ -633,12 +565,10 @@ def test_feedback_cli_compact_json_is_bounded_and_metadata_only(
     args.json_output = False
     assert run_feedback(args) == 0
     rendered = capsys.readouterr().out.rstrip("\n")
-    assert len(rendered.splitlines()) == 1
-    assert "Summary: -" not in rendered
-    assert "external" in rendered
-    assert "word" in rendered
-    assert re.search(r"\b\d{4}-\d{2}-\d{2}\b", rendered)
-    assert not re.search(r"\b\d{2}:\d{2}:\d{2}\b", rendered)
+    assert len(rendered.splitlines()) > 3
+    assert "Summary: word" in rendered
+    assert "x" * 220 in rendered
+    assert re.search(r"\b\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\b", rendered)
 
 
 def test_feedback_summary_and_list_have_distinct_complete_views(
@@ -708,8 +638,8 @@ def test_feedback_summary_and_list_have_distinct_complete_views(
     assert "50 newest open records" in help_text
     assert "default: 50" in help_text
     assert "default: open" in help_text
-    assert "one compact record per line" in help_text
-    assert "feedback show REF" in help_text
+    assert "readable record blocks with complete summaries" in help_text
+    assert "agent-workflows feedback show REF" in help_text
 
 
 def test_feedback_short_refs_are_unique_at_creation(cache: Path) -> None:
@@ -1211,15 +1141,19 @@ def test_feedback_cli_replaces_stats_and_sources_with_summary() -> None:
         parser.parse_args(["feedback", "sources"])
 
 
-def test_feedback_trace_locates_exact_worker_call_without_content(
+def test_feedback_trace_uses_durable_locator_and_progressive_detail(
     cache: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     result = append_feedback(
         tool="task_manage",
-        origin={
-            "error_ref": "err-123456789abc",
-            "failure_kind": "validation",
-            "invocation": {"argument_types": {"report": "string"}, "complete": False},
+        origin=None,
+        provenance={
+            "conversation": {
+                "client": "qwen",
+                "session_id": "session-1",
+                "prompt_id": "prompt-1",
+                "mcp_request_id": "request-1",
+            }
         },
     )
     feedback_id = str(result["feedback_id"])
@@ -1235,6 +1169,60 @@ def test_feedback_trace_locates_exact_worker_call_without_content(
     transcript.parent.mkdir(parents=True)
     rows = [
         {
+            "type": "user",
+            "timestamp": "2026-09-02T11:59:58Z",
+            "message": {"role": "user", "parts": [{"text": "Complete the report"}]},
+        },
+        {
+            "type": "assistant",
+            "message": {
+                "role": "model",
+                "parts": [
+                    {
+                        "functionCall": {
+                            "id": "protected-call",
+                            "name": "read_file",
+                            "args": {"file_path": "/workspace/data/private.csv"},
+                        }
+                    }
+                ],
+            },
+        },
+        {
+            "type": "tool_result",
+            "timestamp": "2026-09-02T11:59:58Z",
+            "message": {
+                "role": "user",
+                "parts": [
+                    {
+                        "functionResponse": {
+                            "id": "protected-call",
+                            "name": "read_file",
+                            "response": {"output": "private", "token": "secret"},
+                        }
+                    }
+                ],
+            },
+        },
+        {
+            "type": "assistant",
+            "timestamp": "2026-09-02T11:59:59Z",
+            "message": {
+                "role": "model",
+                "parts": [
+                    {"thought": "private chain of thought"},
+                    {"text": "I will submit the report."},
+                    {
+                        "functionCall": {
+                            "id": "origin-call",
+                            "name": "mcp__github_workflows__task_manage",
+                            "args": {"action": "complete", "report": "wrong type"},
+                        }
+                    },
+                ],
+            },
+        },
+        {
             "type": "tool_result",
             "timestamp": "2026-09-02T12:00:00Z",
             "sessionId": "session-1",
@@ -1247,7 +1235,8 @@ def test_feedback_trace_locates_exact_worker_call_without_content(
                             "id": "origin-call",
                             "name": "mcp__github_workflows__task_manage",
                             "response": {
-                                "output": 'report must be an object; error_ref="err-123456789abc"'
+                                "output": "report must be an object\x1b[2J\x9b31m",
+                                "isError": True,
                             },
                         }
                     }
@@ -1263,27 +1252,7 @@ def test_feedback_trace_locates_exact_worker_call_without_content(
                         "functionCall": {
                             "id": "feedback-call",
                             "name": "mcp__github_workflows__workflow_feedback",
-                            "args": {
-                                "message": "The report type was unclear",
-                                "error_ref": "err-123456789abc",
-                            },
-                        }
-                    }
-                ],
-            },
-        },
-        {
-            "type": "tool_result",
-            "message": {
-                "role": "user",
-                "parts": [
-                    {
-                        "functionResponse": {
-                            "id": "rejected-feedback-call",
-                            "name": "mcp__github_workflows__workflow_feedback",
-                            "response": {
-                                "output": "error_ref cannot be combined with tool: err-123456789abc"
-                            },
+                            "args": {"message": "The report type was unclear"},
                         }
                     }
                 ],
@@ -1319,28 +1288,224 @@ def test_feedback_trace_locates_exact_worker_call_without_content(
     incidental.write_text(json.dumps({"message": feedback_id}) + "\n", encoding="utf-8")
     monkeypatch.setenv("QWEN_HOME", str(qwen_home))
 
-    traced = feedback.trace(feedback_id)
+    attached = feedback.attach_qwen_locator(
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "mcp__github_workflows__workflow_feedback",
+            "session_id": "session-1",
+            "transcript_path": str(transcript),
+            "agent_id": "worker-call",
+            "tool_use_id": "tool-use-1",
+            "tool_call_id": "feedback-call",
+            "tool_response": {"structuredContent": {"feedback_id": feedback_id}},
+        }
+    )
+    assert attached == {"attached": True, "feedback_id": feedback_id}
+    assert feedback.find(feedback_id)["provenance"]["conversation"] == {
+        "client": "qwen",
+        "session_id": "session-1",
+        "prompt_id": "prompt-1",
+        "mcp_request_id": "request-1",
+        "transcript": (
+            "$QWEN_HOME/projects/-workspace/subagents/session-1/agent-worker-call.jsonl"
+        ),
+        "agent_id": "worker-call",
+        "tool_use_id": "tool-use-1",
+        "tool_call_id": "feedback-call",
+    }
+
+    with mock.patch.object(feedback, "_candidate_transcripts", side_effect=AssertionError):
+        traced = feedback.trace(feedback_id)
 
     assert traced == {
         "feedback_id": feedback_id,
+        "detail": "tools",
         "matches": [
             {
                 "timestamp": "2026-09-02T12:00:01Z",
                 "session_id": "session-1",
+                "prompt_id": "prompt-1",
                 "agent_id": "worker-call",
+                "mcp_request_id": "request-1",
+                "feedback_tool_use_id": "tool-use-1",
                 "feedback_tool_call_id": "feedback-call",
                 "transcript": (
                     "$QWEN_HOME/projects/-workspace/subagents/session-1/agent-worker-call.jsonl"
                 ),
-                "origin": {
-                    "match": "exact-error-ref",
-                    "tool": "mcp__github_workflows__task_manage",
-                    "tool_call_id": "origin-call",
-                },
+                "tools": [
+                    {
+                        "tool": "read_file",
+                        "tool_call_id": "protected-call",
+                        "timestamp": "2026-09-02T11:59:58Z",
+                        "status": "success",
+                    },
+                    {
+                        "tool": "mcp__github_workflows__task_manage",
+                        "tool_call_id": "origin-call",
+                        "timestamp": "2026-09-02T12:00:00Z",
+                        "status": "error",
+                    },
+                ],
             }
         ],
     }
-    assert "report must be an object" not in feedback.format_trace(traced)
+    contextual = feedback.trace(feedback_id, detail="context")
+    assert contextual["matches"][0]["messages"] == [
+        {
+            "role": "user",
+            "timestamp": "2026-09-02T11:59:58Z",
+            "text": "Complete the report",
+        },
+        {
+            "role": "assistant",
+            "timestamp": "2026-09-02T11:59:59Z",
+            "text": "I will submit the report.",
+        },
+    ]
+    assert "private chain of thought" not in json.dumps(contextual)
+    detailed = feedback.trace(feedback_id, detail="data")
+    protected = detailed["matches"][0]["tools"][0]
+    omitted = {"omitted": "interaction references a protected path"}
+    assert protected["input"] == omitted
+    assert protected["response"] == omitted
+    assert "private" not in json.dumps(protected)
+    assert detailed["matches"][0]["tools"][1]["input"] == {
+        "action": "complete",
+        "report": "wrong type",
+    }
+    assert detailed["matches"][0]["tools"][1]["response"] == {
+        "output": "report must be an object\x1b[2J\x9b31m",
+        "isError": True,
+    }
+    rendered = feedback.format_trace(detailed)
+    assert "\x1b" not in rendered
+    assert "\x9b" not in rendered
+    assert r"\u001b[2J\u009b31m" in rendered
+
+
+def test_feedback_locator_rejects_wrong_session_and_non_qwen_path(
+    cache: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = append_feedback(
+        origin=None,
+        provenance={
+            "conversation": {
+                "client": "qwen",
+                "session_id": "expected-session",
+                "prompt_id": "prompt-1",
+            }
+        },
+    )
+    qwen_home = tmp_path / "qwen-home"
+    transcript = qwen_home / "projects" / "workspace" / "chats" / "session.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("{}\n", encoding="utf-8")
+    outside = tmp_path / "outside.jsonl"
+    outside.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("QWEN_HOME", str(qwen_home))
+    base = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "mcp__github_workflows__workflow_feedback",
+        "session_id": "expected-session",
+        "tool_use_id": "tool-use-1",
+        "tool_response": {"output": json.dumps({"feedback_id": result["feedback_id"]})},
+    }
+
+    with pytest.raises(ValueError, match="under QWEN_HOME"):
+        feedback.attach_qwen_locator({**base, "transcript_path": str(outside)})
+    with pytest.raises(ValueError, match="does not match"):
+        feedback.attach_qwen_locator(
+            {**base, "session_id": "wrong-session", "transcript_path": str(transcript)}
+        )
+
+
+def test_private_feedback_locator_hook_command(
+    cache: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = append_feedback(origin=None, provenance=None)
+    qwen_home = tmp_path / "qwen-home"
+    transcript = qwen_home / "projects" / "workspace" / "chats" / "session.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("{}\n", encoding="utf-8")
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "mcp__github_workflows__workflow_feedback",
+        "session_id": "session-1",
+        "transcript_path": str(transcript),
+        "tool_use_id": "tool-use-1",
+        "tool_response": {"content": [{"text": json.dumps(result)}]},
+    }
+    monkeypatch.setenv("QWEN_HOME", str(qwen_home))
+    monkeypatch.setattr("sys.argv", ["agent-workflows", "_feedback-locator-hook"])
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+
+    assert main() == 0
+    assert capsys.readouterr().out == "{}\n"
+    assert feedback.find(str(result["feedback_id"]))["provenance"]["conversation"] == {
+        "client": "qwen",
+        "session_id": "session-1",
+        "transcript": "$QWEN_HOME/projects/workspace/chats/session.jsonl",
+        "tool_use_id": "tool-use-1",
+    }
+
+
+def test_feedback_trace_falls_back_for_legacy_unlinked_record(
+    cache: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = append_feedback(origin=None, provenance=None)
+    feedback_id = str(result["feedback_id"])
+    qwen_home = tmp_path / "qwen-home"
+    transcript = qwen_home / "projects" / "workspace" / "chats" / "legacy.jsonl"
+    transcript.parent.mkdir(parents=True)
+    rows = [
+        {
+            "message": {
+                "role": "model",
+                "parts": [
+                    {
+                        "functionCall": {
+                            "id": "feedback-call",
+                            "name": "mcp__github_workflows__workflow_feedback",
+                            "args": {"message": "Legacy feedback"},
+                        }
+                    }
+                ],
+            }
+        },
+        {
+            "timestamp": "2026-09-02T12:00:01Z",
+            "sessionId": "legacy-session",
+            "message": {
+                "role": "user",
+                "parts": [
+                    {
+                        "functionResponse": {
+                            "id": "feedback-call",
+                            "name": "mcp__github_workflows__workflow_feedback",
+                            "response": {"output": json.dumps({"feedback_id": feedback_id})},
+                        }
+                    }
+                ],
+            },
+        },
+    ]
+    transcript.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    monkeypatch.setenv("QWEN_HOME", str(qwen_home))
+
+    traced = feedback.trace(feedback_id)
+
+    assert traced["matches"][0]["session_id"] == "legacy-session"
+    assert traced["matches"][0]["transcript"] == (
+        "$QWEN_HOME/projects/workspace/chats/legacy.jsonl"
+    )
+
+
+def test_trace_rejects_unknown_detail() -> None:
+    with pytest.raises(ValueError, match="tools, context, or data"):
+        feedback.trace("12345678", detail="everything")
 
 
 def test_feedback_cli_filters_and_counts_normalized_sources(
@@ -1376,10 +1541,10 @@ def test_feedback_cli_filters_and_counts_normalized_sources(
     assert "Closed (0)" in table
 
 
-def test_feedback_compact_rows_format_short_refs_and_empty_results() -> None:
-    assert feedback.format_compact_records([], width=120) == "No feedback recorded."
+def test_feedback_table_formats_short_refs_and_complete_summaries() -> None:
+    assert feedback.format_table([], width=120) == "No feedback recorded."
     message = "A long explanation " * 20
-    table = feedback.format_compact_records(
+    table = feedback.format_table(
         [
             {
                 "feedback_id": "fb-20260901232545-5f009f5df7",
@@ -1387,9 +1552,9 @@ def test_feedback_compact_rows_format_short_refs_and_empty_results() -> None:
                 "timestamp": "2026-09-01T23:25:45.610861Z",
                 "repository": "example/repository-with-a-long-name",
                 "workflow": "gh-audit-repo",
-                "source": "glob",
+                "tool": "glob",
                 "status": "open",
-                "summary": message,
+                "message": message,
             }
         ],
         width=120,
@@ -1397,11 +1562,11 @@ def test_feedback_compact_rows_format_short_refs_and_empty_results() -> None:
 
     assert "009f5df7" in table
     assert "fb-20260901232545-5f009f5df7" not in table
-    expected_date = feedback._display_date("2026-09-01T23:25:45Z")
-    assert expected_date in table
+    assert feedback._display_time("2026-09-01T23:25:45Z") in table
     assert "glob" in table
-    assert len(table.splitlines()) == 1
-    assert len(table) <= 120
+    assert "Summary: A long explanation" in table
+    assert " ".join(table.split()).count("A long explanation") == 20
+    assert len(table.splitlines()) > 4
 
 
 def test_feedback_display_time_uses_system_timezone(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1432,8 +1597,8 @@ def test_feedback_display_time_falls_back_to_edt(monkeypatch: pytest.MonkeyPatch
     assert feedback._display_time("2026-09-01T12:00:00Z") == "2026-09-01 08:00:00 EDT"
 
 
-def test_feedback_compact_rows_label_records_without_sources_as_general() -> None:
-    table = feedback.format_compact_records(
+def test_feedback_table_labels_records_without_sources_as_general() -> None:
+    table = feedback.format_table(
         [
             {
                 "feedback_id": "fb-123456789abc",
@@ -1442,7 +1607,7 @@ def test_feedback_compact_rows_label_records_without_sources_as_general() -> Non
                 "workflow": "gh-audit-repo",
                 "source": "general",
                 "status": "open",
-                "summary": "The active instruction was ambiguous",
+                "message": "The active instruction was ambiguous",
             }
         ],
         width=120,
@@ -1451,8 +1616,8 @@ def test_feedback_compact_rows_label_records_without_sources_as_general() -> Non
     assert "general" in table
 
 
-def test_feedback_compact_rows_escape_terminal_controls() -> None:
-    table = feedback.format_compact_records(
+def test_feedback_table_escapes_terminal_controls() -> None:
+    table = feedback.format_table(
         [
             {
                 "feedback_id": "fb-123456789abc",
@@ -1460,7 +1625,7 @@ def test_feedback_compact_rows_escape_terminal_controls() -> None:
                 "repository": "example/repo",
                 "source": "tool\x1b]8;;https://example.invalid\x07",
                 "status": "open",
-                "summary": "warning\x1b[2J\x9b31m hidden\u200btext",
+                "message": "warning\x1b[2J\x9b31m hidden\u200btext",
             }
         ],
         width=200,

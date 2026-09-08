@@ -179,32 +179,28 @@ class WorkflowRuntime:
         request: WorkflowFeedbackRequest,
         *,
         provenance: dict[str, Any] | None = None,
-        failure_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Record one bounded agent observation outside workflow state."""
         repository, workflow, run_id, task = self._feedback_attribution(request.task_ref)
-        attached = failure_context is not None or request.tool is not None
-        context = failure_context or {}
-        stored_provenance = {
-            **(provenance or {}),
-            **(context.get("provenance") or {}),
-        }
+        stored_provenance = dict(provenance or {})
         if task is not None:
             stored_provenance["task"] = task
-        origin = dict(context.get("origin") or {})
-        if request.error_ref is not None:
-            origin["error_ref"] = request.error_ref
         result = feedback.append(
             message=request.message,
-            tool=context.get("tool", request.tool),
-            origin=origin or None,
+            tool=request.tool,
+            origin=None,
             repository=repository,
             workflow=workflow,
             run_id=run_id,
             provenance=stored_provenance,
             private_paths=self.feedback_private_paths(),
         )
-        return {**result, "context_attached": attached}
+        return {
+            **result,
+            "context_attached": bool(
+                request.tool or task is not None or stored_provenance.get("conversation")
+            ),
+        }
 
     @staticmethod
     def _invoke(

@@ -30,6 +30,12 @@ supervisors and workers.
   do not copy the returned body or unrelated metadata into assignments or
   history.
 
+## Workflow MCP arguments
+
+- Send native JSON values that match the loaded tool schema. Omit optional
+  arguments when unused; explicit `null` is not accepted. Correct a client-side
+  schema rejection before retrying because no workflow call occurred.
+
 ## Interactive preflight and unattended execution
 
 - Each workflow invocation has one interactive preflight before new material
@@ -278,12 +284,10 @@ instruction friction by silently ignoring the active higher-precedence rule.
 
 Keep calls simple. Instruction or general workflow friction needs only
 `message`. A named worker also supplies its exact `task_ref` from
-`task_context`. When a failed `github-workflows` MCP call provides an
-`error_ref`, pass that reference instead of repeating the rejected arguments or
-error response; the server attaches a PHI-safe call shape automatically. Use
-`tool` only to name a Qwen-native or external tool, or a confusing successful
-interaction the workflow server could not observe. Never combine `error_ref`
-with `tool`.
+`task_context`. Qwen attaches the current session, prompt, transcript, agent,
+and tool-call locator automatically. Use `tool` only to name a Qwen-native or
+external tool, or a confusing successful interaction that nearby transcript
+context cannot identify.
 
 Record one concise item for the friction encountered, rather than another item
 for each retry in the same encounter. Independent agents may report the same

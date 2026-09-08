@@ -87,12 +87,12 @@ def add_feedback_commands(feedback_parser: argparse.ArgumentParser, *, agent_out
         aliases=["ls"],
         help="list newest feedback summaries",
         description=(
-            "List newest feedback as one compact record per line. Defaults to the 50 newest "
-            "open records; use 'agent-feedback show REF...' for complete "
-            "record details."
+            "List newest feedback as bounded JSON metadata. Defaults to the 50 newest open "
+            "records; use 'agent-feedback show REF...' for complete record details."
             if agent_output
-            else "List newest feedback as one compact record per line. Defaults to the 50 "
-            "newest open records; use 'feedback show REF...' for complete record details."
+            else "List newest feedback as readable record blocks with complete summaries. "
+            "Defaults to the 50 newest open records; use "
+            "'agent-workflows feedback show REF...' for complete record details."
         ),
     )
     feedback_list.set_defaults(feedback_command="list")
@@ -137,9 +137,15 @@ def add_feedback_commands(feedback_parser: argparse.ArgumentParser, *, agent_out
     )
     feedback_show.add_argument("feedback_ids", nargs="+")
     feedback_trace = feedback_commands.add_parser(
-        "trace", help="locate feedback in Qwen transcripts without printing conversation content"
+        "trace", help="inspect bounded Qwen transcript context for one feedback record"
     )
     feedback_trace.add_argument("feedback_id")
+    feedback_trace.add_argument(
+        "--detail",
+        choices=("tools", "context", "data"),
+        default="tools",
+        help="trace depth: tool metadata (default), visible context, or sanitized payload data",
+    )
     if agent_output:
         feedback_trace.set_defaults(json_output=True)
     else:
@@ -270,7 +276,7 @@ def run_feedback(args: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
     if args.feedback_command == "trace":
-        result = feedback.trace(args.feedback_id)
+        result = feedback.trace(args.feedback_id, detail=args.detail)
         print(
             json.dumps(result, indent=2, sort_keys=True)
             if args.json_output
@@ -347,7 +353,12 @@ def run_feedback(args: argparse.Namespace) -> int:
         limit = None if args.all_records else args.limit
         if limit is not None and limit < 1:
             raise ValueError("feedback limit must be positive")
-        result = feedback.compact_records(
+        list_records = (
+            feedback.compact_records
+            if getattr(args, "json_output", False)
+            else feedback.list_records
+        )
+        result = list_records(
             repository=args.repository,
             workflow=args.workflow,
             sources=args.sources,
@@ -359,7 +370,7 @@ def run_feedback(args: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2, sort_keys=True))
     else:
         width = shutil.get_terminal_size(fallback=(140, 24)).columns
-        print(feedback.format_compact_records(result, width=width))
+        print(feedback.format_table(result, width=width))
     return 0
 
 
@@ -382,6 +393,10 @@ def agent_feedback_main() -> int:
 
 def main() -> int:
     try:
+        if sys.argv[1:] == ["_feedback-locator-hook"]:
+            feedback.attach_qwen_locator(json.load(sys.stdin))
+            print("{}")
+            return 0
         args = build_parser().parse_args()
         if args.command == "install":
             return install_from_args(args)
