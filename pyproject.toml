@@ -28,6 +28,7 @@ dev = [
 
 [project.scripts]
 agent-workflows = "github_workflows.cli:main"
+agent-feedback = "github_workflows.cli:agent_feedback_main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

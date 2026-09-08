@@ -171,11 +171,56 @@ class Installer:
             current = json.loads(state.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             current = None
-        executable = self.root / ".venv" / "bin" / "agent-workflows"
-        if current != expected or not executable.is_file():
+        executables = (
+            self.root / ".venv" / "bin" / "agent-workflows",
+            self.root / ".venv" / "bin" / "agent-feedback",
+        )
+        if current != expected or not all(executable.is_file() for executable in executables):
             self.add_change("install the Python environment", group="Shared", component="runtime")
         else:
             self.notice("Python environment is current")
+
+    def plan_agent_command(self) -> None:
+        """Expose the native CLI on the conventional user executable path."""
+        source = self.root / ".venv" / "bin" / "agent-feedback"
+        target = self.home / ".local" / "bin" / "agent-feedback"
+        current = target.resolve(strict=False) if target.is_symlink() else None
+        if current == source.resolve(strict=False):
+            self.notice("Agent feedback command is current")
+        elif not target.exists() and not target.is_symlink():
+            self.add_change(
+                "link the agent-feedback command",
+                group="Shared",
+                component="agent-command",
+            )
+        else:
+            raise RuntimeError(f"refusing unmanaged agent-feedback command: {target}")
+
+        path_entries = os.environ.get("PATH", "").split(os.pathsep)
+        managed_directory = target.parent.resolve(strict=False)
+        managed_index = next(
+            (
+                index
+                for index, entry in enumerate(path_entries)
+                if entry and Path(entry).expanduser().resolve(strict=False) == managed_directory
+            ),
+            None,
+        )
+        if managed_index is None:
+            self.warnings.append(
+                f"{target.parent} is not on PATH; agent-feedback will not be directly callable"
+            )
+        elif managed_index:
+            shadowing = shutil.which(
+                "agent-feedback",
+                path=os.pathsep.join(path_entries[:managed_index]),
+            )
+            if shadowing is not None and Path(shadowing).resolve(strict=False) != source.resolve(
+                strict=False
+            ):
+                raise RuntimeError(
+                    f"PATH resolves agent-feedback to {shadowing} before managed command {target}"
+                )
 
     def plan_codex(self) -> None:
         destination = self.home / ".codex" / "skills"
@@ -449,6 +494,32 @@ class Installer:
             return False
         return True
 
+    def reconcile_selected_dependencies(self) -> bool:
+        """Drop selected operations whose explicitly excluded prerequisite is unavailable."""
+        command_change = "link the agent-feedback command"
+        runtime_change = "install the Python environment"
+        source = self.root / ".venv" / "bin" / "agent-feedback"
+        if (
+            command_change in self.changes
+            and runtime_change not in self.changes
+            and not source.is_file()
+        ):
+            print(
+                "[WARN] skipping the agent-feedback command because runtime installation "
+                "was excluded",
+                file=sys.stderr,
+            )
+            self.changes.remove(command_change)
+            self.changed_components = {
+                self.change_components[change]
+                for change in self.changes
+                if change in self.change_components
+            }
+        if not self.changes:
+            print("[OK] Nothing selected")
+            return False
+        return True
+
     def apply_runtime(self) -> None:
         description = "install the Python environment"
         if description not in self.changes:
@@ -473,6 +544,21 @@ class Installer:
         if self.args.dev:
             pre_commit = self.root / ".venv" / "bin" / "pre-commit"
             self.run(str(pre_commit), "install")
+
+    def apply_agent_command(self) -> None:
+        description = "link the agent-feedback command"
+        if description not in self.changes:
+            return
+        source = self.root / ".venv" / "bin" / "agent-feedback"
+        if not source.is_file():
+            print(
+                "[WARN] skipped the agent-feedback command because its runtime was not installed",
+                file=sys.stderr,
+            )
+            return
+        target = self.home / ".local" / "bin" / "agent-feedback"
+        self.apply_notice(description)
+        self.replace_link(source, target)
 
     def replace_link(self, source: Path, target: Path) -> None:
         if target.is_symlink() or target.is_file():
@@ -587,6 +673,7 @@ class Installer:
 
     def install(self) -> int:
         self.plan_runtime()
+        self.plan_agent_command()
         self.plan_user_policies()
         self.plan_codex()
         self.plan_qwen()
@@ -594,8 +681,12 @@ class Installer:
         self.plan_polars()
         if not self.approve():
             return 0
+        if not self.reconcile_selected_dependencies():
+            return 0
         if "runtime" in self.changed_components:
             self.apply_runtime()
+        if "agent-command" in self.changed_components:
+            self.apply_agent_command()
         if "user-policies" in self.changed_components:
             self.apply_user_policies()
         if "codex" in self.changed_components:

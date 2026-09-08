@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -105,9 +106,10 @@ def test_current_runtime_is_omitted_unless_verbose(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(installation, "command_path", lambda _name: "/bin/tool")
-    executable = repository / ".venv" / "bin" / "agent-workflows"
-    executable.parent.mkdir(parents=True)
-    executable.touch()
+    executable_directory = repository / ".venv" / "bin"
+    executable_directory.mkdir(parents=True)
+    (executable_directory / "agent-workflows").touch()
+    (executable_directory / "agent-feedback").touch()
     state = {
         "dev": False,
         "pyproject_sha256": hashlib.sha256(
@@ -124,6 +126,128 @@ def test_current_runtime_is_omitted_unless_verbose(
     assert "Python environment is current" in capsys.readouterr().out
 
 
+def test_installer_manages_agent_feedback_command_link(
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = repository / "home"
+    executable = repository / ".venv" / "bin" / "agent-feedback"
+    executable.parent.mkdir(parents=True)
+    executable.touch()
+    monkeypatch.setenv("PATH", str(home / ".local" / "bin"))
+    installer = installation.Installer(arguments(), repository)
+    installer.home = home
+
+    installer.plan_agent_command()
+    assert installer.changes == ["link the agent-feedback command"]
+    assert installer.warnings == []
+
+    installer.apply_agent_command()
+    target = home / ".local" / "bin" / "agent-feedback"
+    assert target.is_symlink()
+    assert target.resolve() == executable.resolve()
+
+    current = installation.Installer(arguments(verbose=True), repository)
+    current.home = home
+    current.plan_agent_command()
+    assert current.changes == []
+    assert "Agent feedback command is current" in capsys.readouterr().out
+
+
+def test_installer_refuses_unmanaged_agent_feedback_command(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = repository / "home"
+    target = home / ".local" / "bin" / "agent-feedback"
+    target.parent.mkdir(parents=True)
+    target.write_text("unmanaged\n")
+    monkeypatch.setenv("PATH", str(target.parent))
+    installer = installation.Installer(arguments(), repository)
+    installer.home = home
+
+    with pytest.raises(RuntimeError, match="refusing unmanaged agent-feedback command"):
+        installer.plan_agent_command()
+
+    assert installer.changes == []
+
+
+def test_installer_warns_when_user_bin_is_not_on_path(repository: Path) -> None:
+    installer = installation.Installer(arguments(), repository)
+    installer.home = repository / "home"
+
+    installer.plan_agent_command()
+
+    assert any("is not on PATH" in warning for warning in installer.warnings)
+
+
+def test_installer_rejects_when_another_agent_feedback_command_wins_path_lookup(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = repository / "home"
+    shadow_directory = repository / "shadow-bin"
+    shadow_directory.mkdir()
+    shadow = shadow_directory / "agent-feedback"
+    shadow.write_text("#!/bin/sh\n")
+    shadow.chmod(0o755)
+    managed_directory = home / ".local" / "bin"
+    monkeypatch.setenv("PATH", f"{shadow_directory}{os.pathsep}{managed_directory}")
+    installer = installation.Installer(arguments(), repository)
+    installer.home = home
+
+    with pytest.raises(RuntimeError, match=f"PATH resolves agent-feedback to {shadow}"):
+        installer.plan_agent_command()
+
+
+def test_command_link_is_listed_when_runtime_executable_is_missing(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(installation, "command_path", lambda _name: "/bin/tool")
+    installer = installation.Installer(arguments(), repository)
+    installer.home = repository / "home"
+
+    installer.plan_runtime()
+    installer.plan_agent_command()
+
+    assert installer.changes == [
+        "install the Python environment",
+        "link the agent-feedback command",
+    ]
+
+
+def test_excluding_runtime_skips_dependent_command_without_dropping_other_work(
+    repository: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    installer = installation.Installer(arguments(), repository)
+    installer.add_change(
+        "link the agent-feedback command",
+        group="Shared",
+        component="agent-command",
+    )
+    installer.add_change("link skill example", group="Codex", component="codex")
+
+    assert installer.reconcile_selected_dependencies() is True
+
+    assert installer.changes == ["link skill example"]
+    assert installer.changed_components == {"codex"}
+    assert "runtime installation was excluded" in capsys.readouterr().err
+
+
+def test_command_link_skip_does_not_abort_when_runtime_source_disappears(
+    repository: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    installer = installation.Installer(arguments(), repository)
+    installer.add_change(
+        "link the agent-feedback command",
+        group="Shared",
+        component="agent-command",
+    )
+
+    installer.apply_agent_command()
+
+    assert "skipped the agent-feedback command" in capsys.readouterr().err
+
+
 def test_install_applies_only_changed_components(
     repository: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -134,10 +258,12 @@ def test_install_applies_only_changed_components(
     installer.cache = repository / "cache"
     applied: list[str] = []
     monkeypatch.setattr(installer, "plan_runtime", lambda: None)
+    monkeypatch.setattr(installer, "plan_agent_command", lambda: None)
     monkeypatch.setattr(installer, "plan_codex", lambda: None)
     monkeypatch.setattr(installer, "plan_qwen", lambda: None)
     monkeypatch.setattr(installer, "plan_polars", lambda: None)
     monkeypatch.setattr(installer, "apply_runtime", lambda: applied.append("runtime"))
+    monkeypatch.setattr(installer, "apply_agent_command", lambda: applied.append("agent-command"))
     monkeypatch.setattr(installer, "apply_codex", lambda: applied.append("codex"))
     monkeypatch.setattr(installer, "apply_qwen", lambda: applied.append("qwen"))
     monkeypatch.setattr(installer, "apply_polars", lambda: applied.append("polars"))

@@ -58,34 +58,16 @@ def load_request(raw: str) -> dict[str, Any]:
     return value
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    install = subparsers.add_parser("install", help="install or update agent integrations")
-    add_install_arguments(install)
-
-    mcp = subparsers.add_parser("mcp", help="serve the private Qwen MCP interface")
-    mcp.add_argument("--workspace", type=Path, required=True)
-    mcp.add_argument("--project-dir", type=Path)
-
-    workflow = subparsers.add_parser("workflow", help="run a manual workflow recovery operation")
-    workflow.add_argument("--workspace", type=Path, default=Path.cwd())
-    workflow.add_argument("--project-dir", type=Path)
-    workflow.add_argument(
-        "tool",
-        choices=sorted([*REQUESTS, "run-status", "task-context", "audit-metrics"]),
-    )
-    workflow.add_argument("request", nargs="?", help="JSON object, JSON file, or - for stdin")
-
-    feedback_parser = subparsers.add_parser(
-        "feedback", help="record or inspect local agent feedback"
-    )
+def add_feedback_commands(feedback_parser: argparse.ArgumentParser, *, agent_output: bool) -> None:
+    """Configure the human or JSON-only feedback command surface."""
+    feedback_parser.set_defaults(agent_interface=agent_output)
     feedback_commands = feedback_parser.add_subparsers(dest="feedback_command", required=True)
     feedback_add = feedback_commands.add_parser("add", help="record one concise observation")
     feedback_add.add_argument("message", help="PHI-free workflow friction and its consequence")
     feedback_add.add_argument("--tool", help="related native or external tool name")
-    feedback_commands.add_parser("path", help="print the feedback JSONL path")
+    feedback_add.set_defaults(json_output=agent_output)
+    if not agent_output:
+        feedback_commands.add_parser("path", help="print the feedback JSONL path")
     feedback_summary = feedback_commands.add_parser(
         "summary", help="summarize the complete feedback state"
     )
@@ -94,16 +76,23 @@ def build_parser() -> argparse.ArgumentParser:
     feedback_summary.add_argument(
         "--since", help="include records from the last AGE, such as 24h, 30d, or 4w"
     )
-    feedback_summary.add_argument(
-        "--json", action="store_true", dest="json_output", help="print machine-readable JSON"
-    )
+    if agent_output:
+        feedback_summary.set_defaults(json_output=True)
+    else:
+        feedback_summary.add_argument(
+            "--json", action="store_true", dest="json_output", help="print machine-readable JSON"
+        )
     feedback_list = feedback_commands.add_parser(
         "list",
         aliases=["ls"],
         help="list newest feedback summaries",
         description=(
             "List newest feedback as one compact record per line. Defaults to the 50 newest "
-            "open records; use 'feedback show REF...' for complete record details."
+            "open records; use 'agent-feedback show REF...' for complete "
+            "record details."
+            if agent_output
+            else "List newest feedback as one compact record per line. Defaults to the 50 "
+            "newest open records; use 'feedback show REF...' for complete record details."
         ),
     )
     feedback_list.set_defaults(feedback_command="list")
@@ -134,12 +123,15 @@ def build_parser() -> argparse.ArgumentParser:
         dest="all_records",
         help="return every matching record instead of limiting to 50",
     )
-    feedback_list.add_argument(
-        "--json",
-        action="store_true",
-        dest="json_output",
-        help="print the same compact records as a JSON array",
-    )
+    if agent_output:
+        feedback_list.set_defaults(json_output=True)
+    else:
+        feedback_list.add_argument(
+            "--json",
+            action="store_true",
+            dest="json_output",
+            help="print the same compact records as a JSON array",
+        )
     feedback_show = feedback_commands.add_parser(
         "show", help="show one or more complete feedback records"
     )
@@ -148,9 +140,12 @@ def build_parser() -> argparse.ArgumentParser:
         "trace", help="locate feedback in Qwen transcripts without printing conversation content"
     )
     feedback_trace.add_argument("feedback_id")
-    feedback_trace.add_argument(
-        "--json", action="store_true", dest="json_output", help="print machine-readable JSON"
-    )
+    if agent_output:
+        feedback_trace.set_defaults(json_output=True)
+    else:
+        feedback_trace.add_argument(
+            "--json", action="store_true", dest="json_output", help="print machine-readable JSON"
+        )
     feedback_close = feedback_commands.add_parser(
         "close", help="close reviewed feedback without deleting it"
     )
@@ -165,15 +160,63 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional short PHI-free resolution note",
     )
     feedback_close.add_argument("--input", help="JSON resolution list, JSON file, or - for stdin")
-    feedback_close.add_argument(
-        "--json", action="store_true", dest="json_output", help="print machine-readable JSON"
-    )
+    if agent_output:
+        feedback_close.set_defaults(json_output=True)
+    else:
+        feedback_close.add_argument(
+            "--json", action="store_true", dest="json_output", help="print machine-readable JSON"
+        )
     feedback_reopen = feedback_commands.add_parser("reopen", help="reopen closed feedback")
     feedback_reopen.add_argument("feedback_ids", nargs="+")
-    feedback_remove = feedback_commands.add_parser(
-        "remove", help="permanently remove reviewed feedback records"
+    feedback_reopen.set_defaults(json_output=agent_output)
+    if not agent_output:
+        feedback_remove = feedback_commands.add_parser(
+            "remove", help="permanently remove reviewed feedback records"
+        )
+        feedback_remove.add_argument("feedback_ids", nargs="+")
+
+
+class AgentArgumentParser(argparse.ArgumentParser):
+    """Turn agent-facing usage errors into structured operational errors."""
+
+    def error(self, message: str) -> None:
+        raise ValueError(message)
+
+
+def build_agent_feedback_parser() -> argparse.ArgumentParser:
+    parser = AgentArgumentParser(
+        prog="agent-feedback",
+        description="Operate the local feedback queue with JSON-only output.",
     )
-    feedback_remove.add_argument("feedback_ids", nargs="+")
+    add_feedback_commands(parser, agent_output=True)
+    return parser
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    install = subparsers.add_parser("install", help="install or update agent integrations")
+    add_install_arguments(install)
+
+    mcp = subparsers.add_parser("mcp", help="serve the private Qwen MCP interface")
+    mcp.add_argument("--workspace", type=Path, required=True)
+    mcp.add_argument("--project-dir", type=Path)
+
+    workflow = subparsers.add_parser("workflow", help="run a manual workflow recovery operation")
+    workflow.add_argument("--workspace", type=Path, default=Path.cwd())
+    workflow.add_argument("--project-dir", type=Path)
+    workflow.add_argument(
+        "tool",
+        choices=sorted([*REQUESTS, "run-status", "task-context", "audit-metrics"]),
+    )
+    workflow.add_argument("request", nargs="?", help="JSON object, JSON file, or - for stdin")
+
+    feedback_parser = subparsers.add_parser(
+        "feedback", help="record or inspect local agent feedback"
+    )
+    add_feedback_commands(feedback_parser, agent_output=False)
+
     return parser
 
 
@@ -212,7 +255,11 @@ def run_feedback(args: argparse.Namespace) -> int:
             tool=request.tool,
             workspace=Path.cwd(),
         )
-        print(f"Recorded feedback {result['ref']}.")
+        print(
+            json.dumps(result, indent=2, sort_keys=True)
+            if getattr(args, "json_output", False)
+            else f"Recorded feedback {result['ref']}."
+        )
         return 0
     if args.feedback_command == "path":
         print(feedback.storage_path())
@@ -258,6 +305,20 @@ def run_feedback(args: argparse.Namespace) -> int:
             return 0
         if not args.feedback_ids:
             raise ValueError("feedback close requires IDs or --input")
+        if getattr(args, "agent_interface", False):
+            resolution: dict[str, str] = {
+                "disposition": args.disposition or "addressed",
+            }
+            if args.note is not None:
+                resolution["note"] = args.note
+            result = feedback.resolve_records(
+                [
+                    {"ref": feedback_id, **resolution}
+                    for feedback_id in dict.fromkeys(args.feedback_ids)
+                ]
+            )
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 0
         changed = feedback.set_closed(
             args.feedback_ids,
             closed=True,
@@ -268,7 +329,15 @@ def run_feedback(args: argparse.Namespace) -> int:
         return 0
     if args.feedback_command == "reopen":
         changed = feedback.set_closed(args.feedback_ids, closed=False)
-        print(f"Reopened {len(changed)} feedback record{'s' if len(changed) != 1 else ''}.")
+        print(
+            json.dumps(
+                {"changed": len(changed), "feedback_ids": changed},
+                indent=2,
+                sort_keys=True,
+            )
+            if getattr(args, "json_output", False)
+            else f"Reopened {len(changed)} feedback record{'s' if len(changed) != 1 else ''}."
+        )
         return 0
     if args.feedback_command == "remove":
         removed = feedback.remove(args.feedback_ids)
@@ -292,6 +361,23 @@ def run_feedback(args: argparse.Namespace) -> int:
         width = shutil.get_terminal_size(fallback=(140, 24)).columns
         print(feedback.format_compact_records(result, width=width))
     return 0
+
+
+def run_agent_feedback(arguments: list[str]) -> int:
+    """Run the bounded agent feedback interface with structured errors."""
+    try:
+        args = build_agent_feedback_parser().parse_args(arguments)
+        return run_feedback(args)
+    except KeyboardInterrupt:
+        return 130
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+        print(json.dumps({"error": str(error)}, sort_keys=True), file=sys.stderr)
+        return 2
+
+
+def agent_feedback_main() -> int:
+    """Run the standalone JSON-only feedback command."""
+    return run_agent_feedback(sys.argv[1:])
 
 
 def main() -> int:

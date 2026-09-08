@@ -69,26 +69,27 @@ PHI, or PII.
 ## Analyze the queue
 
 Preserve the current worktree and make one read call that matches the request.
-Use `feedback summary --json` for an aggregate overview. When record-level
-analysis is required, skip that preliminary call and use
-`feedback ls --all --json`, then fetch needed full records in one
-batched `feedback show <ref>...` call (or use `--limit 1` for only the newest
-record). From an
-`agent-workflows` checkout use its existing root environment directly;
-elsewhere use the installed executable, for example:
+Use `agent-feedback summary` for an aggregate overview. When
+record-level analysis is required, skip that preliminary call and use
+`agent-feedback ls --all`, then fetch needed full records in one batched
+`agent-feedback show <ref>...` call (or use
+`--limit 1` for only the newest record). The agent interface always emits JSON; do not add
+`--json` or select a Python environment. If the command is unavailable, report
+that `agent-workflows install` must be run instead of falling back to `.venv`,
+`uv`, or a Python path. For example:
 
 ```sh
-.venv/bin/agent-workflows feedback summary --json
-agent-workflows feedback summary --json
+agent-feedback summary
+agent-feedback ls --all --since 30d
 ```
 
 Apply requested source, repository, workflow, status, and cutoff filters. If
 both views are genuinely needed, carry the same `--since` age on summary and
 list so their scopes agree. Use compact ages such as `24h`, `30d`, or `4w`.
-Reuse the resulting records
-throughout the contiguous task; refresh only when scope changes, the store may
-have changed, or resolution reports a conflict. Use one batched
-`feedback show <ref>...` call only when direct ID lookup is needed. Do not load
+Reuse the resulting records throughout the contiguous task; refresh only when
+scope changes, the store may have changed, or resolution reports a conflict.
+Use one batched `agent-feedback show <ref>...` call only when
+direct ID lookup is needed. Do not load
 closed feedback without a reason or change status during default analysis. Do
 not set a custom uv cache or synchronize the environment.
 
@@ -100,8 +101,9 @@ group's IDs, evidence, confidence, consequence, proposed change, and expected
 disposition. A zero-item queue is a successful no-op.
 
 If the sanitized record is insufficient, explain the missing evidence.
-Ask the user before calling `feedback trace` or opening any Qwen transcript. After
-permission, inspect only rows tied to the exact feedback and origin call IDs.
+Ask the user before calling `agent-feedback trace` or opening
+any Qwen transcript. After permission, inspect only rows tied to the exact
+feedback and origin call IDs.
 Never scan, reproduce, or summarize the complete conversation.
 
 ## Implement authorized groups
@@ -133,11 +135,12 @@ After validation, close every proven record in the group with one concise note:
   observation, or unsupported premise.
 
 Apply mixed validated dispositions in one atomic
-`agent-workflows feedback close --input <JSON|file|->` request. The request
+`agent-feedback close --input <JSON|file|->` request. The request
 is a JSON array whose entries have `ref`, `disposition`, and an optional
 `note`; do not wrap it in a `resolutions` object. Prefer `--input -` with stdin for generated JSON so it cannot
-be mistaken for a file path. Use positional `feedback close` for a simple group
-sharing one disposition and note; never use `feedback remove` as routine cleanup. Leave
+be mistaken for a file path. Use positional `agent-feedback close`
+for a simple group sharing one disposition and note. The agent interface does
+not expose permanent removal; leave
 partial or ambiguous records open. Reopen a record when later review invalidates
 its resolution, then repair and revalidate it.
 

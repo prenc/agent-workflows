@@ -13,7 +13,12 @@ from unittest import mock
 import pytest
 
 from github_workflows import feedback
-from github_workflows.cli import build_parser, run_feedback
+from github_workflows.cli import (
+    build_agent_feedback_parser,
+    build_parser,
+    run_agent_feedback,
+    run_feedback,
+)
 from github_workflows.models import (
     RunManageRequest,
     TaskManageRequest,
@@ -514,6 +519,73 @@ def test_feedback_cli_lists_compact_records_and_shows_context(
     assert run_feedback(remove_args) == 0
     assert capsys.readouterr().out == "Removed 1 feedback record.\n"
     assert feedback.read_records() == []
+
+
+def test_agent_feedback_cli_returns_json_without_format_flags(
+    cache: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = append_feedback()
+    monkeypatch.setattr(feedback, "repository_from_workspace", lambda _workspace: None)
+
+    assert run_agent_feedback(["ls", "--all"]) == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert [record["feedback_id"] for record in listed] == [result["feedback_id"]]
+
+    assert run_agent_feedback(["show", str(result["ref"])]) == 0
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["feedback_id"] == result["feedback_id"]
+
+    assert run_agent_feedback(["add", "The agent command removed environment selection"]) == 0
+    recorded = json.loads(capsys.readouterr().out)
+    assert recorded["recorded"] is True
+    assert feedback.find(recorded["ref"])["message"] == (
+        "The agent command removed environment selection"
+    )
+
+
+def test_agent_feedback_is_a_standalone_command() -> None:
+    assert build_agent_feedback_parser().prog == "agent-feedback"
+    assert "agent-feedback" not in build_parser().format_help()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["list", "--json"],
+        ["path"],
+        ["remove", "12345678"],
+    ],
+)
+def test_agent_feedback_cli_rejects_non_agent_surface_as_json(
+    capsys: pytest.CaptureFixture[str], arguments: list[str]
+) -> None:
+    assert run_agent_feedback(arguments) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert isinstance(json.loads(captured.err)["error"], str)
+
+
+def test_agent_feedback_cli_mutations_return_json_receipts(
+    cache: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    result = append_feedback(message="Resolve through the agent interface")
+
+    assert run_agent_feedback(["close", str(result["ref"])]) == 0
+    closed = json.loads(capsys.readouterr().out)
+    assert closed["changed"] == 1
+    assert closed["unchanged"] == 0
+
+    assert run_agent_feedback(["close", str(result["ref"])]) == 0
+    unchanged = json.loads(capsys.readouterr().out)
+    assert unchanged["changed"] == 0
+    assert unchanged["unchanged"] == 1
+
+    assert run_agent_feedback(["reopen", str(result["ref"])]) == 0
+    reopened = json.loads(capsys.readouterr().out)
+    assert reopened == {"changed": 1, "feedback_ids": [result["feedback_id"]]}
 
 
 def test_feedback_cli_compact_json_is_bounded_and_metadata_only(

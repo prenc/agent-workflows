@@ -2188,16 +2188,16 @@ class TestExtensionMcp:
                     "make one read call that matches the request",
                     "skip that preliminary call",
                     "Reuse the resulting records",
-                    "feedback summary --json",
-                    "`feedback show <ref>...`",
+                    "agent-feedback summary",
+                    "`agent-feedback show <ref>...`",
                     "every explicitly approved",
                     "non-conflicting root-cause group",
                     "consolidate overlapping owning tests",
-                    "feedback close --input <JSON|file|->",
+                    "agent-feedback close --input <JSON|file|->",
                     "do not wrap it in a `resolutions` object",
                     "Prefer `--input -` with stdin",
-                    "Ask the user before calling `feedback trace`",
-                    "never use `feedback remove`",
+                    "Ask the user before calling `agent-feedback trace`",
+                    "permanent removal",
                     "commits, pushes, installation",
                     "MCP restart",
                     "`addressed`",
@@ -2207,5 +2207,5 @@ class TestExtensionMcp:
                 )
             )
 
-        assert "agent-workflows feedback add" in codex
+        assert "agent-feedback add" in codex
         assert "mcp__github_workflows__workflow_feedback" in qwen
