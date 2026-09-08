@@ -222,10 +222,19 @@ that issue, plausible matches read in full, relevant relationship records, the
 repository summary, cutoff, watermark, and immutable default SHA.
 Keep secrets and repository contents out of bundles.
 
+Every plausible record named in the supervisor shortlist or match index must
+appear in `matches` with its snapshot after the required full read. Do not omit
+a plausible match merely because the supervisor expects the worker to rediscover
+it.
+
 GitHub issue and PR records are the curator's evidence boundary. Treat paths,
 symbols, and implementation statements as claims from those records. Route a
 decision requiring current-code proof to `/gh-audit-repo` or
 `$gh-reassess-work`.
+Label every code-related “Key facts” entry as either audit-verified, with the
+originating audit run and immutable SHA when available, or as an unverified
+claim from a named GitHub record. Never instruct a curator worker to inspect
+repository source to verify it.
 
 ## Stage 2: run one complete report per issue
 
@@ -421,6 +430,12 @@ short second optimistic transaction to refresh affected records. A failed
 post-write cache refresh is reported but does not make a recorded GitHub write
 ambiguous. Keep run artifacts user-private and retain the run directory as
 recovery and audit state. Persistent history files are retained by design.
+
+After every task attempt is terminal and integrated and scheduler/pending work
+is empty, finish the run normally only when every required logical task has an
+integrated completion. If at least one required logical task cannot succeed,
+call `run_manage` with action `finish`, outcome `blocked`, and a concise
+non-empty note. A blocked run is terminal and cannot resume.
 
 ## Stage 6: report
 

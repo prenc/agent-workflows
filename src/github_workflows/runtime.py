@@ -573,6 +573,8 @@ class WorkflowRuntime:
     def _validate_execution_blocked_retry(
         previous: dict[str, Any], invocation_id: str | None
     ) -> None:
+        if previous.get("execution_blocked_requires_resume"):
+            raise ValueError("execution-blocked tasks require the run to pause and resume")
         blocked_invocation = previous.get("execution_blocked_invocation")
         if blocked_invocation is None:
             return
@@ -634,12 +636,52 @@ class WorkflowRuntime:
         return hashlib.sha256(rendered.encode()).hexdigest()
 
     @classmethod
+    def _audit_history_links(cls, assignment: dict[str, Any]) -> list[dict[str, Any]]:
+        links: list[dict[str, Any]] = []
+        seen: set[tuple[str, int]] = set()
+
+        def add(kind: str, number: Any, field: str) -> None:
+            if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+                raise ValueError(f"assignment.{field} must contain positive integers")
+            key = (kind, number)
+            if key not in seen:
+                seen.add(key)
+                links.append({"kind": kind, "number": number})
+
+        for field, kind in (
+            ("leads", "issue"),
+            ("history_issues", "issue"),
+            ("history_pulls", "pull"),
+        ):
+            values = assignment.get(field, [])
+            if not isinstance(values, list):
+                raise ValueError(f"assignment.{field} must be an array")
+            for number in values:
+                add(kind, number, field)
+        values = assignment.get("history_links", [])
+        if not isinstance(values, list):
+            raise ValueError("assignment.history_links must be an array")
+        for item in values:
+            if not isinstance(item, dict) or set(item) != {"kind", "number"}:
+                raise ValueError("assignment.history_links entries require only kind and number")
+            kind = item.get("kind")
+            if kind not in {"issue", "pull"}:
+                raise ValueError("assignment.history_links kind must be issue or pull")
+            add(str(kind), item.get("number"), "history_links")
+        if len(links) > TASK_HISTORY_LIMIT:
+            raise ValueError(
+                f"audit assignments accept at most {TASK_HISTORY_LIMIT} explicit history links"
+            )
+        return links
+
+    @classmethod
     def _audit_task_assignment(
         cls,
         assignment: dict[str, Any],
         *,
         caller_supplied: bool,
     ) -> dict[str, Any]:
+        cls._audit_history_links(assignment)
         if assignment.get("mode") != "verify":
             return assignment
         candidate = assignment.get("candidate")
@@ -801,7 +843,11 @@ class WorkflowRuntime:
         for field in ("pull_request", "remote_lease", "execution_environment"):
             if not isinstance(assignment.get(field), dict):
                 raise ValueError(f"assignment.{field} must be an object")
-        self._non_blank(assignment["pull_request"].get("state"), "pull_request.state")
+        pull_state = self._non_blank(assignment["pull_request"].get("state"), "pull_request.state")
+        if pull_state not in {"none", "open"}:
+            raise ValueError("assignment.pull_request.state must be none or open")
+        if pull_state == "none" and set(assignment["pull_request"]) != {"state"}:
+            raise ValueError("assignment.pull_request for new work must contain only state=none")
         self._non_blank(assignment["remote_lease"].get("state"), "remote_lease.state")
         environment = assignment["execution_environment"]
         if environment.get("mode") not in {"native", "shared", "isolated"}:
@@ -1068,66 +1114,19 @@ class WorkflowRuntime:
             }
         return status
 
-    @staticmethod
-    def _validate_generic_terminal(state: dict[str, Any]) -> None:
-        errors: list[str] = []
-        tasks = state.get("tasks", {})
-        if not isinstance(tasks, dict):
-            raise ValueError("generic workflow tasks state is invalid")
-        inputs = state.get("inputs", {})
-        if (
-            state.get("workflow") == "gh-implement-issue"
-            and isinstance(inputs, dict)
-            and inputs.get("targets")
-            and not tasks
-        ):
-            errors.append("target work has not been planned")
-        terminal = {"completed", "failed", "abandoned"}
-        nonterminal = sorted(
-            task_id
-            for task_id, task in tasks.items()
-            if not isinstance(task, dict) or task.get("status") not in terminal
-        )
-        if nonterminal:
-            errors.append(f"nonterminal tasks: {nonterminal}")
-        unintegrated = sorted(
-            task_id
-            for task_id, task in tasks.items()
-            if isinstance(task, dict)
-            and task.get("status") in terminal
-            and not task.get("integrated")
-        )
-        if unintegrated:
-            errors.append(f"unintegrated terminal tasks: {unintegrated}")
-        logical: dict[str, list[dict[str, Any]]] = {}
-        for task in tasks.values():
-            if isinstance(task, dict):
-                logical.setdefault(str(task.get("logical_id", "")), []).append(task)
-        missing_required = sorted(
-            logical_id
-            for logical_id, attempts in logical.items()
-            if any(attempt.get("required", True) for attempt in attempts)
-            and not any(
-                attempt.get("status") == "completed" and attempt.get("integrated")
-                for attempt in attempts
-            )
-        )
+    @classmethod
+    def _validate_generic_terminal(cls, state: dict[str, Any]) -> None:
+        errors, missing_required, _failed = workflow_run.generic_terminal_state(state)
         if missing_required:
             errors.append(
                 f"required logical tasks without an integrated completion: {missing_required}"
             )
-        scheduler = state.get("scheduler", {})
-        if not isinstance(scheduler, dict):
-            errors.append("scheduler state is invalid")
-        else:
-            if scheduler.get("integration_queue"):
-                errors.append("integration queue is not empty")
-            if scheduler.get("supervisor_activity") is not None:
-                errors.append("supervisor material activity is still active")
-        if state.get("pending"):
-            errors.append("pending operations are not empty")
         if errors:
             raise ValueError("generic workflow cannot be finalized: " + "; ".join(errors))
+
+    @classmethod
+    def _blocked_terminal(cls, state: dict[str, Any], note: str | None) -> dict[str, Any]:
+        return workflow_run.generic_blocked_terminal(state, note)
 
     def run_manage(self, request: RunManageRequest) -> dict[str, Any]:
         with self.lock():
@@ -1200,13 +1199,17 @@ class WorkflowRuntime:
                 self._event({"type": "directive-update", "directive": request.directive()})
             else:
                 state = self.state(request.workflow)
+                blocked_terminal: dict[str, Any] | None = None
                 if request.action == "finish" and request.workflow != "gh-audit-repo":
-                    self._validate_generic_terminal(state)
+                    if request.outcome == "blocked":
+                        blocked_terminal = self._blocked_terminal(state, request.note)
+                    else:
+                        self._validate_generic_terminal(state)
                 status = {
                     "checkpoint": "in-progress",
                     "pause": "suspended",
                     "abort": "aborted",
-                    "finish": "complete",
+                    "finish": "blocked" if blocked_terminal is not None else "complete",
                 }[request.action]
                 terminal = request.action in {"abort", "finish"}
                 update = (
@@ -1216,6 +1219,8 @@ class WorkflowRuntime:
                     and "pending" in request.model_fields_set
                     else None
                 )
+                if blocked_terminal is not None:
+                    update = {"terminal": blocked_terminal}
                 with self._json_file(update) if update is not None else nullcontext() as source:
                     self._invoke(
                         lambda args: workflow_run.update_state(args, terminal=terminal),
@@ -1290,6 +1295,8 @@ class WorkflowRuntime:
             "tasks": tasks,
             "scheduler": scheduler,
         }
+        if isinstance(state.get("terminal"), dict):
+            summary["terminal"] = state["terminal"]
         if workflow == "gh-audit-repo" and state.get("schema_version") == 2:
             finish_blockers = workflow_run.audit_finish_blockers(self.current(workflow), state)
             finish_ready = state.get("status") == "in-progress" and not finish_blockers
@@ -1553,8 +1560,9 @@ class WorkflowRuntime:
                     payload["note"] = request.note
                 if request.action == "fail" and request.note == "execution-blocked":
                     if invocation_id is None:
-                        raise ValueError("execution-blocked failure requires invocation context")
-                    payload["execution_blocked_invocation"] = invocation_id
+                        payload["execution_blocked_requires_resume"] = True
+                    else:
+                        payload["execution_blocked_invocation"] = invocation_id
                 try:
                     self._event(payload)
                 except Exception:
@@ -1797,8 +1805,9 @@ class WorkflowRuntime:
                 task["note"] = request.note
             if request.action == "fail" and request.note == "execution-blocked":
                 if invocation_id is None:
-                    raise ValueError("execution-blocked failure requires invocation context")
-                task["execution_blocked_invocation"] = invocation_id
+                    task["execution_blocked_requires_resume"] = True
+                else:
+                    task["execution_blocked_invocation"] = invocation_id
             if status in {"completed", "failed", "abandoned"} and request.task_id not in queue:
                 queue.append(request.task_id)
         state["revision"] += 1
@@ -1941,21 +1950,7 @@ class WorkflowRuntime:
         database = github_cache.live_path(github_cache.repo_dir(self.project_dir, repo), "records")
         if not database.is_file():
             raise ValueError("committed GitHub history cache is missing")
-        links: list[dict[str, Any]] = []
-        seen: set[tuple[str, int]] = set()
-        for number in assignment.get("leads", []):
-            if isinstance(number, int) and not isinstance(number, bool):
-                seen.add(("issue", number))
-                links.append({"kind": "issue", "number": number})
-        for item in assignment.get("history_links", []):
-            if not isinstance(item, dict):
-                continue
-            key = (item.get("kind"), item.get("number"))
-            if key[0] in {"issue", "pull"} and isinstance(key[1], int) and key not in seen:
-                seen.add(cast(tuple[str, int], key))
-                links.append({"kind": key[0], "number": key[1]})
-        if len(links) > 40:
-            raise ValueError("audit assignments accept at most 40 explicit history links")
+        links = self._audit_history_links(assignment)
         terms = " ".join(
             value
             for value in (

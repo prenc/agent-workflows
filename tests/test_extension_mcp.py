@@ -173,6 +173,69 @@ class TestExtensionMcp:
                 assert not retried.is_error
                 assert retried.structured_content["task"]["attempt"] == 2
 
+    async def test_execution_blocked_retry_without_mcp_metadata_requires_resume(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="github-workflows-no-invocation-") as directory:
+            root = Path(directory)
+            workspace = root / "repo"
+            workspace.mkdir()
+            runtime = WorkflowRuntime(workspace, root / "qwen-project")
+            async with Client(create_server(runtime), raise_exceptions=False) as client:
+                await client.call_tool(
+                    "run_manage",
+                    {
+                        "action": "start",
+                        "workflow": "gh-curate-issues",
+                        "repository": "example/repo",
+                    },
+                )
+                planned = await client.call_tool(
+                    "task_manage",
+                    {
+                        "action": "plan",
+                        "workflow": "gh-curate-issues",
+                        "task": {
+                            "logical_id": "unit-a",
+                            "assignment": self.curation_assignment(runtime, 1),
+                        },
+                    },
+                )
+                task_id = planned.structured_content["task_id"]
+                await client.call_tool(
+                    "task_manage",
+                    {
+                        "action": "mark_running",
+                        "workflow": "gh-curate-issues",
+                        "task_id": task_id,
+                    },
+                )
+                failed = await client.call_tool(
+                    "task_manage",
+                    {
+                        "action": "fail",
+                        "workflow": "gh-curate-issues",
+                        "task_id": task_id,
+                        "note": "execution-blocked",
+                    },
+                )
+                assert not failed.is_error
+                retry = await client.call_tool(
+                    "task_manage",
+                    {"action": "retry", "workflow": "gh-curate-issues", "task_id": task_id},
+                )
+                assert retry.is_error
+                await client.call_tool(
+                    "run_manage", {"action": "pause", "workflow": "gh-curate-issues"}
+                )
+                await client.call_tool(
+                    "run_manage", {"action": "resume", "workflow": "gh-curate-issues"}
+                )
+                retry = await client.call_tool(
+                    "task_manage",
+                    {"action": "retry", "workflow": "gh-curate-issues", "task_id": task_id},
+                )
+                assert not retry.is_error
+                assert retry.structured_content["task"]["attempt"] == 2
+
     @staticmethod
     def git(*arguments: str, cwd: Path) -> None:
         subprocess.run(
@@ -229,6 +292,10 @@ class TestExtensionMcp:
                 assert "repository" in run_properties
                 assert "instructions" in run_properties
                 assert "confirmed_source_sha" in run_properties
+                assert set(run_properties["outcome"]["anyOf"][0]["enum"]) == {
+                    "complete",
+                    "blocked",
+                }
                 for name in (
                     "task_manage",
                     "history_manage",
@@ -241,6 +308,9 @@ class TestExtensionMcp:
                     properties = tools[name].input_schema["properties"]
                     assert ("action" if name != "audit_probe" else "kind") in properties
                 assert "task" in tools["task_manage"].input_schema["properties"]
+                task_schema = json.dumps(tools["task_manage"].input_schema["properties"]["task"])
+                assert "snapshot and accepted_scope are non-empty compact strings" in task_schema
+                assert 'pull_request={\\"state\\":\\"none\\"}' in task_schema
                 report_schema = tools["task_manage"].input_schema["properties"]["report"]
                 assert report_schema["type"] == "object"
                 assert "anyOf" not in report_schema
@@ -1075,6 +1145,40 @@ class TestExtensionMcp:
                     )
                 )
             assert implementer.state("gh-implement-issue")["tasks"] == {}
+
+            for index, pull_request in enumerate(
+                ({"state": "draft"}, {"state": "none", "number": 1})
+            ):
+                invalid_pull = self.implementation_assignment(1)
+                invalid_pull["pull_request"] = pull_request
+                with pytest.raises(ValueError, match="pull_request"):
+                    implementer.task_manage(
+                        TaskManageRequest(
+                            action="plan",
+                            workflow="gh-implement-issue",
+                            task={
+                                "logical_id": f"invalid-pull-{index}",
+                                "assignment": invalid_pull,
+                            },
+                        )
+                    )
+
+            existing_pull = self.implementation_assignment(1)
+            existing_pull["pull_request"] = {
+                "state": "open",
+                "number": 44,
+                "head_sha": "b" * 40,
+            }
+            assert (
+                implementer.task_manage(
+                    TaskManageRequest(
+                        action="plan",
+                        workflow="gh-implement-issue",
+                        task={"logical_id": "existing-pull", "assignment": existing_pull},
+                    )
+                )["task"]["assignment"]["pull_request"]["number"]
+                == 44
+            )
 
             worktree = workspace / ".worktrees" / "unit"
             (worktree / "src").mkdir(parents=True)

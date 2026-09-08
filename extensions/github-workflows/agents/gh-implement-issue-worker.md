@@ -182,6 +182,12 @@ scientific and reproducibility semantics. The supervisor owns Python
 environment and lock mutation. Route dependency changes, Slurm/GPU work, and
 heavy computation to the supervisor for user authorization.
 
+Treat a repository instruction that a file “must remain unmodified” as a
+literal edit prohibition. If the accepted change would require modifying that
+file, stop before editing it and return `CORRECTION_NEEDED` (or `BLOCKED` when
+maintainer authority is required). The supervisor must resolve the conflict in
+interactive preflight; do not infer an exception from the requested outcome.
+
 Preflight the assigned validation plan before editing. Repository-owned commands
 must retain their documented argument lists. For an additional file-specific
 check, inspect the file's shebang, language configuration, and syntax; never
@@ -215,8 +221,10 @@ secret or confidential-data exposure, and accidental semantic changes. In a
 verification-only round, leave the worktree, branch, and PR unchanged and end
 with `NO_IMPLEMENTATION` when no gap exists or `CORRECTION_NEEDED` when one is
 proven. In an implementation round, commit the focused unit changes and push
-the assigned branch. Use the recorded lease for an existing remote branch and
-a normal first push after confirming a new remote ref remains absent.
+the assigned branch. Use the recorded lease for an existing remote branch.
+When the assignment's supervisor-verified `remote_lease.state` is `absent`,
+trust that lease and use a normal first push; do not run a redundant remote-ref
+query. The push remains the race-detecting operation.
 
 For an implementation round, build the PR body from the shared template and begin it with
 `<!-- qwen:issue-implementation:v1 -->`. Create a new PR with `draft: true`, or

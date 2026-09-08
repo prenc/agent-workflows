@@ -43,24 +43,24 @@ and other local callers can record the same concise observation with
 time, storage, and CLI provenance are derived automatically.
 Use `agent-workflows feedback summary --json` for aggregate state: separate
 open and closed source counts, closed dispositions by source, timestamp range,
-and storage size. Use `feedback list` (`ls`) for records, with `--limit 1` for the
-newest record or `--all` for every match. Both commands accept `--repository`,
-`--workflow`, and an inclusive creation-time lower bound via `--cutoff`.
+and storage size. `feedback list` (`ls`) returns the 50 newest open records by
+default, with `--limit 1` for only the newest record or `--all` for every match.
+Select another state with `--status closed|all`. Both commands accept
+`--repository`, `--workflow`, and a recent-age filter such as `--since 30d`.
 Each listed record has a short collision-free `ref` for routine commands and
 retains its canonical `fb-` ID for storage and transcript correlation.
-`feedback show <ref>...` accepts one or more records. Repeat `--source <name>`
-on `ls` to include one or more normalized tool sources.
+`feedback show <ref>...` returns complete records. Repeat `--source <name>` on
+`ls` to include one or more normalized tool sources.
 Use `feedback trace <feedback-id>`
 to locate the exact Qwen session and tool call without printing conversation
 content. Feedback stores PHI-free summaries and bounded call shapes only; raw
 tool arguments, responses, prompts, and source-data excerpts remain exclusively
 in the Qwen transcript.
-The legacy `--tool` spelling remains an alias for `--source`. Close reviewed
-records with `feedback close <feedback-id> [<feedback-id> ...]`, optionally
+Close reviewed records with `feedback close <feedback-id> [<feedback-id> ...]`, optionally
 selecting a disposition and a short PHI-free note; default lists
-show only open feedback, while `feedback ls --closed` inspects the retained
-closed set. Use `feedback reopen` to restore a
-closed record. Apply mixed dispositions atomically with
+show bounded metadata and summaries with the local date as one record per line;
+JSON retains the full timestamp and includes closed-record dispositions. Use
+`feedback reopen` to restore a closed record. Apply mixed dispositions atomically with
 `feedback close --input <JSON-list|file|->`; `feedback remove` permanently
 deletes records.
 

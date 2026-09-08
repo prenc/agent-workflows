@@ -68,7 +68,10 @@ helps identify the interface.
 
 Preserve the current worktree and make one read call that matches the request.
 Use `feedback summary --json` for an aggregate overview. When record-level
-analysis is required, skip that preliminary call and use `feedback ls --all --json` directly (or `--limit 1` for only the newest record). From an
+analysis is required, skip that preliminary call and use
+`feedback ls --all --json`, then fetch needed full records in one
+batched `feedback show <ref>...` call (or use `--limit 1` for only the newest
+record). From an
 `agent-workflows` checkout use its existing root environment directly;
 elsewhere use the installed executable, for example:
 
@@ -78,9 +81,9 @@ agent-workflows feedback summary --json
 ```
 
 Apply requested source, repository, workflow, status, and cutoff filters. If
-both views are genuinely needed, carry the same `--cutoff` on summary and list
-so their scopes agree. The cutoff is an inclusive lower bound on record
-creation time. Reuse the resulting records
+both views are genuinely needed, carry the same `--since` age on summary and
+list so their scopes agree. Use compact ages such as `24h`, `30d`, or `4w`.
+Reuse the resulting records
 throughout the contiguous task; refresh only when scope changes, the store may
 have changed, or resolution reports a conflict. Use one batched
 `feedback show <ref>...` call only when direct ID lookup is needed. Do not load

@@ -15,13 +15,14 @@ from typing import Any
 
 WORKFLOWS = {"gh-audit-repo", "gh-curate-issues", "gh-implement-issue"}
 RESUMABLE = {"in-progress", "suspended", "partial"}
-TERMINAL = {"complete", "aborted"}
+TERMINAL = {"complete", "blocked", "aborted"}
 STATUSES = RESUMABLE | TERMINAL
 RUN_TRANSITIONS = {
-    "in-progress": {"in-progress", "suspended", "complete", "aborted"},
+    "in-progress": {"in-progress", "suspended", "complete", "blocked", "aborted"},
     "partial": {"suspended", "aborted"},
     "suspended": {"aborted"},
     "complete": set(),
+    "blocked": set(),
     "aborted": set(),
 }
 RESERVED = {
@@ -319,6 +320,15 @@ def resume(args: argparse.Namespace) -> None:
     previous = state["status"]
     if previous != "in-progress":
         state["status"] = "in-progress"
+        cleared = 0
+        tasks = state.get("tasks")
+        if isinstance(tasks, dict):
+            for task in tasks.values():
+                if (
+                    isinstance(task, dict)
+                    and task.pop("execution_blocked_requires_resume", None) is not None
+                ):
+                    cleared += 1
         state["revision"] += 1
         state["updated_at"] = utc_now()
         write_state(current, state)
@@ -328,6 +338,7 @@ def resume(args: argparse.Namespace) -> None:
         previous=previous,
         status=state["status"],
         revision=state["revision"],
+        cleared_execution_blocks=cleared if previous != "in-progress" else 0,
     )
     print(
         json.dumps(
@@ -365,6 +376,10 @@ def update_state(args: argparse.Namespace, *, terminal: bool) -> None:
     previous = state["status"]
     if status not in RUN_TRANSITIONS[previous]:
         raise ValueError(f"invalid run transition: {previous} -> {status}")
+    if terminal and status == "blocked":
+        if state.get("workflow") == "gh-audit-repo":
+            raise ValueError("audit workflows cannot be finalized as blocked")
+        validate_generic_blocked_terminal(state)
     if (
         terminal
         and status == "complete"
@@ -385,6 +400,93 @@ def update_state(args: argparse.Namespace, *, terminal: bool) -> None:
             revision=state["revision"],
         )
     print(json.dumps({"run_dir": str(current), "status": status, "revision": state["revision"]}))
+
+
+def generic_terminal_state(state: dict[str, Any]) -> tuple[list[str], list[str], list[str]]:
+    """Return structural blockers, incomplete required units, and failed attempts."""
+    errors: list[str] = []
+    tasks = state.get("tasks", {})
+    if not isinstance(tasks, dict):
+        raise ValueError("generic workflow tasks state is invalid")
+    inputs = state.get("inputs", {})
+    if (
+        state.get("workflow") == "gh-implement-issue"
+        and isinstance(inputs, dict)
+        and inputs.get("targets")
+        and not tasks
+    ):
+        errors.append("target work has not been planned")
+    terminal = {"completed", "failed", "abandoned"}
+    nonterminal = sorted(
+        task_id
+        for task_id, task in tasks.items()
+        if not isinstance(task, dict) or task.get("status") not in terminal
+    )
+    if nonterminal:
+        errors.append(f"nonterminal tasks: {nonterminal}")
+    unintegrated = sorted(
+        task_id
+        for task_id, task in tasks.items()
+        if isinstance(task, dict) and task.get("status") in terminal and not task.get("integrated")
+    )
+    if unintegrated:
+        errors.append(f"unintegrated terminal tasks: {unintegrated}")
+    logical: dict[str, list[dict[str, Any]]] = {}
+    for task in tasks.values():
+        if isinstance(task, dict):
+            logical.setdefault(str(task.get("logical_id", "")), []).append(task)
+    missing_required = sorted(
+        logical_id
+        for logical_id, attempts in logical.items()
+        if any(attempt.get("required", True) for attempt in attempts)
+        and not any(
+            attempt.get("status") == "completed" and attempt.get("integrated")
+            for attempt in attempts
+        )
+    )
+    scheduler = state.get("scheduler", {})
+    if not isinstance(scheduler, dict):
+        errors.append("scheduler state is invalid")
+    else:
+        if scheduler.get("integration_queue"):
+            errors.append("integration queue is not empty")
+        if scheduler.get("supervisor_activity") is not None:
+            errors.append("supervisor material activity is still active")
+    if state.get("pending"):
+        errors.append("pending operations are not empty")
+    failed = sorted(
+        task_id
+        for task_id, task in tasks.items()
+        if isinstance(task, dict) and task.get("status") == "failed"
+    )
+    return errors, missing_required, failed
+
+
+def generic_blocked_terminal(state: dict[str, Any], note: str | None) -> dict[str, Any]:
+    """Build validated metadata for a terminal blocked generic run."""
+    errors, missing_required, failed = generic_terminal_state(state)
+    if not missing_required:
+        errors.append("at least one required logical task must lack an integrated completion")
+    if not isinstance(note, str) or not note.strip():
+        errors.append("blocked terminal note must be a non-empty string")
+    if errors:
+        raise ValueError("generic workflow cannot finish blocked: " + "; ".join(errors))
+    return {
+        "outcome": "blocked",
+        "note": note.strip(),
+        "logical_ids": missing_required,
+        "failed_task_ids": failed,
+    }
+
+
+def validate_generic_blocked_terminal(state: dict[str, Any]) -> None:
+    """Reject incomplete or forged blocked-run metadata at the state boundary."""
+    terminal = state.get("terminal")
+    if not isinstance(terminal, dict):
+        raise ValueError("blocked finalization requires terminal metadata")
+    expected = generic_blocked_terminal(state, terminal.get("note"))
+    if terminal != expected:
+        raise ValueError("blocked finalization terminal metadata does not match task state")
 
 
 def audit_state(
@@ -659,6 +761,7 @@ def audit_event(args: argparse.Namespace) -> None:
             "error",
             "note",
             "execution_blocked_invocation",
+            "execution_blocked_requires_resume",
         ):
             if name in payload:
                 task[name] = payload[name]

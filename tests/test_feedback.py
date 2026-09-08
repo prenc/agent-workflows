@@ -487,23 +487,12 @@ def test_feedback_cli_lists_compact_records_and_shows_context(
     cache: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     result = append_feedback()
-    list_args = argparse.Namespace(
-        feedback_command="list",
-        repository=None,
-        workflow=None,
-        sources=None,
-        closed=False,
-        status=None,
-        cutoff=None,
-        limit=50,
-        all_records=False,
-        json_output=False,
-    )
+    list_args = build_parser().parse_args(["feedback", "ls"])
     assert run_feedback(list_args) == 0
     table = capsys.readouterr().out
-    assert "WHEN (LOCAL)" in table
     assert "example/repo" in table
     assert "run-1" not in table
+    assert "The schema rejected a structured report" in table
     assert "report must be an object" not in table
 
     list_args.json_output = True
@@ -525,6 +514,59 @@ def test_feedback_cli_lists_compact_records_and_shows_context(
     assert run_feedback(remove_args) == 0
     assert capsys.readouterr().out == "Removed 1 feedback record.\n"
     assert feedback.read_records() == []
+
+
+def test_feedback_cli_compact_json_is_bounded_and_metadata_only(
+    cache: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    result = append_feedback(message="word\n\x1b[31m" + "x" * 220)
+    append_feedback(message="excluded", tool="web_fetch")
+    feedback.set_closed([str(result["feedback_id"])], closed=True, disposition="external")
+    args = build_parser().parse_args(
+        [
+            "feedback",
+            "ls",
+            "--all",
+            "--source",
+            "task_manage",
+            "--status",
+            "all",
+            "--json",
+        ]
+    )
+
+    assert run_feedback(args) == 0
+
+    listed = json.loads(capsys.readouterr().out)
+    assert len(listed) == 1
+    assert set(listed[0]) == {
+        "ref",
+        "feedback_id",
+        "timestamp",
+        "repository",
+        "workflow",
+        "source",
+        "tool",
+        "status",
+        "summary",
+        "disposition",
+    }
+    assert listed[0]["feedback_id"] == result["feedback_id"]
+    assert len(listed[0]["summary"]) <= 160
+    assert "\n" not in listed[0]["summary"]
+    assert "\x1b" not in listed[0]["summary"]
+    assert listed[0]["summary"].endswith("…")
+    assert listed[0]["disposition"] == "external"
+
+    args.json_output = False
+    assert run_feedback(args) == 0
+    rendered = capsys.readouterr().out.rstrip("\n")
+    assert len(rendered.splitlines()) == 1
+    assert "Summary: -" not in rendered
+    assert "external" in rendered
+    assert "word" in rendered
+    assert re.search(r"\b\d{4}-\d{2}-\d{2}\b", rendered)
+    assert not re.search(r"\b\d{2}:\d{2}:\d{2}\b", rendered)
 
 
 def test_feedback_summary_and_list_have_distinct_complete_views(
@@ -578,9 +620,24 @@ def test_feedback_summary_and_list_have_distinct_complete_views(
     assert "addressed=1" in human
     assert "task_context" in human
 
-    conflicting = build_parser().parse_args(["feedback", "ls", "--closed", "--status", "all"])
-    with pytest.raises(ValueError, match="cannot be combined"):
-        run_feedback(conflicting)
+    parser = build_parser()
+    for arguments in (
+        ["--closed"],
+        ["--tool", "task_context"],
+        ["--compact"],
+        ["--cutoff", "2026-09-01"],
+    ):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["feedback", "ls", *arguments])
+    with pytest.raises(SystemExit) as help_exit:
+        parser.parse_args(["feedback", "ls", "--help"])
+    assert help_exit.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "50 newest open records" in help_text
+    assert "default: 50" in help_text
+    assert "default: open" in help_text
+    assert "one compact record per line" in help_text
+    assert "feedback show REF" in help_text
 
 
 def test_feedback_short_refs_are_unique_at_creation(cache: Path) -> None:
@@ -723,7 +780,7 @@ def test_feedback_cli_closes_filters_and_reopens_records(
         second["feedback_id"]
     ]
 
-    closed_args = build_parser().parse_args(["feedback", "ls", "--closed", "--json"])
+    closed_args = build_parser().parse_args(["feedback", "ls", "--status", "closed", "--json"])
     assert run_feedback(closed_args) == 0
     closed = json.loads(capsys.readouterr().out)
     assert [record["feedback_id"] for record in closed] == [first["feedback_id"]]
@@ -1047,6 +1104,32 @@ def test_feedback_summary_supports_inclusive_normalized_cutoff(cache: Path) -> N
         feedback.feedback_summary(cutoff="yesterday")
 
 
+@pytest.mark.parametrize(
+    ("age", "expected"),
+    [
+        ("30m", "2026-09-08T11:30:00Z"),
+        ("24h", "2026-09-07T12:00:00Z"),
+        ("30d", "2026-08-09T12:00:00Z"),
+        ("4w", "2026-08-11T12:00:00Z"),
+    ],
+)
+def test_feedback_relative_cutoff_accepts_compact_ages(age: str, expected: str) -> None:
+    now = feedback.dt.datetime(2026, 9, 8, 12, tzinfo=feedback.dt.UTC)
+    assert feedback.relative_cutoff(age, now=now) == expected
+
+
+@pytest.mark.parametrize("age", ["", "0d", "-1d", "1month", "yesterday"])
+def test_feedback_relative_cutoff_rejects_ambiguous_ages(age: str) -> None:
+    with pytest.raises(ValueError, match="positive age"):
+        feedback.relative_cutoff(age)
+
+
+def test_feedback_list_and_summary_expose_relative_since_only() -> None:
+    parser = build_parser()
+    assert parser.parse_args(["feedback", "ls", "--since", "30d"]).since == "30d"
+    assert parser.parse_args(["feedback", "summary", "--since", "4w"]).since == "4w"
+
+
 def test_feedback_cli_replaces_stats_and_sources_with_summary() -> None:
     parser = build_parser()
     assert parser.parse_args(["feedback", "summary"]).feedback_command == "summary"
@@ -1197,7 +1280,7 @@ def test_feedback_cli_filters_and_counts_normalized_sources(
     append_feedback(tool=None, message="General feedback")
 
     parsed = build_parser().parse_args(
-        ["feedback", "ls", "--source", "task_context", "--tool", "web_fetch"]
+        ["feedback", "ls", "--source", "task_context", "--source", "web_fetch"]
     )
     assert parsed.feedback_command == "list"
     assert parsed.sources == ["task_context", "web_fetch"]
@@ -1221,10 +1304,10 @@ def test_feedback_cli_filters_and_counts_normalized_sources(
     assert "Closed (0)" in table
 
 
-def test_feedback_table_formats_short_refs_and_empty_results() -> None:
-    assert feedback.format_table([], width=120) == "No feedback recorded."
+def test_feedback_compact_rows_format_short_refs_and_empty_results() -> None:
+    assert feedback.format_compact_records([], width=120) == "No feedback recorded."
     message = "A long explanation " * 20
-    table = feedback.format_table(
+    table = feedback.format_compact_records(
         [
             {
                 "feedback_id": "fb-20260901232545-5f009f5df7",
@@ -1232,24 +1315,21 @@ def test_feedback_table_formats_short_refs_and_empty_results() -> None:
                 "timestamp": "2026-09-01T23:25:45.610861Z",
                 "repository": "example/repository-with-a-long-name",
                 "workflow": "gh-audit-repo",
-                "tool": "glob",
-                "message": message,
-                "provenance": {"task": {"id": "discover-core-1"}},
+                "source": "glob",
+                "status": "open",
+                "summary": message,
             }
         ],
-        width=100,
+        width=120,
     )
 
     assert "009f5df7" in table
     assert "fb-20260901232545-5f009f5df7" not in table
-    expected_time = feedback._display_time("2026-09-01T23:25:45Z")
-    assert expected_time in table
-    assert "example/repository-with-a-long-name" in table
-    assert "discover-core" in table
+    expected_date = feedback._display_date("2026-09-01T23:25:45Z")
+    assert expected_date in table
     assert "glob" in table
-    assert "Summary:" in table
-    assert "\n           " in table
-    assert " ".join(message.split()) in " ".join(table.split())
+    assert len(table.splitlines()) == 1
+    assert len(table) <= 120
 
 
 def test_feedback_display_time_uses_system_timezone(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1280,16 +1360,17 @@ def test_feedback_display_time_falls_back_to_edt(monkeypatch: pytest.MonkeyPatch
     assert feedback._display_time("2026-09-01T12:00:00Z") == "2026-09-01 08:00:00 EDT"
 
 
-def test_feedback_table_labels_records_without_tools_as_general() -> None:
-    table = feedback.format_table(
+def test_feedback_compact_rows_label_records_without_sources_as_general() -> None:
+    table = feedback.format_compact_records(
         [
             {
                 "feedback_id": "fb-123456789abc",
                 "timestamp": "2026-09-01T23:25:45Z",
                 "repository": "example/repo",
                 "workflow": "gh-audit-repo",
-                "tool": None,
-                "message": "The active instruction was ambiguous",
+                "source": "general",
+                "status": "open",
+                "summary": "The active instruction was ambiguous",
             }
         ],
         width=120,
@@ -1298,18 +1379,19 @@ def test_feedback_table_labels_records_without_tools_as_general() -> None:
     assert "general" in table
 
 
-def test_feedback_table_escapes_terminal_controls() -> None:
-    table = feedback.format_table(
+def test_feedback_compact_rows_escape_terminal_controls() -> None:
+    table = feedback.format_compact_records(
         [
             {
                 "feedback_id": "fb-123456789abc",
                 "timestamp": "2026-09-01T23:25:45Z",
                 "repository": "example/repo",
-                "tool": "tool\x1b]8;;https://example.invalid\x07",
-                "message": "warning\x1b[2J\x9b31m hidden\u200btext",
+                "source": "tool\x1b]8;;https://example.invalid\x07",
+                "status": "open",
+                "summary": "warning\x1b[2J\x9b31m hidden\u200btext",
             }
         ],
-        width=100,
+        width=200,
     )
 
     assert "\x1b" not in table

@@ -351,8 +351,9 @@ unrelated stale/fixed/duplicate observations for closure reconciliation or the
 final report.
 
 The server supplies each audit worker with a bounded compact history view through
-`task_context`. Include issue leads and optional typed issue/PR history links in
-the assignment so that view contains relevant open records and only the resolved
+`task_context`. Use canonical
+`history_links: [{"kind": "issue"|"pull", "number": <positive integer>}]`
+in assignments so that view contains relevant open records and only the resolved
 records selected by the targeted gate. Without
 `--regression-sweep`, select a resolved record only when its affected paths
 changed after resolution, a current lead matches its root cause, or it is needed

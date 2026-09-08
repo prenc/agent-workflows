@@ -102,6 +102,114 @@ class TestWorkflowRun:
         second = self.initialize("gh-implement-issue")
         assert first["run_id"] != second["run_id"]
 
+    def test_direct_blocked_finalization_enforces_workflow_integrity(self) -> None:
+        self.initialize("gh-audit-repo")
+        audit = self.call(
+            "finalize",
+            "gh-audit-repo",
+            "--expected-revision",
+            "1",
+            "--status",
+            "blocked",
+            check=False,
+        )
+        assert audit.returncode != 0
+        assert "audit workflows cannot be finalized as blocked" in audit.stderr
+        audit_state = json.loads(
+            (self.project_dir / "workflows/gh-audit-repo/current/state.json").read_text()
+        )
+        assert audit_state["status"] == "in-progress"
+        assert audit_state["revision"] == 1
+
+        source = self.project / "generic-input.json"
+        source.write_text(
+            json.dumps(
+                {
+                    "repository": "example/repo",
+                    "inputs": {"targets": []},
+                    "tasks": {
+                        "unit-1": {
+                            "logical_id": "unit",
+                            "required": True,
+                            "status": "failed",
+                            "integrated": True,
+                        }
+                    },
+                    "scheduler": {
+                        "integration_queue": [],
+                        "supervisor_activity": None,
+                    },
+                    "pending": [],
+                }
+            )
+            + "\n"
+        )
+        self.call("initialize", "gh-curate-issues", "--input", str(source))
+        missing = self.call(
+            "finalize",
+            "gh-curate-issues",
+            "--expected-revision",
+            "1",
+            "--status",
+            "blocked",
+            check=False,
+        )
+        assert missing.returncode != 0
+        assert "requires terminal metadata" in missing.stderr
+
+        terminal = self.project / "terminal.json"
+        terminal.write_text(
+            json.dumps(
+                {
+                    "terminal": {
+                        "outcome": "blocked",
+                        "note": "Maintainer decision required",
+                        "logical_ids": ["wrong-unit"],
+                        "failed_task_ids": ["unit-1"],
+                    }
+                }
+            )
+            + "\n"
+        )
+        forged = self.call(
+            "finalize",
+            "gh-curate-issues",
+            "--expected-revision",
+            "1",
+            "--status",
+            "blocked",
+            "--input",
+            str(terminal),
+            check=False,
+        )
+        assert forged.returncode != 0
+        assert "metadata does not match task state" in forged.stderr
+
+        terminal.write_text(
+            json.dumps(
+                {
+                    "terminal": {
+                        "outcome": "blocked",
+                        "note": "Maintainer decision required",
+                        "logical_ids": ["unit"],
+                        "failed_task_ids": ["unit-1"],
+                    }
+                }
+            )
+            + "\n"
+        )
+        finalized = self.call(
+            "finalize",
+            "gh-curate-issues",
+            "--expected-revision",
+            "1",
+            "--status",
+            "blocked",
+            "--input",
+            str(terminal),
+        )
+        assert json.loads(finalized.stdout)["status"] == "blocked"
+
     def test_checkpoint_rejects_stale_revision(self) -> None:
         self.initialize()
         failed = self.call(

@@ -91,35 +91,54 @@ def build_parser() -> argparse.ArgumentParser:
     )
     feedback_summary.add_argument("--repository")
     feedback_summary.add_argument("--workflow")
-    feedback_summary.add_argument("--cutoff", help="include records created at or after this time")
+    feedback_summary.add_argument(
+        "--since", help="include records from the last AGE, such as 24h, 30d, or 4w"
+    )
     feedback_summary.add_argument(
         "--json", action="store_true", dest="json_output", help="print machine-readable JSON"
     )
     feedback_list = feedback_commands.add_parser(
-        "list", aliases=["ls"], help="list compact feedback records"
+        "list",
+        aliases=["ls"],
+        help="list newest feedback summaries",
+        description=(
+            "List newest feedback as one compact record per line. Defaults to the 50 newest "
+            "open records; use 'feedback show REF...' for complete record details."
+        ),
     )
     feedback_list.set_defaults(feedback_command="list")
-    feedback_list.add_argument("--repository")
-    feedback_list.add_argument("--workflow")
-    feedback_list.add_argument("--cutoff", help="include records created at or after this time")
+    feedback_list.add_argument("--repository", help="include only this OWNER/REPO")
+    feedback_list.add_argument("--workflow", help="include only this workflow")
     feedback_list.add_argument(
-        "--closed", action="store_true", help="show closed feedback instead of open feedback"
+        "--since", help="include records from the last AGE, such as 24h, 30d, or 4w"
     )
-    feedback_list.add_argument("--status", choices=("open", "closed", "all"))
+    feedback_list.add_argument(
+        "--status",
+        choices=("open", "closed", "all"),
+        default="open",
+        help="record state to include (default: open)",
+    )
     feedback_list.add_argument(
         "--source",
-        "--tool",
         action="append",
         dest="sources",
-        help="include a logical source; repeat to include more than one",
+        help="include this normalized source; repeat to include more than one",
     )
     list_limit = feedback_list.add_mutually_exclusive_group()
-    list_limit.add_argument("--limit", type=int, default=50)
     list_limit.add_argument(
-        "--all", action="store_true", dest="all_records", help="return every matching record"
+        "--limit", type=int, default=50, help="maximum newest records to return (default: 50)"
+    )
+    list_limit.add_argument(
+        "--all",
+        action="store_true",
+        dest="all_records",
+        help="return every matching record instead of limiting to 50",
     )
     feedback_list.add_argument(
-        "--json", action="store_true", dest="json_output", help="print machine-readable JSON"
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="print the same compact records as a JSON array",
     )
     feedback_show = feedback_commands.add_parser(
         "show", help="show one or more complete feedback records"
@@ -215,7 +234,7 @@ def run_feedback(args: argparse.Namespace) -> int:
         result = feedback.feedback_summary(
             repository=args.repository,
             workflow=args.workflow,
-            cutoff=args.cutoff,
+            cutoff=feedback.relative_cutoff(args.since),
         )
         print(
             json.dumps(result, indent=2, sort_keys=True)
@@ -256,9 +275,6 @@ def run_feedback(args: argparse.Namespace) -> int:
         print(f"Removed {len(removed)} feedback record{'s' if len(removed) != 1 else ''}.")
         return 0
     else:
-        if args.closed and args.status is not None:
-            raise ValueError("feedback list --closed cannot be combined with --status")
-        status = args.status or ("closed" if args.closed else "open")
         limit = None if args.all_records else args.limit
         if limit is not None and limit < 1:
             raise ValueError("feedback limit must be positive")
@@ -266,19 +282,15 @@ def run_feedback(args: argparse.Namespace) -> int:
             repository=args.repository,
             workflow=args.workflow,
             sources=args.sources,
-            status=status,
-            cutoff=args.cutoff,
+            status=args.status,
+            cutoff=feedback.relative_cutoff(args.since),
             limit=limit,
         )
     if getattr(args, "json_output", False):
         print(json.dumps(result, indent=2, sort_keys=True))
     else:
-        print(
-            feedback.format_table(
-                result,
-                width=shutil.get_terminal_size(fallback=(140, 24)).columns,
-            )
-        )
+        width = shutil.get_terminal_size(fallback=(140, 24)).columns
+        print(feedback.format_compact_records(result, width=width))
     return 0
 
 

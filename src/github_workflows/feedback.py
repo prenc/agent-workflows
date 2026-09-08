@@ -9,7 +9,6 @@ import os
 import re
 import stat
 import subprocess
-import textwrap
 import threading
 import time
 import unicodedata
@@ -457,14 +456,12 @@ def compact_records(
     repository: str | None = None,
     workflow: str | None = None,
     sources: list[str] | None = None,
-    closed: bool = False,
-    status: str | None = None,
+    status: str = "open",
     cutoff: str | None = None,
     limit: int | None = 50,
 ) -> list[dict[str, Any]]:
     """Return newest matching records with globally resolvable short references."""
-    selected_status = status or ("closed" if closed else "open")
-    if selected_status not in {"open", "closed", "all"}:
+    if status not in {"open", "closed", "all"}:
         raise ValueError("feedback status must be open, closed, or all")
     if limit is not None and limit < 1:
         raise ValueError("feedback limit must be positive")
@@ -476,7 +473,7 @@ def compact_records(
         for record in records
         if (repository is None or record.get("repository") == repository)
         and (workflow is None or record.get("workflow") == workflow)
-        and (selected_status == "all" or record.get("status", "open") == selected_status)
+        and (status == "all" or record.get("status", "open") == status)
         and (cutoff_time is None or _record_time(record) >= cutoff_time)
         and (
             not requested_sources
@@ -485,7 +482,7 @@ def compact_records(
         )
     ]
     selected = list(reversed(matching if limit is None else matching[-limit:]))
-    return [
+    selected_records = [
         {
             **record,
             "ref": feedback_ref(str(record["feedback_id"]), records),
@@ -493,6 +490,43 @@ def compact_records(
         }
         for record in selected
     ]
+    return _compact_list_records(selected_records)
+
+
+def _compact_list_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Project feedback records to bounded queue-triage metadata."""
+    projected: list[dict[str, Any]] = []
+    for record in records:
+        raw = str(record.get("summary") or record.get("message") or "")
+        printable = "".join(
+            character if ord(character) >= 32 and ord(character) != 127 else " "
+            for character in raw
+        )
+        summary = " ".join(printable.split())
+        if len(summary) > 160:
+            summary = summary[:159].rstrip() + "…"
+        item = {
+            key: record.get(key)
+            for key in (
+                "ref",
+                "feedback_id",
+                "timestamp",
+                "repository",
+                "workflow",
+                "source",
+                "tool",
+                "status",
+            )
+        }
+        item["summary"] = summary
+        resolution = record.get("resolution")
+        disposition = resolution.get("disposition") if isinstance(resolution, dict) else None
+        if disposition is None:
+            disposition = record.get("disposition")
+        if disposition is not None:
+            item["disposition"] = disposition
+        projected.append(item)
+    return projected
 
 
 def feedback_ref(feedback_id: str, records: list[dict[str, Any]]) -> str:
@@ -527,6 +561,22 @@ def _parse_cutoff(value: str | None) -> dt.datetime | None:
     if parsed is None:
         raise ValueError("feedback cutoff must be an ISO-8601 timestamp")
     return parsed
+
+
+def relative_cutoff(value: str | None, *, now: dt.datetime | None = None) -> str | None:
+    """Convert a compact relative age to an absolute UTC cutoff."""
+    if value is None:
+        return None
+    match = re.fullmatch(r"([1-9][0-9]*)(m|h|d|w)", value.strip())
+    if match is None:
+        raise ValueError("feedback since must be a positive age such as 24h, 30d, or 4w")
+    amount = int(match.group(1))
+    unit = match.group(2)
+    seconds = amount * {"m": 60, "h": 3600, "d": 86400, "w": 604800}[unit]
+    current = now or dt.datetime.now(dt.UTC)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=dt.UTC)
+    return _iso_utc(current - dt.timedelta(seconds=seconds))
 
 
 def _record_time(record: Mapping[str, Any]) -> dt.datetime:
@@ -1065,6 +1115,20 @@ def _display_time(value: Any) -> str:
     return localized.strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
+def _display_date(value: Any) -> str:
+    try:
+        parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return str(value or "-")
+    try:
+        localized = parsed.astimezone()
+        if localized.tzinfo is None or not localized.tzname():
+            raise ValueError("system timezone is unavailable")
+    except (OSError, ValueError):
+        localized = parsed.astimezone(FALLBACK_EDT)
+    return localized.strftime("%Y-%m-%d")
+
+
 def _one_line(value: Any) -> str:
     raw = str(value or "-")
     visible = "".join(
@@ -1087,84 +1151,30 @@ def _bounded(value: Any, width: int) -> str:
     return rendered if len(rendered) <= width else rendered[: max(1, width - 1)] + "…"
 
 
-def _metadata_widths(headers: list[str], rows: list[list[str]], width: int) -> list[int]:
-    """Size columns to their content, shrinking payload columns only when needed."""
-    widths = [
-        max(len(header), *(len(row[index]) for row in rows)) for index, header in enumerate(headers)
-    ]
-    minimums = [len(header) for header in headers]
-    overflow = max(0, sum(widths) + 2 * (len(widths) - 1) - width)
-    for group in ((2, 3, 4), (0, 1)):
-        while overflow:
-            active = [index for index in group if widths[index] > minimums[index]]
-            if not active:
-                break
-            share = max(1, (overflow + len(active) - 1) // len(active))
-            for index in active:
-                reduction = min(share, widths[index] - minimums[index], overflow)
-                widths[index] -= reduction
-                overflow -= reduction
-                if not overflow:
-                    break
-    return widths
-
-
-def format_table(records: list[dict[str, Any]], *, width: int) -> str:
-    """Render compact metadata followed by each complete wrapped summary."""
+def format_compact_records(records: list[dict[str, Any]], *, width: int) -> str:
+    """Render each compact feedback record on exactly one line."""
     if not records:
         return "No feedback recorded."
     width = max(width, 100)
-    headers = ["ID", "WHEN (LOCAL)", "REPOSITORY", "CONTEXT", "SOURCE"]
-    rows: list[tuple[list[str], str]] = []
+    lines: list[str] = []
     for record in records:
-        provenance = record.get("provenance")
-        task = provenance.get("task") if isinstance(provenance, dict) else None
-        task_id = task.get("id") if isinstance(task, dict) else None
-        workflow = record.get("workflow")
-        context = (
-            str(task_id)
-            if width < 120 and task_id
-            else "/".join(str(item) for item in (workflow, task_id) if item) or "-"
-        )
-        rows.append(
+        status = _one_line(record.get("status"))
+        disposition = record.get("disposition")
+        if disposition:
+            status = f"{status}/{_one_line(disposition)}"
+        line = "  ".join(
             (
-                [
-                    _one_line(record.get("ref") or record.get("feedback_id")),
-                    _one_line(_display_time(record.get("timestamp"))),
-                    _one_line(record.get("repository")),
-                    _one_line(context),
-                    _one_line(source_name(record)),
-                ],
-                _one_line(record.get("message")),
+                _one_line(record.get("ref") or record.get("feedback_id")),
+                _one_line(_display_date(record.get("timestamp"))),
+                _one_line(record.get("repository")),
+                _one_line(record.get("workflow")),
+                _one_line(record.get("source")),
+                status,
+                _one_line(record.get("summary")),
             )
         )
-    widths = _metadata_widths(headers, [metadata for metadata, _summary in rows], width)
-    rendered = [
-        "  ".join(
-            _bounded(value, size).ljust(size) for value, size in zip(headers, widths, strict=True)
-        ),
-        "  ".join("-" * size for size in widths),
-    ]
-    summary_prefix = "  Summary: "
-    summary_indent = " " * len(summary_prefix)
-    for metadata, summary in rows:
-        rendered.append(
-            "  ".join(
-                _bounded(value, size).ljust(size)
-                for value, size in zip(metadata, widths, strict=True)
-            ).rstrip()
-        )
-        wrapped = textwrap.wrap(
-            summary,
-            width=max(20, width - len(summary_prefix)),
-            break_long_words=False,
-            break_on_hyphens=False,
-        ) or [""]
-        rendered.append(summary_prefix + wrapped[0])
-        rendered.extend(summary_indent + line for line in wrapped[1:])
-        rendered.append("")
-    rendered.pop()
-    return "\n".join(line.rstrip() for line in rendered)
+        lines.append(_bounded(line, width))
+    return "\n".join(lines)
 
 
 def format_feedback_summary(summary: Mapping[str, Any]) -> str:

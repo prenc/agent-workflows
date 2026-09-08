@@ -605,6 +605,7 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
         separate: bool | None = None,
         pending: JsonArrayArgument[list[str] | None] = None,
         confirmed_source_sha: str | None = None,
+        outcome: Literal["complete", "blocked"] | None = None,
         note: str | None = None,
     ) -> dict[str, Any]:
         """Start, resume, checkpoint, direct, pause, abort, or finish a workflow run."""

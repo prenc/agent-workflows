@@ -111,6 +111,7 @@ class RunManageRequest(StrictRequest):
         ),
     )
     acknowledge_pending_publication: bool = False
+    outcome: Literal["complete", "blocked"] | None = None
     note: str | None = None
 
     @field_validator("n", mode="before")
@@ -138,8 +139,15 @@ class RunManageRequest(StrictRequest):
 
     @model_validator(mode="after")
     def validate_action_fields(self) -> RunManageRequest:
-        control = {"action", "workflow", "note"}
+        control = {"action", "workflow", "note", "outcome"}
         supplied = self.model_fields_set - control
+        if self.outcome is not None:
+            if self.action != "finish":
+                raise ValueError("outcome is accepted only when finishing a workflow")
+            if self.workflow == "gh-audit-repo":
+                raise ValueError("audit workflows do not accept a finish outcome")
+            if self.outcome == "blocked" and (self.note is None or not self.note.strip()):
+                raise ValueError("blocked finish requires a non-blank note")
         if self.action == "start":
             if not self.repository:
                 raise ValueError("start requires repository in OWNER/REPO form")
@@ -240,11 +248,16 @@ class TaskPlan(StrictRequest):
         description=(
             "Workflow-specific assignment object; extension fields are allowed. Curator "
             "assignments require issue, issue_snapshot, and candidate_bundle. Implementation "
-            "assignments require issues, pull_request, worktree, branch, rebased_base_sha, "
+            "assignments require issues whose snapshot and accepted_scope are non-empty "
+            'compact strings. They require pull_request={"state":"none"} for new work, '
+            'or an extensible pull_request object with state="open" for existing work, plus '
+            "worktree, branch, rebased_base_sha, "
             "remote_lease, round_objective, acceptance_condition, repository_instructions, "
-            "validation_plan, and execution_environment. Audit verify assignments may include "
-            "validation_ids. New plans and replacement retries are validated before an attempt "
-            "is created."
+            "validation_plan, and execution_environment. Audit assignments use canonical "
+            "history_links objects with kind issue/pull and a positive number; history_issues "
+            "and history_pulls remain compatibility aliases. Audit verify assignments may "
+            "include validation_ids. New plans and replacement retries are validated before "
+            "an attempt is created."
         ),
     )
     required: bool = True

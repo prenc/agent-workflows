@@ -616,6 +616,147 @@ class TestRuntimeSafety:
             )
             assert retried["task"]["attempt"] == 2
 
+    @pytest.mark.parametrize("workflow", ["gh-curate-issues", "gh-implement-issue"])
+    def test_execution_blocked_without_invocation_requires_pause_resume(
+        self, workflow: str
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-unscoped-block-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            runtime.run_manage(
+                RunManageRequest(
+                    action="start",
+                    workflow=workflow,
+                    repository="example/repo",
+                    targets=["1"] if workflow == "gh-implement-issue" else [],
+                )
+            )
+            assignment = (
+                self.curation_assignment(runtime, 1)
+                if workflow == "gh-curate-issues"
+                else self.implementation_assignment(1)
+            )
+            planned = runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    workflow=workflow,
+                    task={"logical_id": "unit", "assignment": assignment},
+                )
+            )
+            task_id = planned["task_id"]
+            runtime.task_manage(
+                TaskManageRequest(action="mark_running", workflow=workflow, task_id=task_id)
+            )
+            runtime.task_manage(
+                TaskManageRequest(
+                    action="fail",
+                    workflow=workflow,
+                    task_id=task_id,
+                    note="execution-blocked",
+                )
+            )
+            with pytest.raises(ValueError, match="pause and resume"):
+                runtime.task_manage(
+                    TaskManageRequest(action="retry", workflow=workflow, task_id=task_id)
+                )
+            runtime.run_manage(RunManageRequest(action="pause", workflow=workflow))
+            runtime.run_manage(RunManageRequest(action="resume", workflow=workflow))
+            assert (
+                runtime.task_manage(
+                    TaskManageRequest(action="retry", workflow=workflow, task_id=task_id)
+                )["task"]["attempt"]
+                == 2
+            )
+
+    def test_audit_execution_blocked_without_invocation_requires_pause_resume(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-audit-unscoped-block-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            planned = runtime.task_manage(
+                TaskManageRequest(action="plan", task={"logical_id": "area-a"})
+            )
+            task_id = planned["task_id"]
+            runtime.task_manage(TaskManageRequest(action="mark_running", task_id=task_id))
+            runtime.task_manage(
+                TaskManageRequest(action="fail", task_id=task_id, note="execution-blocked")
+            )
+            with pytest.raises(ValueError, match="pause and resume"):
+                runtime.task_manage(TaskManageRequest(action="retry", task_id=task_id))
+            runtime.run_manage(RunManageRequest(action="pause", workflow="gh-audit-repo"))
+            runtime.run_manage(RunManageRequest(action="resume", workflow="gh-audit-repo"))
+            assert (
+                runtime.task_manage(TaskManageRequest(action="retry", task_id=task_id))["task"][
+                    "attempt"
+                ]
+                == 2
+            )
+
+    @pytest.mark.parametrize("workflow", ["gh-curate-issues", "gh-implement-issue"])
+    def test_generic_run_can_finish_with_a_persisted_blocked_outcome(self, workflow: str) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-blocked-finish-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            runtime.run_manage(
+                RunManageRequest(
+                    action="start",
+                    workflow=workflow,
+                    repository="example/repo",
+                    targets=["1"] if workflow == "gh-implement-issue" else [],
+                )
+            )
+            assignment = (
+                self.curation_assignment(runtime, 1)
+                if workflow == "gh-curate-issues"
+                else self.implementation_assignment(1)
+            )
+            task_id = runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    workflow=workflow,
+                    task={"logical_id": "unit", "assignment": assignment},
+                )
+            )["task_id"]
+            runtime.task_manage(
+                TaskManageRequest(action="mark_running", workflow=workflow, task_id=task_id)
+            )
+            runtime.task_manage(
+                TaskManageRequest(action="fail", workflow=workflow, task_id=task_id)
+            )
+            runtime.task_manage(
+                TaskManageRequest(action="integration_begin", workflow=workflow, task_id=task_id)
+            )
+            runtime.task_manage(
+                TaskManageRequest(action="integration_end", workflow=workflow, task_id=task_id)
+            )
+            with pytest.raises(ValueError, match="required logical tasks"):
+                runtime.run_manage(RunManageRequest(action="finish", workflow=workflow))
+            finished = runtime.run_manage(
+                RunManageRequest(
+                    action="finish",
+                    workflow=workflow,
+                    outcome="blocked",
+                    note="Maintainer decision is required",
+                )
+            )
+            assert finished["status"] == "blocked"
+            assert runtime.run_status(workflow)["terminal"] == {
+                "outcome": "blocked",
+                "note": "Maintainer decision is required",
+                "logical_ids": ["unit"],
+                "failed_task_ids": [task_id],
+            }
+            with pytest.raises(ValueError, match="not resumable"):
+                runtime.run_manage(RunManageRequest(action="resume", workflow=workflow))
+
+    def test_blocked_finish_contract_rejects_invalid_uses(self) -> None:
+        with pytest.raises(ValidationError, match="non-blank note"):
+            RunManageRequest(action="finish", workflow="gh-curate-issues", outcome="blocked")
+        with pytest.raises(ValidationError, match="audit workflows"):
+            RunManageRequest(
+                action="finish",
+                workflow="gh-audit-repo",
+                outcome="blocked",
+                note="blocked",
+            )
+
     def test_audit_execution_blocked_retry_recovers_in_a_later_invocation(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-audit-execution-blocked-") as directory:
             runtime = self.make_runtime(Path(directory))
@@ -2070,7 +2211,7 @@ class TestRuntimeSafety:
                         {
                             "kind": "pull",
                             "number": 3,
-                            "state": "open",
+                            "state": "closed",
                             "title": "Unrelated documentation",
                         },
                     ],
@@ -2092,7 +2233,8 @@ class TestRuntimeSafety:
                             "mode": "discover",
                             "area": "area/shared-core",
                             "focus": "cache behavior",
-                            "leads": [2],
+                            "history_issues": [2],
+                            "history_pulls": [3],
                         },
                     },
                 )
@@ -2112,9 +2254,41 @@ class TestRuntimeSafety:
                 for record in context["history"]["selection"]["records"]
             ] == [
                 ("issue", 2, "Earlier parser defect"),
-                ("issue", 1, "Shared core cache grows"),
                 ("pull", 3, "Unrelated documentation"),
+                ("issue", 1, "Shared core cache grows"),
             ]
+            assert all(
+                set(record) <= {"kind", "number", "url", "title", "state", "state_reason", "labels"}
+                for record in context["history"]["selection"]["records"]
+            )
+
+    def test_audit_history_links_are_typed_deduplicated_and_bounded(self) -> None:
+        assert WorkflowRuntime._audit_history_links(
+            {
+                "leads": [1],
+                "history_issues": [1, 2],
+                "history_pulls": [3],
+                "history_links": [
+                    {"kind": "pull", "number": 3},
+                    {"kind": "issue", "number": 4},
+                ],
+            }
+        ) == [
+            {"kind": "issue", "number": 1},
+            {"kind": "issue", "number": 2},
+            {"kind": "pull", "number": 3},
+            {"kind": "issue", "number": 4},
+        ]
+        with pytest.raises(ValueError, match="positive integers"):
+            WorkflowRuntime._audit_history_links({"history_issues": [0]})
+        with pytest.raises(ValueError, match="only kind and number"):
+            WorkflowRuntime._audit_history_links(
+                {"history_links": [{"kind": "issue", "number": 1, "title": "extra"}]}
+            )
+        with pytest.raises(ValueError, match="at most 40"):
+            WorkflowRuntime._audit_history_links(
+                {"history_links": [{"kind": "issue", "number": n} for n in range(1, 42)]}
+            )
 
     def test_audit_task_context_reports_an_exact_history_window(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-audit-history-window-") as directory:

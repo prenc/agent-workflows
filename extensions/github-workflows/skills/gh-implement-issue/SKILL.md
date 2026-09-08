@@ -69,7 +69,10 @@ dependency changes, and heavy computation require separate authority.
 Complete one interactive preflight before starting or resuming material work.
 Resolve the invocation, every currently discoverable grouping, scope,
 dependency, network, scientific, security, or data-authority question, and the
-active approval mode there. Durable execution requires the parent Qwen session
+active approval mode there. Resolve any conflict between the requested schema
+change and a repository instruction that a file “must remain unmodified”; the
+worker treats that phrase as a literal prohibition and never guesses an
+exception. Durable execution requires the parent Qwen session
 to be in YOLO mode; Plan mode may be used to discuss the preflight, but do not
 call `run_manage` `start` or `resume`, claim issues, prepare worktrees, or launch
 workers from Plan, default, auto-edit, or auto mode. Refresh target and claim
@@ -358,8 +361,11 @@ root against the verified assigned worktree and sets the resulting absolute
 
 Register the complete round assignment with
 `mcp__github_workflows__task_manage` using action `plan` and a typed `task`.
-Include non-empty `issues` entries with `number`, `snapshot`, and
-`accepted_scope`; `pull_request`, `worktree`, `branch`, full
+Include non-empty `issues` entries with `number`, non-empty compact string
+`snapshot`, and `accepted_scope`. For new work use
+`pull_request: {"state": "none"}`; for an existing PR use an extensible object
+whose `state` is `open` plus the available PR evidence. Also include `worktree`,
+`branch`, full
 `rebased_base_sha`, `remote_lease`, `round_objective`, `acceptance_condition`,
 `repository_instructions`, `validation_plan`, and `execution_environment`.
 Use an empty `validation_plan` only when preflight found no safe repository-owned
@@ -513,6 +519,12 @@ A unit is finalized only after issue and PR reads confirm the intended status
 and derived taxonomy label state. If authentication, authorization, interruption, or a conflicting actor
 prevents cleanup, report each retained label and URL prominently as manual
 repair state.
+
+After every task attempt is terminal and integrated and scheduler/pending work
+is empty, finish the run normally only when every required logical task has an
+integrated completion. If at least one required logical task cannot succeed,
+call `run_manage` with action `finish`, outcome `blocked`, and a concise
+non-empty note. A blocked run is terminal and cannot resume.
 
 ## Final report
 
