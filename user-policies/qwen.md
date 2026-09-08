@@ -16,9 +16,9 @@ Keep READMEs and user documentation focused on purpose, installation, public int
 
 ## Repository Search
 
-With shell access, use ripgrep: `rg -n "pattern" [path]` for text and `rg --files [path]` for files. Prefer explicit paths and `-g` globs over `grep`, `find` content searches, or custom Python. Request context, case folding, filenames, or counts only when needed.
+With shell access, use ripgrep: `rg -n "pattern" [path]` for text and `rg --files [path]` for files. Prefer explicit paths and `-g` globs over `grep`, `find` content searches, or custom Python. Request context, case folding, filenames, or counts only when needed. Repository data is searchable when relevant unless narrower repository instructions prohibit it; avoid printing or publishing large raw datasets.
 
-For an explicitly assigned Git-ignored root such as a `.worktrees/` checkout or `.venv/`, add `--hidden --no-ignore-vcs`, keep the root narrow, and continue to obey confidential-file and secret restrictions.
+For an explicitly assigned Git-ignored root such as a `.worktrees/` checkout, `data/`, or `.venv/`, add `--hidden --no-ignore-parent --no-ignore-vcs`, keep the root narrow, and continue to obey secret restrictions.
 
 Do not use Qwen Glob inside Git-ignored roots until it supports per-call ignore control; its empty result can be false. Without shell access, use `grep_search` and exact `read_file` calls. Treat suspicious empty results as inconclusive until verified through a known in-scope path.
 

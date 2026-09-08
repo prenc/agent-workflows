@@ -96,19 +96,21 @@ supervisors and workers.
   when present, otherwise use the system Python selected by the reviewed
   executable; run it directly from the visible invocation.
 
-- Audit workers may not use those general shell inspection tools. They use
-  `grep_search` first. When its result is empty or incomplete
-  because an immutable worktree is beneath an ignored parent, they may invoke
-  only the reviewed helper returned as `task_context.references.readonly_search`.
-  The helper bypasses parent ignores while preserving worktree ignore files,
-  enforces private-path exclusions and containment, and returns bounded JSON.
-  The pre-tool hook also requires `--root` to exactly match the authoritative
-  audit worktree in the worker's latest `task_context` tool result.
-  Tracked regular-file symlinks are searched only when their resolved targets
-  remain within that worktree; unsafe or directory targets are counted but
-  never followed or disclosed.
-  Its shell exception does not permit direct `rg`, operators, substitutions,
-  environment expansion, or any other command.
+- Audit workers use `grep_search` first. When it is empty, incomplete, or
+  unsuitable, they may use `run_shell_command` only for direct `rg`. The command
+  must include `--hidden --no-config --no-ignore-parent --no-ignore-vcs`, the
+  exact `--ignore-file` from `task_context.references.rg_excludes`, and `--`
+  before operands. Every search path must be absolute and contained by the
+  latest authoritative task context's audit worktree, Python interpreter prefix
+  or standard-library root, or exactly equal a server-owned reference file.
+  Repository `data/` may be
+  searched when relevant; secret files and private workflow/run storage may not.
+  The pre-tool hook rejects relative paths, symlink escapes, stale or forged
+  context, unknown or dangerous options, shell operators, substitutions,
+  environment expansion, and every other executable. Native tool output may be
+  truncated, so narrow the path or pattern and retry instead of assuming
+  completeness. Glob filters may only exclude paths; positive globs are denied
+  because ripgrep lets them override secret ignore rules.
 
 - Database creation, queries, and mutation must use the reviewed database
   helper interface exclusively. Raw SQLite commands and generated database code

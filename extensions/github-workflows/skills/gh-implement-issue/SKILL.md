@@ -94,9 +94,10 @@ are resume context rather than a fallback. The supervisor remains authoritative
 for claims, scheduling, issue/label state, final live verification, and every
 draft-to-ready transition.
 
-Use the supervisor-selected environment, `uv`, and lightweight login-node checks. Keep
-repository-root `data/` contents, secrets, unrelated changes, CI/check APIs,
-merges, reviews, and reassessment outside this workflow. Validate issue
+Use the supervisor-selected environment, `uv`, and lightweight login-node
+checks. Keep secrets, unrelated changes, CI/check APIs, merges, reviews, and
+reassessment outside this workflow. Use repository data only when relevant to
+the accepted scope, and never publish large or raw datasets. Validate issue
 taxonomy and report its drift. Reconcile each implementation PR to the distinct
 justified area/type labels of all covered issues and exactly one priority label,
 the highest among them; preserve unrelated labels and avoid speculative or

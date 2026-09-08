@@ -56,19 +56,27 @@ This worker is read-only and must not create or execute any orchestration file.
   The worktree is beneath a Git-ignored root, so use assigned paths,
   `grep_search`, and exact `read_file` calls for discovery. Treat an empty search
   as inconclusive until a known in-scope path confirms the search surface. If
-  `grep_search` stays empty or incomplete because the immutable worktree is
-  beneath an ignored parent, use `run_shell_command` only to invoke the exact
-  bounded helper path in `task_context.references.readonly_search`. Its `files`
-  and `search` operations accept an absolute `--root` plus relative `--path`
-  values and return paginated JSON. This is a fallback, not the primary search
-  path; never use shell operators, substitutions, environment variables, or any
-  other command. The hook binds `--root` to the authoritative `audit_worktree`
-  from your latest `task_context` result; call `task_context` again if that
-  result is no longer present after compaction.
-  The helper includes tracked regular-file symlinks only when their targets
-  remain inside the assigned worktree. Treat a nonzero
-  `symlink_coverage.skipped_unsafe` count as an explicit coverage limitation;
-  never follow or disclose those targets.
+  `grep_search` is empty, incomplete, or unsuitable, use `run_shell_command`
+  only for direct `rg` with
+  `--hidden --no-config --no-ignore-parent --no-ignore-vcs`, the exact
+  `--ignore-file` from `task_context.references.rg_excludes`, `--` before
+  operands, and absolute paths. Search only the latest task context's
+  `audit_worktree`, Python `interpreter_prefix` or `stdlib_root`, or an exact
+  server-owned reference file. Keep searches narrow and retry with a narrower
+  path or pattern if native output is truncated. Never use shell operators,
+  substitutions, environment variables, `--follow`, archive search, `--pre`,
+  arbitrary configuration, or another executable. Call `task_context` again if
+  its authoritative result is no longer present after compaction. Repository
+  `data/` is ordinary searchable evidence unless narrower repository policy
+  says otherwise; secret files and private workflow/run storage remain outside
+  the boundary.
+  Use the compact forms
+  `rg -n --hidden --no-config --no-ignore-parent --no-ignore-vcs --ignore-file <rg_excludes> -- <pattern> <absolute-path>`
+  and
+  `rg --files --hidden --no-config --no-ignore-parent --no-ignore-vcs --ignore-file <rg_excludes> -- <absolute-path>`;
+  add only the documented bounded matching, context, or count options. Glob
+  filters must be exclusions such as `-g '!vendor/**'`; positive globs are
+  prohibited because they override secret ignore rules.
   For `.ipynb` evidence, use the assigned cell index and unique anchor with an
   exact-file `grep_search`; use a full `read_file` only when the surrounding cell
   content is required. Do not treat serialized notebook line numbers as stable
@@ -199,7 +207,7 @@ For a behavior claim that is safely reproducible, include an optional
 small synthetic setup, action, observable assertion, expected confirming and
 disproving outcomes, and either focused existing pytest node IDs or a Python
 probe design. Never supply a general shell command. A proposal must avoid
-network access, repository `data/`, secrets, external services, dependencies,
+network access, secrets, external services, dependencies,
 Slurm, GPUs, and repository writes. Use at most 100,000 generated rows or 10
 MiB of generated input. Omit the proposal when execution would be unsafe,
 heavy, nondeterministic, or unnecessary for direct logical proof.

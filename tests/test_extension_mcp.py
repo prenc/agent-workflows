@@ -2003,15 +2003,15 @@ class TestExtensionMcp:
         policy = (EXTENSION / "references/github-runtime-policy.md").read_text(encoding="utf-8")
 
         for document in (worker, policy):
-            assert "references.readonly_search" in document
+            assert "references.rg_excludes" in document
             assert "parent" in document
-            assert "bounded" in document
+            assert "direct `rg`" in document
             assert "task_context" in document
         assert "audit_worktree" in worker
         assert "authoritative" in policy
         assert "audit worktree" in policy
-        assert "symlink_coverage.skipped_unsafe" in worker
-        assert "never followed or disclosed" in policy
+        assert "symlink" in policy
+        assert "private workflow/run storage" in policy
 
     def test_audit_context_guidance_uses_server_evidence_and_candidate_verdict_identity(
         self,

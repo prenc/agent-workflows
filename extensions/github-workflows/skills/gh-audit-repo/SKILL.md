@@ -133,7 +133,8 @@ write.
 - Never create or execute an ad hoc orchestration script. Run reviewed helpers
   directly, store temporary state as declarative data, and use visible inline
   checks only under the shared runtime policy.
-- Never access secret files. Do not disclose confidential or dataset content.
+- Never access secret files or private workflow/run storage. Repository data may
+  be inspected when relevant, but do not disclose large or raw dataset content.
 - On an HPC login node, use static inspection and lightweight read-only checks;
   never submit Slurm/GPU/distributed/heavy work.
 - Use `gh-audit-repo-worker` with at most the effective concurrency. Give each
@@ -633,7 +634,7 @@ audit in a separate workflow. Never edit the probe or inventory helper during
 the audit.
 
 Before approving a probe, inspect every invoked test/module and ensure it does
-not read repository `data/` or secrets, write repository files, contact a
+not read secrets, write repository files, contact a
 service, install dependencies, launch Slurm/GPU/distributed work, or consume
 substantial resources. Generated inputs are capped at 100,000 rows or 10 MiB.
 Missing programs, pytest, imports, or other dependencies remain recorded

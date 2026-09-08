@@ -166,9 +166,10 @@ class TestRuntimeSafety:
 
             context = runtime.task_context(planned["task_ref"])
 
-            readonly_search = Path(context["references"]["readonly_search"])
-            assert readonly_search.name == "readonly-search.py"
-            assert readonly_search.is_file()
+            rg_excludes = Path(context["references"]["rg_excludes"])
+            assert rg_excludes.name == "github-rg-excludes.ignore"
+            assert rg_excludes.is_file()
+            assert "data" not in rg_excludes.read_text(encoding="utf-8")
             assert context["audit_worktree_head"] == context["audit_sha"]
 
             assert context["validation"] == {

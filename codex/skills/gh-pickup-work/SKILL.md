@@ -63,9 +63,9 @@ reviewed-execution boundary.
   convention. Construct/report labels as area, type, priority, status.
 - Never merge, close/reopen issues, apply terminal status labels, approve a
   review, mutate unrelated metadata, or expand into nearby cleanup.
-- Never access secrets or confidential data. Preserve scientific and research
-  semantics unless accepted scope and current user authority explicitly permit
-  a change.
+- Never access secrets. Repository data may be inspected when relevant, but do
+  not publish large or raw datasets. Preserve scientific and research semantics
+  unless accepted scope and current user authority explicitly permit a change.
 - Use the selected worktree environment, `uv`, and lightweight login-node checks. Do not add
   dependencies or run Slurm/GPU/heavy work without explicit authority.
 - Never create or execute a temporary orchestration script. Repository source,

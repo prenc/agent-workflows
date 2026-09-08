@@ -2194,9 +2194,7 @@ class WorkflowRuntime:
             "issue_conventions": str(reference_root / "github-issue-conventions.md"),
         }
         if workflow == "gh-audit-repo":
-            references["readonly_search"] = str(
-                reference_root.parent / "hooks" / "readonly-search.py"
-            )
+            references["rg_excludes"] = str(reference_root / "github-rg-excludes.ignore")
         if workflow == "gh-implement-issue":
             references["pull_request_template"] = str(reference_root / "github-pr-template.md")
         stored_history = state.get("history")

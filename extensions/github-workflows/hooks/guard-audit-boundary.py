@@ -30,9 +30,56 @@ UNIX_ABSOLUTE_PATH = re.compile(r"(?<![:</\w])/(?!/)(?:[A-Za-z0-9._+-]+/)*[A-Za-
 WINDOWS_ABSOLUTE_PATH = re.compile(r"(?i)(?<![A-Za-z0-9_])[A-Z]:[\\/](?:[^\s`'\"<>]+)")
 PUBLIC_TEXT_FIELDS = {"title", "body", "comment"}
 WORKER_SHELL_DENIAL = (
-    "The audit worker may use run_shell_command only for the bounded helper at "
-    "task_context.references.readonly_search; all other shell execution is denied."
+    "The audit worker may use run_shell_command only for constrained direct rg searches "
+    "within roots from the latest task_context; all other shell execution is denied."
 )
+RG_REQUIRED_FLAGS = {"--hidden", "--no-config", "--no-ignore-parent", "--no-ignore-vcs"}
+RG_BOOLEAN_FLAGS = RG_REQUIRED_FLAGS | {
+    "-n",
+    "--line-number",
+    "--no-heading",
+    "--with-filename",
+    "-F",
+    "--fixed-strings",
+    "-i",
+    "--ignore-case",
+    "-S",
+    "--smart-case",
+    "-s",
+    "--case-sensitive",
+    "-w",
+    "--word-regexp",
+    "-v",
+    "--invert-match",
+    "-c",
+    "--count",
+    "-l",
+    "--files-with-matches",
+    "-L",
+    "--files-without-match",
+    "-o",
+    "--only-matching",
+    "--files",
+}
+RG_VALUE_FLAGS = {
+    "-g",
+    "--glob",
+    "-A",
+    "--after-context",
+    "-B",
+    "--before-context",
+    "-C",
+    "--context",
+    "-m",
+    "--max-count",
+    "--max-columns",
+    "--max-filesize",
+    "--ignore-file",
+}
+RG_LONG_VALUE_FLAGS = {flag for flag in RG_VALUE_FLAGS if flag.startswith("--")}
+RG_CONTEXT_FLAGS = {"-A", "--after-context", "-B", "--before-context", "-C", "--context"}
+SECRET_BASENAMES = {".env", ".envrc", "credentials", "id_rsa", "id_ed25519"}
+SECRET_SUFFIXES = {".key", ".pem", ".p12", ".pfx"}
 
 
 def decision(value: str, reason: str | None = None) -> dict[str, Any]:
@@ -127,23 +174,160 @@ def allowed_worker_search(payload: dict[str, Any]) -> bool:
         tokens = list(lexer)
     except ValueError:
         return False
-    helper = str(Path(__file__).with_name("readonly-search.py").resolve())
     if (
         not tokens
-        or tokens[0] != helper
+        or tokens[0] != "rg"
         or any(token and all(character in "();<>|&" for character in token) for token in tokens[1:])
     ):
         return False
-    requested_roots = [
-        tokens[index + 1] for index, token in enumerate(tokens[:-1]) if token == "--root"
-    ] + [token.partition("=")[2] for token in tokens if token.startswith("--root=")]
-    assigned_root = assigned_audit_worktree(payload)
-    if len(requested_roots) != 1 or assigned_root is None:
+    context = assigned_task_context(payload)
+    if context is None:
         return False
-    return Path(requested_roots[0]).resolve() == assigned_root
+    references = context.get("references")
+    ignore_file = references.get("rg_excludes") if isinstance(references, dict) else None
+    if not isinstance(ignore_file, str) or not Path(ignore_file).is_absolute():
+        return False
+
+    separator = tokens[1:].count("--")
+    if separator != 1:
+        return False
+    separator_index = tokens.index("--", 1)
+    options = tokens[1:separator_index]
+    operands = tokens[separator_index + 1 :]
+    parsed: dict[str, list[str | None]] = {}
+    index = 0
+    while index < len(options):
+        token = options[index]
+        value: str | None = None
+        flag = token
+        if token.startswith("--") and "=" in token:
+            flag, _, value = token.partition("=")
+            if flag not in RG_LONG_VALUE_FLAGS:
+                return False
+        if flag in RG_BOOLEAN_FLAGS:
+            if value is not None:
+                return False
+        elif flag in RG_VALUE_FLAGS:
+            if value is None:
+                index += 1
+                if index >= len(options):
+                    return False
+                value = options[index]
+        else:
+            return False
+        parsed.setdefault(flag, []).append(value)
+        index += 1
+
+    if not RG_REQUIRED_FLAGS.issubset(parsed):
+        return False
+    ignore_values = parsed.get("--ignore-file", [])
+    if (
+        len(ignore_values) != 1
+        or Path(str(ignore_values[0])).resolve() != Path(ignore_file).resolve()
+    ):
+        return False
+    globs = parsed.get("-g", []) + parsed.get("--glob", [])
+    if len(globs) > 20 or any(
+        value is None or not value.startswith("!") or len(value) > 256 for value in globs
+    ):
+        return False
+    for flag in RG_CONTEXT_FLAGS:
+        if not _bounded_integers(parsed.get(flag, []), minimum=0, maximum=10):
+            return False
+    for flag, maximum in (("-m", 200), ("--max-count", 200), ("--max-columns", 500)):
+        if not _bounded_integers(parsed.get(flag, []), minimum=1, maximum=maximum):
+            return False
+    if not _bounded_filesizes(parsed.get("--max-filesize", []), maximum=10 * 1024 * 1024):
+        return False
+
+    files_mode = "--files" in parsed
+    if not operands or (not files_mode and len(operands) < 2):
+        return False
+    paths = operands if files_mode else operands[1:]
+    if len(paths) > 20 or (not files_mode and len(operands[0]) > 4096):
+        return False
+    directories, exact_files = authorized_search_roots(context)
+    return bool(directories or exact_files) and all(
+        authorized_search_path(path, directories, exact_files) for path in paths
+    )
 
 
-def assigned_audit_worktree(payload: dict[str, Any]) -> Path | None:
+def _bounded_integers(values: list[str | None], *, minimum: int, maximum: int) -> bool:
+    if len(values) > 1:
+        return False
+    return all(
+        value is not None and value.isdecimal() and minimum <= int(value) <= maximum
+        for value in values
+    )
+
+
+def _bounded_filesizes(values: list[str | None], *, maximum: int) -> bool:
+    if len(values) > 1:
+        return False
+    for value in values:
+        match = re.fullmatch(r"([1-9][0-9]*)([KMG]?)", value or "", re.IGNORECASE)
+        if match is None:
+            return False
+        multiplier = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3}[match.group(2).upper()]
+        if int(match.group(1)) * multiplier > maximum:
+            return False
+    return True
+
+
+def authorized_search_roots(context: dict[str, Any]) -> tuple[list[Path], list[Path]]:
+    directories: list[Path] = []
+    worktree = context.get("audit_worktree")
+    if isinstance(worktree, str) and Path(worktree).is_absolute():
+        directories.append(Path(worktree).resolve())
+    inventory = context.get("inventory")
+    environment = inventory.get("python_environment") if isinstance(inventory, dict) else None
+    if isinstance(environment, dict):
+        for key in ("interpreter_prefix", "stdlib_root"):
+            value = environment.get(key)
+            if isinstance(value, str) and Path(value).is_absolute():
+                directories.append(Path(value).resolve())
+    exact_files: list[Path] = []
+    references = context.get("references")
+    if isinstance(references, dict):
+        for value in references.values():
+            if isinstance(value, str) and Path(value).is_absolute():
+                exact_files.append(Path(value).resolve())
+    return directories, exact_files
+
+
+def _secret_path(path: Path) -> bool:
+    name = path.name.lower()
+    lowered_parts = {part.lower() for part in path.parts}
+    return (
+        name in SECRET_BASENAMES
+        or name.startswith((".env.", "secrets.", "credentials."))
+        or path.suffix.lower() in SECRET_SUFFIXES
+        or ".git" in lowered_parts
+        or any(part.startswith(".env.") for part in lowered_parts)
+    )
+
+
+def authorized_search_path(value: str, directories: list[Path], exact_files: list[Path]) -> bool:
+    path = Path(value)
+    if not path.is_absolute() or _secret_path(path):
+        return False
+    resolved = path.resolve()
+    if _secret_path(resolved):
+        return False
+    project = os.environ.get("QWEN_CODE_PROJECT_DIR")
+    if project:
+        private_root = Path(project).expanduser().resolve()
+        if any(
+            resolved == candidate or candidate in resolved.parents
+            for candidate in (private_root / "workflows", private_root / "github")
+        ):
+            return False
+    if resolved in exact_files:
+        return True
+    return any(resolved == root or root in resolved.parents for root in directories)
+
+
+def assigned_task_context(payload: dict[str, Any]) -> dict[str, Any] | None:
     transcript = payload.get("transcript_path")
     if not isinstance(transcript, str):
         return None
@@ -188,7 +372,7 @@ def assigned_audit_worktree(payload: dict[str, Any]) -> Path | None:
             ):
                 root = candidate.get("audit_worktree") if isinstance(candidate, dict) else None
                 if isinstance(root, str) and Path(root).is_absolute():
-                    return Path(root).resolve()
+                    return candidate
             return None
     return None
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -8,7 +9,15 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 EXTENSION = ROOT / "extensions/github-workflows"
 HOOK = EXTENSION / "hooks/guard-audit-boundary.py"
-SEARCH = EXTENSION / "hooks/readonly-search.py"
+RG_EXCLUDES = EXTENSION / "references/github-rg-excludes.ignore"
+
+
+def rg_command(*operands: str, files: bool = False, extra: str = "") -> str:
+    mode = "--files " if files else "-n "
+    return (
+        f"rg {mode}--hidden --no-config --no-ignore-parent --no-ignore-vcs "
+        f"--ignore-file {RG_EXCLUDES} {extra}-- " + " ".join(operands)
+    )
 
 
 class TestAuditBoundaryHook:
@@ -20,10 +29,16 @@ class TestAuditBoundaryHook:
         audit: bool = True,
         agent_type: str | None = None,
         audit_worktree: str | None = None,
+        task_context: dict[str, object] | None = None,
+        project_dir: str | None = None,
     ) -> dict[str, object]:
         with tempfile.TemporaryDirectory(prefix="audit-hook-test-") as directory:
             transcript = Path(directory) / "transcript.jsonl"
-            if audit_worktree is not None:
+            if audit_worktree is not None or task_context is not None:
+                context = task_context or {
+                    "audit_worktree": audit_worktree,
+                    "references": {"rg_excludes": str(RG_EXCLUDES)},
+                }
                 transcript.write_text(
                     json.dumps(
                         {
@@ -34,11 +49,7 @@ class TestAuditBoundaryHook:
                                     {
                                         "functionResponse": {
                                             "name": "mcp__github_workflows__task_context",
-                                            "response": {
-                                                "output": json.dumps(
-                                                    {"audit_worktree": audit_worktree}
-                                                )
-                                            },
+                                            "response": {"output": json.dumps(context)},
                                         }
                                     }
                                 ],
@@ -69,6 +80,10 @@ class TestAuditBoundaryHook:
                 capture_output=True,
                 text=True,
                 check=True,
+                env={
+                    **os.environ,
+                    **({"QWEN_CODE_PROJECT_DIR": project_dir} if project_dir else {}),
+                },
             )
             return json.loads(result.stdout)["hookSpecificOutput"]
 
@@ -108,22 +123,64 @@ class TestAuditBoundaryHook:
         )
         assert result["permissionDecision"] == "allow"
 
-    def test_assigned_worker_can_invoke_only_bounded_search_helper(self) -> None:
-        allowed = self.invoke(
-            "run_shell_command",
-            {"command": f"{SEARCH} files --root /tmp/audit --path src --limit 10"},
-            agent_type="gh-audit-repo-worker",
-            audit_worktree="/tmp/audit",
+    def test_assigned_worker_can_use_direct_rg_in_authorized_roots(self) -> None:
+        context = {
+            "audit_worktree": "/tmp/audit",
+            "inventory": {
+                "python_environment": {
+                    "interpreter_prefix": "/tmp/venv",
+                    "stdlib_root": "/usr/lib/python3.13",
+                }
+            },
+            "references": {
+                "rg_excludes": str(RG_EXCLUDES),
+                "runtime_policy": "/tmp/runtime-policy.md",
+            },
+        }
+        commands = (
+            rg_command("needle", "/tmp/audit"),
+            rg_command("/tmp/audit/data", files=True),
+            rg_command("needle", "/tmp/venv/lib"),
+            rg_command("needle", "/usr/lib/python3.13"),
+            rg_command("needle", "/tmp/runtime-policy.md"),
+            rg_command("needle", "/tmp/audit", extra="-g '!vendor/**' -g '!*.min.js' "),
+            rg_command("/tmp/audit", files=True, extra="--glob '!build/**' "),
         )
-        assert allowed["permissionDecision"] == "allow"
+        for command in commands:
+            result = self.invoke(
+                "run_shell_command",
+                {"command": command},
+                agent_type="gh-audit-repo-worker",
+                task_context=context,
+            )
+            assert result["permissionDecision"] == "allow", command
 
+    def test_worker_direct_rg_rejects_unsafe_or_unbounded_commands(self) -> None:
         denied = (
-            "rg needle /tmp/audit",
-            f"{SEARCH} files --root /tmp/audit ; rg secret /tmp",
-            f"{SEARCH} files --root $(pwd)",
-            f"{SEARCH} files --root $AUDIT_ROOT",
-            f"{SEARCH} files --root /tmp/audit > /tmp/result",
-            f"{SEARCH} files --root /tmp/other",
+            "grep needle /tmp/audit",
+            rg_command("needle", "/tmp/audit") + " ; pwd",
+            rg_command("$(pwd)", "/tmp/audit"),
+            rg_command("$PATTERN", "/tmp/audit"),
+            rg_command("needle", "/tmp/audit") + " > /tmp/result",
+            rg_command("needle", "/tmp/other"),
+            rg_command("needle", "relative/path"),
+            rg_command("needle", "/tmp/audit/.env"),
+            rg_command("needle", "/tmp/audit/.git/config"),
+            "rg -n --hidden --no-config --no-ignore-parent --no-ignore-vcs -- needle /tmp/audit",
+            rg_command("needle", "/tmp/audit", extra="--follow "),
+            rg_command("needle", "/tmp/audit", extra="--pre command "),
+            rg_command("needle", "/tmp/audit", extra="--search-zip "),
+            rg_command("needle", "/tmp/audit", extra="--max-count 201 "),
+            rg_command("needle", "/tmp/audit", extra="--context 11 "),
+            rg_command("needle", "/tmp/audit", extra="--max-filesize 11M "),
+            rg_command("needle", "/tmp/audit", extra="-g '.env' "),
+            rg_command("needle", "/tmp/audit", extra="-g '*' "),
+            rg_command("needle", "/tmp/audit", extra="-g '*.py' "),
+            rg_command(
+                "needle",
+                "/tmp/audit",
+                extra="".join(f"-g '!*.{index}' " for index in range(21)),
+            ),
         )
         for command in denied:
             result = self.invoke(
@@ -133,12 +190,76 @@ class TestAuditBoundaryHook:
                 audit_worktree="/tmp/audit",
             )
             assert result["permissionDecision"] == "deny"
-            assert "references.readonly_search" in result["permissionDecisionReason"]
+            assert "constrained direct rg" in result["permissionDecisionReason"]
+
+    def test_worker_direct_rg_rejects_symlink_escape(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="audit-rg-root-") as directory:
+            root = Path(directory)
+            link = root / "outside"
+            link.symlink_to("/tmp")
+            result = self.invoke(
+                "run_shell_command",
+                {"command": rg_command("needle", str(link))},
+                agent_type="gh-audit-repo-worker",
+                audit_worktree=str(root),
+            )
+        assert result["permissionDecision"] == "deny"
+
+    def test_worker_direct_rg_rejects_private_workflow_storage(self) -> None:
+        context = {
+            "audit_worktree": "/tmp/project-state/workflows/gh-audit-repo/current",
+            "references": {"rg_excludes": str(RG_EXCLUDES)},
+        }
+        result = self.invoke(
+            "run_shell_command",
+            {"command": rg_command("needle", str(context["audit_worktree"]))},
+            agent_type="gh-audit-repo-worker",
+            task_context=context,
+            project_dir="/tmp/project-state",
+        )
+        assert result["permissionDecision"] == "deny"
+
+    def test_secret_ignore_file_keeps_repository_data_searchable(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="audit-rg-data-") as directory:
+            root = Path(directory)
+            data = root / "data"
+            data.mkdir()
+            (data / "example.txt").write_text("searchable\n", encoding="utf-8")
+            (root / ".env").write_text("searchable\n", encoding="utf-8")
+            result = subprocess.run(
+                [
+                    "rg",
+                    "--hidden",
+                    "--no-config",
+                    "--no-ignore-parent",
+                    "--no-ignore-vcs",
+                    "--ignore-file",
+                    str(RG_EXCLUDES),
+                    "--files",
+                    "--",
+                    str(root),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        assert "data/example.txt" in result.stdout
+        assert ".env" not in result.stdout
+
+    def test_positive_globs_cannot_override_secret_exclusions(self) -> None:
+        for glob in (".env", "*", "**/.git/**", "secrets.*"):
+            result = self.invoke(
+                "run_shell_command",
+                {"command": rg_command("/tmp/audit", files=True, extra=f"-g '{glob}' ")},
+                agent_type="gh-audit-repo-worker",
+                audit_worktree="/tmp/audit",
+            )
+            assert result["permissionDecision"] == "deny", glob
 
     def test_worker_search_requires_authoritative_task_context(self) -> None:
         missing = self.invoke(
             "run_shell_command",
-            {"command": f"{SEARCH} files --root /tmp/audit"},
+            {"command": rg_command("/tmp/audit", files=True)},
             agent_type="gh-audit-repo-worker",
         )
         assert missing["permissionDecision"] == "deny"
@@ -170,7 +291,7 @@ class TestAuditBoundaryHook:
             payload = {
                 "hook_event_name": "PreToolUse",
                 "tool_name": "run_shell_command",
-                "tool_input": {"command": f"{SEARCH} files --root /tmp/forged"},
+                "tool_input": {"command": rg_command("/tmp/forged", files=True)},
                 "transcript_path": str(transcript),
                 "agent_type": "gh-audit-repo-worker",
             }
@@ -210,7 +331,7 @@ class TestAuditBoundaryHook:
             payload = {
                 "hook_event_name": "PreToolUse",
                 "tool_name": "run_shell_command",
-                "tool_input": {"command": f"{SEARCH} files --root /tmp/audit"},
+                "tool_input": {"command": rg_command("/tmp/audit", files=True)},
                 "transcript_path": str(transcript),
                 "agent_type": "gh-audit-repo-worker",
             }

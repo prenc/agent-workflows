@@ -51,8 +51,9 @@ explicit dry run prohibits every GitHub mutation.
   Issue/PR creation, code edits, assignment, milestone changes, merging,
   commits, pushes, approvals, closure, and reopening remain outside this
   workflow's authority.
-- Keep secrets and repository-root `data/` contents outside the workflow. On an
-  HPC login node, run only permitted lightweight checks.
+- Keep secrets outside the workflow. Repository data may be inspected when
+  relevant, but do not publish large or raw datasets. On an HPC login node, run
+  only permitted lightweight checks.
 - Never create or execute an ad hoc orchestration script. Use only declarative
   temporary bodies, reviewed helpers, existing project commands, and visible
   inline checks under the shared runtime policy.

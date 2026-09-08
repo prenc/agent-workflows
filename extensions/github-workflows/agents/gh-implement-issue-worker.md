@@ -225,8 +225,9 @@ the assigned head/base. Confirm through MCP that the PR is a draft and its head
 equals the pushed commit. Keep assignments, labels, issue mutations, reviews,
 merges, CI, and draft-to-ready promotion with the supervisor.
 
-Other workers, branches, worktrees, unrelated GitHub artifacts, CI, and
-repository-root `data/` contents remain outside this worker's activity.
+Other workers, branches, worktrees, unrelated GitHub artifacts, and CI remain
+outside this worker's activity. Repository data may be used when it is relevant
+to the assigned implementation; never publish large or raw datasets.
 
 ## Mandatory checkpoint
 

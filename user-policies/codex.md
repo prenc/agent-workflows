@@ -32,6 +32,19 @@ interfaces, examples, and operation. Put agent-only development policy in the
 applicable `AGENTS.md`; keep specialized procedures in their skills instead of
 duplicating them.
 
+## Repository Search
+
+With shell access, use ripgrep: `rg -n "pattern" [path]` for text and
+`rg --files [path]` for files. Prefer explicit paths and `-g` globs over
+`grep`, `find` content searches, or custom Python. Request context, case
+folding, filenames, or counts only when needed. Repository data is searchable
+when relevant unless narrower repository instructions prohibit it; avoid
+printing or publishing large raw datasets.
+
+For an explicitly assigned Git-ignored root such as a `.worktrees/` checkout,
+`data/`, or `.venv/`, add `--hidden --no-ignore-parent --no-ignore-vcs`, keep
+the root narrow, and continue to obey secret restrictions.
+
 ## Validation
 
 Run the fastest coherent checks during implementation: focused tests before
@@ -101,15 +114,7 @@ statuses, or status rollups, and never run `gh pr checks`. Determine readiness
 from the implementation, proportionate local validation, review state already
 present in ordinary PR metadata, and the confirmed pushed SHA.
 
-## Confidential Data and Secrets
-
-Treat a `data/` directory at the root of any repository as confidential. After
-detecting one, acknowledge once per conversation that its contents will remain
-unread. Never read, open, inspect, search within, summarize, print, copy, or
-modify file contents under it. List file and directory names only when needed
-to understand structure. If contents are required, request a sanitized sample
-outside `data/`. A repository may impose a stricter prohibition, including on
-listing names.
+## Secrets
 
 Never access `.envrc`. Do not access other files that commonly contain secrets
 unless explicitly instructed, including `.env`, `.env.*`, `secrets.*`,
