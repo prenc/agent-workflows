@@ -1,5 +1,38 @@
 #!/usr/bin/env python3
-"""Keep the audit supervisor on the public MCP contract."""
+"""PreToolUse guard that keeps the gh-audit-repo supervisor and worker bounded.
+
+Registration
+------------
+The extension manifest declares no ``hooks`` field, so Qwen falls back to its
+client default: it reads ``<extensionPath>/hooks/hooks.json`` and substitutes
+``${extensionPath}`` in each command. (A manifest ``hooks`` object, or an
+absolute/relative manifest ``hooks`` string path, would take precedence if
+added.) The ``PreToolUse`` entry's matcher selects the inspected tools; its
+command runs this script, feeds the hook payload on stdin, and reads the JSON
+decision from stdout.
+
+PreToolUse payload contract (Qwen Code >= 0.23.1)
+-------------------------------------------------
+The installed client sends, and the guard relies on only, these fields; it never
+sends ``agent_type``:
+
+- ``hook_event_name`` (``"PreToolUse"``), ``session_id``, ``transcript_path``,
+  ``cwd``, ``timestamp``;
+- optional ``source_type`` / ``source_id``;
+- ``permission_mode``, ``tool_name``, ``tool_input``, ``tool_use_id``;
+- optional ``tool_call_id``.
+
+Identity and degraded states
+----------------------------
+A worker is a subagent session, so its ``transcript_path`` is under
+``.../projects/<project>/subagents/``; a supervisor (main chat) transcript is
+under ``.../chats/``. A subagent is treated as an audit worker only when it also
+carries an authorized ``task_context`` (an absolute ``audit_worktree``), leaving
+other subagents unrestricted. A supervisor is recognized from the gh-audit-repo
+skill text in its transcript. Unreadable transcripts and unexpected payload
+shapes are logged to stderr and fail open, except a subagent shell command that
+cannot be verified, which is denied.
+"""
 
 from __future__ import annotations
 
@@ -11,11 +44,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-AUDIT_MARKERS = (
-    "# Audit GitHub Repository",
-    "skills/gh-audit-repo/SKILL.md",
-    "Base directory for this skill:",
-)
 DENIAL = (
     "The gh-audit-repo supervisor must use the public github_workflows MCP tools; "
     "do not inspect extension implementation or private workflow storage to infer behavior. "
@@ -92,13 +120,42 @@ def decision(value: str, reason: str | None = None) -> dict[str, Any]:
     return {"hookSpecificOutput": output}
 
 
-def audit_session(payload: dict[str, Any]) -> bool:
+def _warn(message: str) -> None:
+    print(f"guard-audit-boundary: {message}", file=sys.stderr)
+
+
+def is_subagent(payload: dict[str, Any]) -> bool:
+    """True when the session transcript is a subagent (worker) transcript.
+
+    The client places subagent transcripts under
+    ``.../projects/<project>/subagents/`` and main-chat transcripts under
+    ``.../chats/``. This is the only client-provided signal that a session is a
+    subagent; the client never sends ``agent_type``.
+    """
+    transcript = payload.get("transcript_path")
+    return isinstance(transcript, str) and "/subagents/" in transcript
+
+
+def _transcript_readable(payload: dict[str, Any]) -> bool:
     transcript = payload.get("transcript_path")
     if not isinstance(transcript, str):
         return False
     try:
+        Path(transcript).read_text(encoding="utf-8", errors="replace")
+        return True
+    except OSError:
+        return False
+
+
+def audit_session(payload: dict[str, Any]) -> bool:
+    transcript = payload.get("transcript_path")
+    if not isinstance(transcript, str):
+        _warn("audit session check: transcript_path missing or not a string")
+        return False
+    try:
         text = Path(transcript).read_text(encoding="utf-8", errors="replace")
     except OSError:
+        _warn("audit session check: transcript unreadable; failing open")
         return False
     return "# Audit GitHub Repository" in text or (
         "gh-audit-repo" in text and "Base directory for this skill:" in text
@@ -130,8 +187,6 @@ def targets_private_boundary(payload: dict[str, Any]) -> bool:
         f"{extension}/agents",
         f"{extension}/qwen-extension.json",
         "src/github_workflows",
-        "agents/extensions/github-workflows/agents",
-        "agents/extensions/github-workflows/qwen-extension.json",
     )
     if any(target in lowered for target in implementation_targets):
         return True
@@ -391,13 +446,23 @@ def main() -> int:
     try:
         payload = json.load(sys.stdin)
         if not isinstance(payload, dict):
+            _warn("payload is not a JSON object; ignoring event")
             return 0
         if payload.get("hook_event_name") != "PreToolUse":
             return 0
-        if payload.get("agent_type") == "gh-audit-repo-worker":
-            allowed = payload.get("tool_name") != "run_shell_command" or allowed_worker_search(
-                payload
-            )
+        if is_subagent(payload):
+            if payload.get("tool_name") != "run_shell_command":
+                print(json.dumps(decision("allow")))
+                return 0
+            if assigned_task_context(payload) is None:
+                if _transcript_readable(payload):
+                    # A non-audit subagent: its shell stays unrestricted.
+                    print(json.dumps(decision("allow")))
+                else:
+                    _warn("subagent shell unverifiable against an audit task context; denying")
+                    print(json.dumps(decision("deny", WORKER_SHELL_DENIAL)))
+                return 0
+            allowed = allowed_worker_search(payload)
             print(
                 json.dumps(
                     decision(
@@ -416,10 +481,11 @@ def main() -> int:
                 return 0
         print(json.dumps(decision("allow")))
     except Exception:  # noqa: BLE001 - boundary hooks must fail safely on malformed input
+        _warn("unexpected guard error; failing safely")
         if (
             isinstance(payload, dict)
-            and payload.get("agent_type") == "gh-audit-repo-worker"
             and payload.get("tool_name") == "run_shell_command"
+            and is_subagent(payload)
         ):
             print(json.dumps(decision("deny", WORKER_SHELL_DENIAL)))
         # A local policy helper must not disrupt unrelated or malformed sessions.
