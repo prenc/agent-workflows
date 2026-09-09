@@ -2632,39 +2632,39 @@ class WorkflowRuntime:
             }
         # The probe subprocess runs outside the exclusive lock; state is re-read
         # and revision-checked under the lock before the result is persisted.
-        self._invoke(audit_probe.run_probe, **values)
-        with self.lock():
-            state, worktree, run_dir = self._audit_paths()
-            if request.candidate_id not in state.get("candidates", {}):
-                raise ValueError("probe refers to an unknown candidate")
-            if state["revision"] != expected_revision:
-                raise RuntimeError(
-                    "audit state changed while the probe was in flight; "
-                    f"expected revision {expected_revision}, found {state['revision']}"
+        try:
+            self._invoke(audit_probe.run_probe, **values)
+            with self.lock():
+                state, worktree, run_dir = self._audit_paths()
+                if request.candidate_id not in state.get("candidates", {}):
+                    raise ValueError("probe refers to an unknown candidate")
+                if state["revision"] != expected_revision:
+                    raise RuntimeError(
+                        "audit state changed while the probe was in flight; "
+                        f"expected revision {expected_revision}, found {state['revision']}"
+                    )
+                artifact_path = artifact_dir / "result.json"
+                try:
+                    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                    raise ValueError("probe did not produce a valid result artifact") from error
+                if not isinstance(artifact, dict) or artifact.get("probe_id") != request.probe_id:
+                    raise ValueError("probe result artifact has an invalid identity")
+                status = self._probe_validation_status(artifact)
+
+                def bounded(name: str, limit: int) -> tuple[str, bool]:
+                    value = artifact.get(name, "")
+                    text = value if isinstance(value, str) else ""
+                    truncated = bool(artifact.get(f"{name.removesuffix('_excerpt')}_truncated"))
+                    return text[:limit], truncated or len(text) > limit
+
+                persisted_stdout, persisted_stdout_truncated = bounded(
+                    "stdout_excerpt", TASK_VALIDATION_EXCERPT_BYTES
                 )
-            artifact_path = run_dir / "validation" / request.probe_id / "result.json"
-            try:
-                artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, json.JSONDecodeError) as error:
-                raise ValueError("probe did not produce a valid result artifact") from error
-            if not isinstance(artifact, dict) or artifact.get("probe_id") != request.probe_id:
-                raise ValueError("probe result artifact has an invalid identity")
-            status = self._probe_validation_status(artifact)
-
-            def bounded(name: str, limit: int) -> tuple[str, bool]:
-                value = artifact.get(name, "")
-                text = value if isinstance(value, str) else ""
-                truncated = bool(artifact.get(f"{name.removesuffix('_excerpt')}_truncated"))
-                return text[:limit], truncated or len(text) > limit
-
-            persisted_stdout, persisted_stdout_truncated = bounded(
-                "stdout_excerpt", TASK_VALIDATION_EXCERPT_BYTES
-            )
-            persisted_stderr, persisted_stderr_truncated = bounded(
-                "stderr_excerpt", TASK_VALIDATION_EXCERPT_BYTES
-            )
-            artifact_ref = f"validation/{request.probe_id}/result.json"
-            try:
+                persisted_stderr, persisted_stderr_truncated = bounded(
+                    "stderr_excerpt", TASK_VALIDATION_EXCERPT_BYTES
+                )
+                artifact_ref = f"validation/{request.probe_id}/result.json"
                 self._event(
                     {
                         "type": "candidate-upsert",
@@ -2693,33 +2693,34 @@ class WorkflowRuntime:
                         },
                     }
                 )
-            except ValueError:
-                # A rejected event would orphan the probe artifact against
-                # state["validations"]; the directory is unique to this probe
-                # id, so removing it restores the pre-probe layout.
-                shutil.rmtree(artifact_dir, ignore_errors=True)
-                raise
-            if artifact.get("worktree_unchanged") is False:
-                raise ValueError(
-                    f"probe {request.probe_id} modified the audit worktree; "
-                    f"outcome recorded at {artifact_ref}"
-                )
-            stdout, stdout_truncated = bounded("stdout_excerpt", 8 * 1024)
-            stderr, stderr_truncated = bounded("stderr_excerpt", 8 * 1024)
-            return {
-                "probe_id": request.probe_id,
-                "candidate_id": request.candidate_id,
-                "status": status,
-                "artifact": artifact_ref,
-                "returncode": artifact.get("returncode"),
-                "timed_out": bool(artifact.get("timed_out")),
-                "worktree_unchanged": bool(artifact.get("worktree_unchanged")),
-                "stdout_excerpt": stdout,
-                "stderr_excerpt": stderr,
-                "stdout_truncated": stdout_truncated,
-                "stderr_truncated": stderr_truncated,
-                "validation_recorded": True,
-            }
+        except (RuntimeError, ValueError):
+            # A rejected event would orphan the probe artifact against
+            # state["validations"]; the directory is unique to this probe
+            # id, so removing it restores the pre-probe layout.
+            if artifact_dir.exists():
+                shutil.rmtree(artifact_dir)
+            raise
+        if artifact.get("worktree_unchanged") is False:
+            raise ValueError(
+                f"probe {request.probe_id} modified the audit worktree; "
+                f"outcome recorded at {artifact_ref}"
+            )
+        stdout, stdout_truncated = bounded("stdout_excerpt", 8 * 1024)
+        stderr, stderr_truncated = bounded("stderr_excerpt", 8 * 1024)
+        return {
+            "probe_id": request.probe_id,
+            "candidate_id": request.candidate_id,
+            "status": status,
+            "artifact": artifact_ref,
+            "returncode": artifact.get("returncode"),
+            "timed_out": bool(artifact.get("timed_out")),
+            "worktree_unchanged": bool(artifact.get("worktree_unchanged")),
+            "stdout_excerpt": stdout,
+            "stderr_excerpt": stderr,
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
+            "validation_recorded": True,
+        }
 
     def audit_record(self, request: AuditRecordRequest) -> dict[str, Any]:
         mapping = {

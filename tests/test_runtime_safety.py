@@ -430,6 +430,51 @@ class TestRuntimeSafety:
                 blocker["kind"] == "validation-registration-mismatch" for blocker in blockers
             )
 
+    @pytest.mark.parametrize("failure", ["invoke", "artifact"])
+    def test_pre_event_probe_failure_removes_the_orphaned_artifact(self, failure: str) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-probe-orphan-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.audit_record(
+                AuditRecordRequest(
+                    action="candidate",
+                    candidate={"id": "candidate-race", "status": "discovered"},
+                )
+            )
+
+            def failed_probe(args: Any) -> int:
+                artifact_dir = args.run_dir / "validation" / args.probe_id
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                artifact = {
+                    "probe_id": "wrong-id" if failure == "artifact" else args.probe_id,
+                    "probe_status": "succeeded",
+                    "returncode": 0,
+                    "timed_out": False,
+                    "worktree_unchanged": True,
+                }
+                (artifact_dir / "result.json").write_text(json.dumps(artifact))
+                print(json.dumps({"returncode": 0}))
+                return 3 if failure == "invoke" else 0
+
+            with mock.patch(
+                "github_workflows.runtime.audit_probe.run_probe",
+                side_effect=failed_probe,
+            ):
+                with pytest.raises((RuntimeError, ValueError)):
+                    runtime.audit_probe(
+                        ProbeRequest(
+                            kind="python",
+                            probe_id="probe-race",
+                            candidate_id="candidate-race",
+                            code="pass",
+                        )
+                    )
+
+            state = runtime.state("gh-audit-repo")
+            assert state["candidates"]["candidate-race"]["status"] == "discovered"
+            assert state["validations"] == {}
+            assert not (runtime.current("gh-audit-repo") / "validation" / "probe-race").exists()
+
     def test_audit_task_context_rejects_worktree_head_drift(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-head-drift-") as directory:
             runtime = self.make_runtime(Path(directory))
