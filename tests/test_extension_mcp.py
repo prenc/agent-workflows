@@ -19,6 +19,7 @@ from pydantic import ValidationError
 
 from github_workflows import feedback
 from github_workflows.mcp_server import (
+    _render_validation_error,
     _request_invocation_id,
     _validation_issues,
     create_server,
@@ -292,6 +293,7 @@ class TestExtensionMcp:
                 assert "repository" in run_properties
                 assert "instructions" in run_properties
                 assert "confirmed_source_sha" in run_properties
+                assert "acknowledge_pending_publication" in run_properties
                 assert set(run_properties["outcome"]["enum"]) == {
                     "complete",
                     "blocked",
@@ -409,6 +411,7 @@ class TestExtensionMcp:
                 assert conditional_required["audit_record"]["candidate"] == {"candidate"}
                 assert conditional_required["audit_publish"]["begin"] == {"operation"}
                 assert conditional_required["audit_publish"]["finish"] == {"receipt"}
+                assert conditional_required["audit_publish"]["failed"] == {"error"}
                 implementation_start = next(
                     condition["then"]
                     for condition in tools["run_manage"].input_schema["allOf"]
@@ -947,6 +950,72 @@ class TestExtensionMcp:
                     "run_manage", {"action": "finish", "workflow": workflow}
                 )
                 assert not finished.is_error
+
+    async def test_rendered_corrections_do_not_repeat_field_names(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="github-workflows-error-dup-") as directory:
+            root = Path(directory)
+            workspace = root / "repo"
+            workspace.mkdir()
+            runtime = WorkflowRuntime(workspace, root / "qwen-project")
+            cases = [
+                (
+                    "run_manage",
+                    {
+                        "action": "start",
+                        "workflow": "gh-implement-issue",
+                        "repository": "example/repo",
+                        "targets": [""],
+                    },
+                    "targets must contain only non-blank references",
+                ),
+                (
+                    "run_manage",
+                    {
+                        "action": "start",
+                        "workflow": "gh-audit-repo",
+                        "repository": "example/repo",
+                        "instructions": "   ",
+                    },
+                    "instructions must not be blank",
+                ),
+                (
+                    "audit_record",
+                    {
+                        "action": "verdict",
+                        "verdict": {"id": "C-1", "candidate_id": "C-1"},
+                    },
+                    "verdict uses candidate_id as its sole identity; id is not accepted",
+                ),
+                (
+                    "history_manage",
+                    {"action": "ingest"},
+                    "ingest requires exactly one of records or artifacts",
+                ),
+            ]
+            async with Client(
+                create_server(runtime),
+                raise_exceptions=False,
+                read_timeout_seconds=0.1,
+            ) as client:
+                for tool_name, arguments, correction in cases:
+                    result = await client.call_tool(tool_name, arguments)
+                    assert result.is_error, (tool_name, arguments)
+                    assert result.content[0].text.startswith(correction), (
+                        tool_name,
+                        result.content[0].text,
+                    )
+
+        # The n value_error is masked end-to-end by the tool's own PositiveInteger
+        # parameter check, so pin its rendered form at the MCP rendering layer.
+        with pytest.raises(ValidationError) as validation:
+            RunManageRequest(
+                action="start",
+                workflow="gh-curate-issues",
+                repository="example/repo",
+                n=0,
+            )
+        rendered = _render_validation_error(validation.value, {"action": "start"})
+        assert rendered == "n must be a positive integer"
 
     async def test_expected_runtime_failure_is_actionable_tool_error(
         self, caplog: Any, monkeypatch: pytest.MonkeyPatch
