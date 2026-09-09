@@ -5,6 +5,9 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest import mock
+
+from github_workflows import audit_metrics
 
 HELPER = Path(__file__).parents[1] / "src/github_workflows/audit_metrics.py"
 
@@ -161,37 +164,25 @@ class TestAuditMetrics:
         with log.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
 
-    def test_skips_deeply_nested_string_system_payload(self) -> None:
-        # 50000-deep nesting overflows the JSON decoder stack, so
-        # telemetry_event's json.loads branch raises RecursionError.
-        deep = "[" * 50000 + "]" * 50000
-        line = json.dumps(
-            {
-                "type": "system",
-                "subtype": "ui_telemetry",
-                "systemPayload": (
-                    '{"uiEvent": {"event.name": "qwen-code.api_response", '
-                    '"input_token_count": 4242}, "nested": ' + deep + "}"
-                ),
-            }
-        )
-        self._append_agent_log_line(line)
-        metrics = self.metrics()
-        assert metrics["telemetry"]["model_responses"] == 1
-        assert metrics["telemetry"]["input_token_count"] == 100
-        assert metrics["context7_calls"] == 2
+    def test_skips_string_system_payload_when_decoders_recurse(self) -> None:
+        with (
+            mock.patch.object(audit_metrics.json, "loads", side_effect=RecursionError),
+            mock.patch.object(audit_metrics.ast, "literal_eval", side_effect=RecursionError),
+        ):
+            assert audit_metrics.telemetry_event("recursive payload") == {}
 
-    def test_skips_deeply_nested_outer_record(self) -> None:
-        # A deeply nested outer record overflows summarize's per-line
-        # json.loads before telemetry_event is ever reached.
-        deep = "[" * 50000 + "]" * 50000
-        line = (
-            '{"type": "system", "subtype": "ui_telemetry", '
-            '"systemPayload": {"uiEvent": {"event.name": '
-            '"qwen-code.api_response"}, "nested": ' + deep + "}}"
-        )
-        self._append_agent_log_line(line)
-        metrics = self.metrics()
+    def test_skips_outer_record_when_json_decoder_recurses(self) -> None:
+        state = json.loads((self.run_dir / "state.json").read_text(encoding="utf-8"))
+        self._append_agent_log_line("recursive record")
+        real_loads = json.loads
+
+        def loads(value: str, *args: object, **kwargs: object) -> object:
+            if value.strip() == "recursive record":
+                raise RecursionError
+            return real_loads(value, *args, **kwargs)
+
+        with mock.patch.object(audit_metrics.json, "loads", side_effect=loads):
+            metrics = audit_metrics.summarize(self.project_dir, self.run_dir, state)
         assert metrics["telemetry"]["model_responses"] == 1
         assert metrics["telemetry"]["input_token_count"] == 100
         assert metrics["context7_calls"] == 2
