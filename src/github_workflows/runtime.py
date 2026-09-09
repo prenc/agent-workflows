@@ -206,8 +206,6 @@ class WorkflowRuntime:
     @staticmethod
     def _invoke(
         handler: Callable[[argparse.Namespace], Any],
-        *,
-        allow_timeout: bool = False,
         **values: Any,
     ) -> dict[str, Any]:
         output = StringIO()
@@ -217,19 +215,14 @@ class WorkflowRuntime:
         payload = json.loads(rendered) if rendered else {}
         if not isinstance(payload, dict):
             raise ValueError("workflow operation returned a non-object response")
-        expected_timeout = allow_timeout and result == 124 and payload.get("timed_out") is True
-        if (
-            isinstance(result, int)
-            and result not in {0, payload.get("returncode")}
-            and not expected_timeout
-        ):
+        if isinstance(result, int) and result not in {0, payload.get("returncode")}:
             raise RuntimeError(f"workflow operation failed with exit code {result}")
         return payload
 
     @staticmethod
     def _probe_validation_status(result: dict[str, Any]) -> str:
         probe_status = result.get("probe_status")
-        if probe_status in {"succeeded", "failed", "timed-out", "unavailable"}:
+        if probe_status in {"succeeded", "failed", "timed-out", "unavailable", "worktree-modified"}:
             return probe_status
         if result.get("timed_out") is True:
             return "timed-out"
@@ -2615,23 +2608,31 @@ class WorkflowRuntime:
     def audit_probe(self, request: ProbeRequest) -> dict[str, Any]:
         with self.lock():
             state, worktree, run_dir = self._audit_paths()
-            if request.candidate_id not in state.get("candidates", {}):
+            candidate = state.get("candidates", {}).get(request.candidate_id)
+            if not isinstance(candidate, dict):
                 raise ValueError("probe refers to an unknown candidate")
             expected_revision = state["revision"]
+            candidate_status = candidate.get("status")
+            if candidate_status in workflow_run.AUDIT_CANDIDATE_TERMINAL:
+                raise ValueError(
+                    f"candidate {request.candidate_id} is in terminal status "
+                    f"{candidate_status}; probe refused before execution"
+                )
+            artifact_dir = run_dir / "validation" / request.probe_id
             values = {
                 "project_root": self.workspace,
                 "project_dir": self.project_dir,
                 "audit_worktree": worktree,
                 "run_dir": run_dir,
                 "probe_id": request.probe_id,
-                "pythonpath": None,
+                "pythonpath": request.pythonpath,
                 "kind": request.kind,
                 "selector": getattr(request, "selectors", None),
                 "code": getattr(request, "code", None),
             }
         # The probe subprocess runs outside the exclusive lock; state is re-read
         # and revision-checked under the lock before the result is persisted.
-        self._invoke(audit_probe.run_probe, allow_timeout=True, **values)
+        self._invoke(audit_probe.run_probe, **values)
         with self.lock():
             state, worktree, run_dir = self._audit_paths()
             if request.candidate_id not in state.get("candidates", {}):
@@ -2662,35 +2663,47 @@ class WorkflowRuntime:
             persisted_stderr, persisted_stderr_truncated = bounded(
                 "stderr_excerpt", TASK_VALIDATION_EXCERPT_BYTES
             )
-            self._event(
-                {
-                    "type": "candidate-upsert",
-                    "candidate": {
-                        "id": request.candidate_id,
-                        "status": "validation-pending",
-                    },
-                }
-            )
             artifact_ref = f"validation/{request.probe_id}/result.json"
-            self._event(
-                {
-                    "type": "validation-record",
-                    "validation": {
-                        "id": request.probe_id,
-                        "probe_id": request.probe_id,
-                        "candidate_id": request.candidate_id,
-                        "status": status,
-                        "artifact": artifact_ref,
-                        "returncode": artifact.get("returncode"),
-                        "timed_out": bool(artifact.get("timed_out")),
-                        "worktree_unchanged": bool(artifact.get("worktree_unchanged")),
-                        "stdout_excerpt": persisted_stdout,
-                        "stderr_excerpt": persisted_stderr,
-                        "stdout_truncated": persisted_stdout_truncated,
-                        "stderr_truncated": persisted_stderr_truncated,
-                    },
-                }
-            )
+            try:
+                self._event(
+                    {
+                        "type": "candidate-upsert",
+                        "candidate": {
+                            "id": request.candidate_id,
+                            "status": "validation-pending",
+                        },
+                    }
+                )
+                self._event(
+                    {
+                        "type": "validation-record",
+                        "validation": {
+                            "id": request.probe_id,
+                            "probe_id": request.probe_id,
+                            "candidate_id": request.candidate_id,
+                            "status": status,
+                            "artifact": artifact_ref,
+                            "returncode": artifact.get("returncode"),
+                            "timed_out": bool(artifact.get("timed_out")),
+                            "worktree_unchanged": bool(artifact.get("worktree_unchanged")),
+                            "stdout_excerpt": persisted_stdout,
+                            "stderr_excerpt": persisted_stderr,
+                            "stdout_truncated": persisted_stdout_truncated,
+                            "stderr_truncated": persisted_stderr_truncated,
+                        },
+                    }
+                )
+            except ValueError:
+                # A rejected event would orphan the probe artifact against
+                # state["validations"]; the directory is unique to this probe
+                # id, so removing it restores the pre-probe layout.
+                shutil.rmtree(artifact_dir, ignore_errors=True)
+                raise
+            if artifact.get("worktree_unchanged") is False:
+                raise ValueError(
+                    f"probe {request.probe_id} modified the audit worktree; "
+                    f"outcome recorded at {artifact_ref}"
+                )
             stdout, stdout_truncated = bounded("stdout_excerpt", 8 * 1024)
             stderr, stderr_truncated = bounded("stderr_excerpt", 8 * 1024)
             return {
