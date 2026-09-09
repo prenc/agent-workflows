@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
+import os
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import venv
 from pathlib import Path
 from unittest import mock
@@ -12,8 +16,24 @@ from unittest import mock
 import pytest
 
 from github_workflows import audit_probe
+from github_workflows import audit_sandbox
 
 HELPER = Path(__file__).parents[1] / "src/github_workflows/audit_probe.py"
+
+
+def _pids_with_marker(marker: str) -> list[int]:
+    """Host pid-space pids whose cmdline still carries the marker."""
+    pids = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            cmdline = Path("/proc", entry, "cmdline").read_bytes()
+        except OSError:
+            continue
+        if marker.encode("utf-8") in cmdline:
+            pids.append(int(entry))
+    return pids
 
 
 class TestAuditProbe:
@@ -295,3 +315,160 @@ print("isolated")
         ):
             with pytest.raises(ValueError, match="timed out after"):
                 audit_probe.git_output(Path("/missing"), "status")
+
+    def test_sandbox_enforces_and_records_as_and_nproc_limits(self) -> None:
+        code = (
+            "import json, resource\n"
+            "print(json.dumps({'as': list(resource.getrlimit(resource.RLIMIT_AS)), "
+            "'nproc': list(resource.getrlimit(resource.RLIMIT_NPROC))}))\n"
+        )
+        result = self.invoke("--code", code)
+        assert result.returncode == 0, result.stdout + result.stderr
+        artifact = json.loads(Path(json.loads(result.stdout)["result"]).read_text())
+        assert artifact["probe_status"] == "succeeded"
+        observed = json.loads(artifact["stdout_excerpt"].strip())
+        assert observed["as"] == [audit_sandbox.ADDRESS_SPACE_BYTES] * 2
+        assert observed["nproc"] == [artifact["limits"]["nproc"]] * 2
+        assert artifact["limits"]["address_space_bytes"] == audit_sandbox.ADDRESS_SPACE_BYTES
+        assert artifact["limits"]["address_space_bytes"] >= 1024 * 1024 * 1024
+        assert artifact["limits"]["nproc"] >= audit_sandbox.NPROC_FLOOR
+
+    def test_address_space_exhaustion_maps_to_failed_probe(self) -> None:
+        # exhausting the RLIMIT_AS ceiling is a child MemoryError: it exits
+        # non-zero and maps to probe_status failed with no new exception path
+        code = "chunks = []\nwhile True:\n    chunks.append(bytearray(64 * 1024 * 1024))\n"
+        result = self.invoke("--code", code)
+        assert result.returncode == 1, result.stdout + result.stderr
+        artifact = json.loads(Path(json.loads(result.stdout)["result"]).read_text())
+        assert artifact["probe_status"] == "failed"
+        assert artifact["returncode"] == 1
+
+    def test_sandbox_isolates_pid_namespace_and_primary_gitdir(self) -> None:
+        linked = self.project / "linked-worktree"
+        subprocess.run(
+            ["git", "-C", str(self.project), "worktree", "add", "--detach", "-q", str(linked)],
+            check=True,
+        )
+        try:
+            primary_gitdir = (self.project / ".git").resolve()
+            code = f"""
+from pathlib import Path
+
+nspid = [line for line in Path("/proc/self/status").read_text().splitlines() if line.startswith("NSpid")]
+assert len(nspid) == 1 and len(nspid[0].split()) >= 3, f"no nested pid namespace: {{nspid}}"
+
+try:
+    (Path({str(primary_gitdir)!r}) / "probe-write-test").open("w").write("x")
+except OSError:
+    pass
+else:
+    raise AssertionError("primary git directory was writable")
+
+print("namespaced")
+"""
+            result = subprocess.run(
+                [
+                    str(HELPER),
+                    "python",
+                    "--project-root",
+                    str(self.project),
+                    "--audit-worktree",
+                    str(linked),
+                    "--run-dir",
+                    str(self.run_dir),
+                    "--project-dir",
+                    str(self.project_dir),
+                    "--probe-id",
+                    "probe-ns",
+                    "--code",
+                    code,
+                ],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            artifact = json.loads(Path(json.loads(result.stdout)["result"]).read_text())
+            assert result.returncode == 0, (
+                result.stdout + result.stderr + artifact["stderr_excerpt"]
+            )
+            assert artifact["probe_status"] == "succeeded"
+            assert "namespaced" in artifact["stdout_excerpt"]
+            assert not (primary_gitdir / "probe-write-test").exists()
+        finally:
+            subprocess.run(
+                ["git", "-C", str(self.project), "worktree", "remove", "--force", str(linked)],
+                check=True,
+            )
+
+    def test_timeout_writes_result_and_kills_ignoring_probe(self, monkeypatch) -> None:
+        from github_workflows import audit_probe as audit_probe_module
+
+        monkeypatch.setattr(audit_probe_module, "WALL_SECONDS", 2)
+        marker = f"qwen-poison-marker-{os.getpid()}-{id(self)}"
+        code = (
+            "import signal, time\n"
+            f"# {marker}\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "time.sleep(987.654)\n"
+        )
+        args = argparse.Namespace(
+            project_root=self.project,
+            project_dir=self.project_dir,
+            audit_worktree=self.project,
+            run_dir=self.run_dir,
+            probe_id="probe-timeout",
+            pythonpath=None,
+            kind="python",
+            code=code,
+            selector=[],
+        )
+        returncode = audit_probe_module.run_probe(args)
+        assert returncode == 124
+        # the result artifact must be written even though the group kill
+        # raced a SIGTERM-ignoring probe: a skipped artifact would poison
+        # the probe id for every retry
+        artifact_path = self.run_dir / "validation" / "probe-timeout" / "result.json"
+        assert artifact_path.is_file()
+        artifact = json.loads(artifact_path.read_text())
+        assert artifact["probe_status"] == "timed-out"
+        assert artifact["timed_out"] is True
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and _pids_with_marker(marker):
+            time.sleep(0.1)
+        assert not _pids_with_marker(marker), "SIGTERM-ignoring probe survived the timeout"
+
+
+class TestAuditSandboxKills:
+    def test_kill_process_group_ignores_missing_group(self) -> None:
+        process = subprocess.Popen(["true"], start_new_session=True)
+        process.wait()
+        audit_sandbox.kill_process_group(process, signal.SIGTERM)
+        audit_sandbox.kill_process_group(process, signal.SIGKILL)
+
+    def test_wait_bounded_escalates_to_sigkill_for_term_ignoring_group(self) -> None:
+        process = subprocess.Popen(
+            ["/bin/sh", "-c", 'trap "" TERM; sleep 30 & wait $!'],
+            start_new_session=True,
+        )
+        pgid = process.pid
+        returncode, timed_out = audit_sandbox.wait_bounded(process, 0.5, grace_seconds=1)
+        assert timed_out is True
+        assert returncode != 0
+        # the orphaned members are reaped by the host init shortly after the
+        # SIGKILL; poll until the group is provably empty
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("SIGTERM-ignoring group survived the SIGKILL escalation")
+
+    def test_wait_bounded_tolerates_group_exit_during_grace(self) -> None:
+        process = subprocess.Popen(["/bin/sh", "-c", "sleep 5"], start_new_session=True)
+        returncode, timed_out = audit_sandbox.wait_bounded(process, 0.3, grace_seconds=2)
+        assert timed_out is True
+        assert returncode != 0

@@ -6,16 +6,38 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import importlib.util
 import json
 import os
 import re
-import resource
 import shutil
 import subprocess
 import sys
 import tempfile
+import types
 from pathlib import Path
 from typing import Any
+
+
+def _load_audit_sandbox() -> types.ModuleType:
+    """Load the sibling audit_sandbox module without importing the package.
+
+    These helper CLIs run as standalone scripts. Importing the
+    ``github_workflows`` package executes import-time side effects (including
+    ``github_cache``'s interpreter bootstrap, which can replace the running
+    process), so the helper loads its sibling module directly from its own
+    directory.
+    """
+    module_file = Path(__file__).resolve().with_name("audit_sandbox.py")
+    spec = importlib.util.spec_from_file_location("audit_sandbox", module_file)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"sibling audit_sandbox module is unavailable: {module_file}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+audit_sandbox = _load_audit_sandbox()
 
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}")
 ALLOWED_ARGUMENTS = {"--version", "-V", "-v", "version", "--help", "-h"}
@@ -125,15 +147,26 @@ def package_inventory(project: Path) -> dict[str, Any]:
         "'packages':dict(sorted((d.metadata.get('Name',d.name),d.version) for d in m.distributions()))}))"
     )
     try:
-        result = subprocess.run(
-            [str(python), "-I", "-c", code],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=WALL_SECONDS,
-            env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1"},
-        )
-        payload = json.loads(result.stdout)
+        with tempfile.TemporaryDirectory(prefix="qwen-audit-inventory-") as temporary:
+            stdout_path = Path(temporary) / "stdout"
+            stderr_path = Path(temporary) / "stderr"
+            with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+                process = subprocess.Popen(
+                    [str(python), "-I", "-c", code],
+                    stdout=stdout,
+                    stderr=stderr,
+                    env={
+                        "PATH": "/usr/bin:/bin",
+                        "LANG": "C.UTF-8",
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                    },
+                    start_new_session=True,
+                )
+                returncode, _ = audit_sandbox.wait_bounded(process, WALL_SECONDS)
+            if returncode != 0:
+                raise subprocess.CalledProcessError(returncode, [str(python)])
+            payload_text, _ = audit_sandbox.read_bounded(stdout_path, OUTPUT_BYTES)
+        payload = json.loads(payload_text)
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
         return {
             "available": False,
@@ -253,40 +286,29 @@ def refresh(args: argparse.Namespace) -> None:
     print(json.dumps(commit_refresh(run_dir, current, args.expected_revision)))
 
 
-def limits() -> None:
-    resource.setrlimit(resource.RLIMIT_CPU, (WALL_SECONDS, WALL_SECONDS))
-    resource.setrlimit(resource.RLIMIT_FSIZE, (OUTPUT_BYTES, OUTPUT_BYTES))
-    resource.setrlimit(resource.RLIMIT_NOFILE, (128, 128))
-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    os.nice(10)
+def probe_readonly_roots(
+    worktree: Path,
+    run_dir: Path,
+    executable: Path,
+    readonly_root: Path | None,
+) -> list[Path | None]:
+    """Read-only bind roots beyond the worktree itself for program probes.
 
-
-def sandbox_command(
-    worktree: Path, command: list[str], readonly_root: Path | None = None
-) -> list[str]:
-    script = (
-        'set -eu\nworktree="$1"\nreadonly_root="$2"\nshift 2\n'
-        '/usr/bin/mount --bind "$worktree" "$worktree"\n'
-        '/usr/bin/mount -o remount,bind,ro "$worktree"\n'
-        'if [ -n "$readonly_root" ]; then\n'
-        '  /usr/bin/mount --bind "$readonly_root" "$readonly_root"\n'
-        '  /usr/bin/mount -o remount,bind,ro "$readonly_root"\n'
-        "fi\n"
-        'cd "$worktree"\nexec "$@"\n'
-    )
+    The project .venv when it lives outside the worktree, its resolved
+    target when the venv escapes the worktree through a symlink, the
+    executable's base interpreter prefix, the primary checkout's git
+    directory for a linked worktree, and the audit run state directory when
+    it lives outside the worktree.
+    """
+    venv_target = readonly_root.resolve() if readonly_root is not None else None
     return [
-        "/usr/bin/unshare",
-        "--user",
-        "--map-root-user",
-        "--mount",
-        "--net",
-        "/bin/sh",
-        "-c",
-        script,
-        "audit-inventory",
-        str(worktree),
-        str(readonly_root) if readonly_root is not None else "",
-        *command,
+        readonly_root
+        if readonly_root is not None and not contained(readonly_root, worktree)
+        else None,
+        venv_target if venv_target is not None and not contained(venv_target, worktree) else None,
+        audit_sandbox.interpreter_prefix(executable),
+        audit_sandbox.primary_git_dir(worktree),
+        run_dir if not contained(run_dir, worktree) else None,
     ]
 
 
@@ -354,43 +376,34 @@ def probe_program(
         if executable_source != "project-venv" and contained(resolved_executable, project):
             raise ValueError("project executables must be installed in the project .venv")
         with tempfile.TemporaryDirectory(prefix="qwen-audit-inventory-") as temporary:
-            environment = sanitized_environment(Path(temporary), executable)
+            temporary_path = Path(temporary)
+            environment = sanitized_environment(temporary_path, executable)
+            stdout_path = temporary_path / "stdout"
+            stderr_path = temporary_path / "stderr"
+            address_space, nproc = audit_sandbox.current_resource_bounds()
+            command = audit_sandbox.namespace_command(
+                [str(executable), *arguments],
+                worktree=worktree,
+                readonly_binds=audit_sandbox.readonly_binds(
+                    worktree,
+                    probe_readonly_roots(worktree, run_dir, executable, readonly_root),
+                    scratch=temporary_path,
+                ),
+                label="audit-inventory",
+            )
             try:
-                result = subprocess.run(
-                    sandbox_command(worktree, [str(executable), *arguments], readonly_root),
-                    check=False,
-                    capture_output=True,
-                    timeout=WALL_SECONDS,
-                    env=environment,
-                    preexec_fn=limits,
-                )
-                stdout = result.stdout[:OUTPUT_BYTES].decode("utf-8", errors="replace")
-                stderr = result.stderr[:OUTPUT_BYTES].decode("utf-8", errors="replace")
-                fact = {
-                    "available": True,
-                    "probe_status": "succeeded" if result.returncode == 0 else "failed",
-                    "executable": name,
-                    "executable_source": executable_source,
-                    "arguments": arguments,
-                    "returncode": result.returncode,
-                    "stdout": stdout,
-                    "stderr": stderr,
-                    "truncated": len(result.stdout) > OUTPUT_BYTES
-                    or len(result.stderr) > OUTPUT_BYTES,
-                    "collected_at": now,
-                    "source": "current-audit-host",
-                }
-            except subprocess.TimeoutExpired:
-                fact = {
-                    "available": True,
-                    "probe_status": "timed-out",
-                    "executable": name,
-                    "executable_source": executable_source,
-                    "arguments": arguments,
-                    "reason": "probe timed out",
-                    "collected_at": now,
-                    "source": "current-audit-host",
-                }
+                with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+                    process = subprocess.Popen(
+                        command,
+                        stdout=stdout,
+                        stderr=stderr,
+                        env=environment,
+                        start_new_session=True,
+                        preexec_fn=audit_sandbox.make_limits(
+                            WALL_SECONDS, OUTPUT_BYTES, 128, address_space, nproc
+                        ),
+                    )
+                    returncode, timed_out = audit_sandbox.wait_bounded(process, WALL_SECONDS)
             except OSError as error:
                 fact = {
                     "available": True,
@@ -402,6 +415,34 @@ def probe_program(
                     "collected_at": now,
                     "source": "current-audit-host",
                 }
+            else:
+                if timed_out:
+                    fact = {
+                        "available": True,
+                        "probe_status": "timed-out",
+                        "executable": name,
+                        "executable_source": executable_source,
+                        "arguments": arguments,
+                        "reason": "probe timed out",
+                        "collected_at": now,
+                        "source": "current-audit-host",
+                    }
+                else:
+                    stdout, stdout_truncated = audit_sandbox.read_bounded(stdout_path, OUTPUT_BYTES)
+                    stderr, stderr_truncated = audit_sandbox.read_bounded(stderr_path, OUTPUT_BYTES)
+                    fact = {
+                        "available": True,
+                        "probe_status": "succeeded" if returncode == 0 else "failed",
+                        "executable": name,
+                        "executable_source": executable_source,
+                        "arguments": arguments,
+                        "returncode": returncode,
+                        "stdout": stdout,
+                        "stderr": stderr,
+                        "truncated": stdout_truncated or stderr_truncated,
+                        "collected_at": now,
+                        "source": "current-audit-host",
+                    }
     return fact
 
 

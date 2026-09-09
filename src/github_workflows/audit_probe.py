@@ -5,18 +5,38 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
-import resource
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Sequence
+import types
 from pathlib import Path
+
+
+def _load_audit_sandbox() -> types.ModuleType:
+    """Load the sibling audit_sandbox module without importing the package.
+
+    These helper CLIs run as standalone scripts. Importing the
+    ``github_workflows`` package executes import-time side effects (including
+    ``github_cache``'s interpreter bootstrap, which can replace the running
+    process), so the helper loads its sibling module directly from its own
+    directory.
+    """
+    module_file = Path(__file__).resolve().with_name("audit_sandbox.py")
+    spec = importlib.util.spec_from_file_location("audit_sandbox", module_file)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"sibling audit_sandbox module is unavailable: {module_file}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+audit_sandbox = _load_audit_sandbox()
 
 PROBE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 WALL_SECONDS = 60
@@ -207,51 +227,26 @@ def sanitized_environment(temp_root: Path, pythonpath: Path | None) -> dict[str,
     return environment
 
 
-def namespace_command(worktree: Path, venv: Path, command: Sequence[str]) -> list[str]:
-    script = (
-        "set -eu\n"
-        'worktree="$1"\n'
-        'venv="$2"\n'
-        "shift 2\n"
-        '/usr/bin/mount --bind "$worktree" "$worktree"\n'
-        '/usr/bin/mount -o remount,bind,ro "$worktree"\n'
-        'if [ "${venv#"$worktree"/}" = "$venv" ]; then\n'
-        '  /usr/bin/mount --bind "$venv" "$venv"\n'
-        '  /usr/bin/mount -o remount,bind,ro "$venv"\n'
-        "fi\n"
-        'cd "$worktree"\n'
-        'exec "$@"\n'
-    )
+def probe_readonly_roots(
+    worktree: Path, venv: Path, python: Path, run_dir: Path
+) -> list[Path | None]:
+    """Read-only bind roots beyond the worktree itself.
+
+    The venv when it lives outside the worktree; the venv's resolved target
+    when it escapes the worktree through a symlink (a bind of the symlink
+    path alone still leaves the target reachable by its real path); the
+    interpreter's base CPython prefix; the primary checkout's git directory
+    for a linked worktree; and the audit run state directory when it lives
+    outside the worktree.
+    """
+    venv_target = venv.resolve()
     return [
-        "/usr/bin/unshare",
-        "--user",
-        "--map-root-user",
-        "--mount",
-        "--net",
-        "/bin/sh",
-        "-c",
-        script,
-        "audit-probe",
-        str(worktree),
-        str(venv),
-        *command,
+        venv if not contained(venv, worktree) else None,
+        venv_target if not contained(venv_target, worktree) else None,
+        audit_sandbox.interpreter_prefix(python),
+        audit_sandbox.primary_git_dir(worktree),
+        run_dir if not contained(run_dir, worktree) else None,
     ]
-
-
-def limits() -> None:
-    resource.setrlimit(resource.RLIMIT_CPU, (CPU_SECONDS, CPU_SECONDS))
-    resource.setrlimit(resource.RLIMIT_FSIZE, (OUTPUT_BYTES, OUTPUT_BYTES))
-    resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    os.nice(10)
-
-
-def read_excerpt(path: Path) -> tuple[str, bool]:
-    content = path.read_bytes()
-    truncated = len(content) > EXCERPT_BYTES
-    if truncated:
-        content = content[:EXCERPT_BYTES]
-    return content.decode("utf-8", errors="replace"), truncated
 
 
 def run_probe(args: argparse.Namespace) -> int:
@@ -323,12 +318,22 @@ def run_probe(args: argparse.Namespace) -> int:
 
     before = git_output(worktree, "status", "--porcelain=v1", "--untracked-files=all")
     started = time.monotonic()
-    timed_out = False
+    address_space, nproc = audit_sandbox.current_resource_bounds()
     with tempfile.TemporaryDirectory(prefix="qwen-audit-probe-") as temporary:
-        environment = sanitized_environment(Path(temporary), pythonpath)
+        temporary_path = Path(temporary)
+        environment = sanitized_environment(temporary_path, pythonpath)
         stdout_path = Path(temporary) / "stdout.txt"
         stderr_path = Path(temporary) / "stderr.txt"
-        command = namespace_command(worktree, python.parent.parent, inner_command)
+        command = audit_sandbox.namespace_command(
+            inner_command,
+            worktree=worktree,
+            readonly_binds=audit_sandbox.readonly_binds(
+                worktree,
+                probe_readonly_roots(worktree, python.parent.parent, python, run_dir),
+                scratch=temporary_path,
+            ),
+            label="audit-probe",
+        )
         with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
             process = subprocess.Popen(
                 command,
@@ -336,22 +341,19 @@ def run_probe(args: argparse.Namespace) -> int:
                 stderr=stderr,
                 env=environment,
                 start_new_session=True,
-                preexec_fn=limits,
+                preexec_fn=audit_sandbox.make_limits(
+                    CPU_SECONDS, OUTPUT_BYTES, 256, address_space, nproc
+                ),
             )
-            try:
-                returncode = process.wait(timeout=WALL_SECONDS)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                os.killpg(process.pid, signal.SIGTERM)
-                try:
-                    returncode = process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    returncode = process.wait()
+            returncode, timed_out = audit_sandbox.wait_bounded(process, WALL_SECONDS)
         after = git_output(worktree, "status", "--porcelain=v1", "--untracked-files=all")
         duration = time.monotonic() - started
-        stdout_excerpt, stdout_truncated = read_excerpt(stdout_path)
-        stderr_excerpt, stderr_truncated = read_excerpt(stderr_path)
+        stdout_excerpt, stdout_truncated = audit_sandbox.read_bounded(
+            stdout_path, EXCERPT_BYTES
+        )
+        stderr_excerpt, stderr_truncated = audit_sandbox.read_bounded(
+            stderr_path, EXCERPT_BYTES
+        )
         if before != after:
             probe_status = "worktree-modified"
         elif timed_out:
@@ -376,6 +378,8 @@ def run_probe(args: argparse.Namespace) -> int:
                 "wall_seconds": WALL_SECONDS,
                 "cpu_seconds": CPU_SECONDS,
                 "output_bytes_per_stream": OUTPUT_BYTES,
+                "address_space_bytes": address_space,
+                "nproc": nproc,
                 "threads": 1,
                 "network_namespace": True,
                 "read_only_worktree_mount": True,
@@ -411,9 +415,9 @@ def run_probe(args: argparse.Namespace) -> int:
             }
         )
     )
-    # The helper exit code is the probe program's own exit code; the structured
-    # artifact fields carry the timeout and worktree-modification outcomes.
-    return returncode
+    if before != after:
+        return 3
+    return 124 if timed_out else returncode
 
 
 def parser() -> argparse.ArgumentParser:
