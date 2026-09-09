@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import subprocess
 import sys
 import uuid
 from pathlib import Path
@@ -391,6 +392,36 @@ def agent_feedback_main() -> int:
     return run_agent_feedback(sys.argv[1:])
 
 
+def _text_output(value: object) -> str | None:
+    """Normalize captured subprocess output to displayable text."""
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _subprocess_failure_text(error: subprocess.SubprocessError) -> str:
+    """Render a clean diagnostic naming the failed command and its captured output."""
+    command = error.cmd
+    if isinstance(command, (list, tuple)):
+        command_text = " ".join(str(part) for part in command)
+    else:
+        command_text = str(command)
+    if isinstance(error, subprocess.TimeoutExpired):
+        summary = f"command timed out after {error.timeout:g} seconds: {command_text}"
+    else:
+        summary = f"command failed with exit code {error.returncode}: {command_text}"
+    blocks = [summary]
+    stderr = _text_output(getattr(error, "stderr", None))
+    stdout = _text_output(getattr(error, "output", None))
+    if stderr:
+        blocks.append(f"stderr:\n{stderr.rstrip()}")
+    if stdout and stdout != stderr:
+        blocks.append(f"stdout:\n{stdout.rstrip()}")
+    return "\n".join(blocks)
+
+
 def main() -> int:
     try:
         if sys.argv[1:] == ["_feedback-locator-hook"]:
@@ -409,6 +440,9 @@ def main() -> int:
         return run_workflow(args)
     except KeyboardInterrupt:
         return 130
+    except subprocess.SubprocessError as error:
+        print(f"agent-workflows: {_subprocess_failure_text(error)}", file=sys.stderr)
+        return 2
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
         print(f"agent-workflows: {error}", file=sys.stderr)
         return 2
