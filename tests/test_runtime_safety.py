@@ -10,9 +10,11 @@ from typing import Any
 from unittest import mock
 
 import pytest
+from mcp import Client
 from pydantic import ValidationError
 
 from github_workflows import github_cache, workflow_run
+from github_workflows.mcp_server import create_server
 from github_workflows.models import (
     AuditRecordRequest,
     HistoryManageRequest,
@@ -961,6 +963,73 @@ class TestRuntimeSafety:
             assert replaced["run_id"] != first["run_id"]
             assert not managed_worktree.exists()
             assert replaced["history"]["publication_pending"] is False
+
+    async def test_mcp_start_replaces_aborted_run_with_acknowledged_publication(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-mcp-terminal-pending-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            first = runtime.state("gh-audit-repo")
+            managed_worktree = self.attach_managed_worktree(runtime)
+            state = runtime.state("gh-audit-repo")
+            state["history"].update(
+                {"publication_pending": True, "candidate_id": "C-1", "operation": "create"}
+            )
+            workflow_run.write_state(runtime.current("gh-audit-repo"), state)
+            runtime.run_manage(RunManageRequest(action="abort", workflow="gh-audit-repo"))
+
+            with mock.patch.object(
+                WorkflowRuntime,
+                "_worktree_root",
+                return_value=(runtime.workspace / ".worktrees").resolve(),
+            ):
+                server = create_server(runtime)
+                tools = {tool.name: tool for tool in await server.list_tools()}
+                run_properties = tools["run_manage"].input_schema["properties"]
+                assert "acknowledge_pending_publication" in run_properties
+                assert run_properties["acknowledge_pending_publication"]["type"] == "boolean"
+                async with Client(
+                    server, raise_exceptions=False, read_timeout_seconds=0.1
+                ) as client:
+                    failed = await client.call_tool(
+                        "run_manage",
+                        {
+                            "action": "start",
+                            "workflow": "gh-audit-repo",
+                            "repository": "example/repo",
+                        },
+                    )
+                    assert failed.is_error
+                    assert "pending publication (candidate C-1, operation create)" in (
+                        failed.content[0].text
+                    )
+                    assert "acknowledge_pending_publication" in failed.content[0].text
+                    assert runtime.state("gh-audit-repo")["run_id"] == first["run_id"]
+                    assert managed_worktree.exists()
+
+                    with mock.patch(
+                        "github_workflows.runtime.workflow_run.append_journal",
+                        wraps=workflow_run.append_journal,
+                    ) as journal:
+                        replaced = await client.call_tool(
+                            "run_manage",
+                            {
+                                "action": "start",
+                                "workflow": "gh-audit-repo",
+                                "repository": "example/repo",
+                                "confirmed_source_sha": first["sha"],
+                                "acknowledge_pending_publication": True,
+                            },
+                        )
+                    assert not replaced.is_error
+                    assert replaced.structured_content["run_id"] != first["run_id"]
+                    journal.assert_any_call(
+                        runtime.current("gh-audit-repo"),
+                        "publication_discarded",
+                        candidate_id="C-1",
+                        operation="create",
+                    )
+                    assert Path(runtime.state("gh-audit-repo")["audit_worktree"]).exists()
+                    assert runtime.state("gh-audit-repo")["history"]["publication_pending"] is False
 
     def test_every_public_request_rejects_unknown_fields(self) -> None:
         cases = [

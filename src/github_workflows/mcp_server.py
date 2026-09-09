@@ -113,7 +113,7 @@ class ValidationIssue:
 def _field_path(location: tuple[Any, ...], arguments: dict[str, Any]) -> str:
     parts = list(location)
     discriminator = arguments.get("action", arguments.get("kind"))
-    if len(parts) > 1 and parts[0] == discriminator:
+    if parts and parts[0] == discriminator:
         parts.pop(0)
     rendered: list[str] = []
     for part in parts:
@@ -222,11 +222,13 @@ def _render_validation_error(error: ValidationError, arguments: dict[str, Any]) 
             if discriminator_value is not None
             else f"not accepted: {fields}"
         )
-    messages.extend(
-        f"{issue.field} {issue.requirement}".strip()
-        for issue in issues
-        if issue.kind not in {"missing", "extra_forbidden"}
-    )
+    for issue in issues:
+        if issue.kind in {"missing", "extra_forbidden"}:
+            continue
+        requirement = issue.requirement
+        if issue.field and requirement.startswith(f"{issue.field} "):
+            requirement = requirement.removeprefix(f"{issue.field} ")
+        messages.append(f"{issue.field} {requirement}".strip())
     return "; ".join(messages) or "request is invalid"
 
 
@@ -755,6 +757,7 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
         separate: bool | None = None,
         pending: JsonArrayArgument[list[str] | None] = None,
         confirmed_source_sha: FullSha | None = None,
+        acknowledge_pending_publication: bool | None = None,
         outcome: Literal["complete", "blocked"] | None = None,
         note: str | None = None,
     ) -> dict[str, Any]:
