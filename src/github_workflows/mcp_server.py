@@ -44,6 +44,7 @@ from .models import (
     ProbeRequest,
     ProgramProbe,
     PublishRequest,
+    RelativeSourceRoot,
     RepositoryName,
     RunManageRequest,
     ShardRecordValue,
@@ -859,8 +860,12 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
         candidate_id: NonBlankString,
         selectors: JsonArrayArgument[list[str] | None] = None,
         code: NonBlankString | None = None,
+        pythonpath: RelativeSourceRoot | None = None,
     ) -> dict[str, Any]:
-        """Run and record one candidate probe, returning bounded output directly."""
+        """Run and record one candidate probe, returning bounded output directly.
+
+        Set pythonpath to the worktree-relative source root the probe must import.
+        """
         return _request_call(runtime.audit_probe, ProbeRequest, **locals())
 
     @mcp.tool(annotations=LOCAL_WRITE, structured_output=True)

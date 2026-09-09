@@ -9,6 +9,7 @@ import json
 import os
 import re
 import resource
+import shutil
 import signal
 import subprocess
 import sys
@@ -71,7 +72,9 @@ def git_output(worktree: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def environment_fingerprint(worktree: Path, python: Path, python_source: str) -> dict[str, object]:
+def environment_fingerprint(
+    worktree: Path, python: Path, python_source: str, pythonpath: Path | None
+) -> dict[str, object]:
     package_script = """
 import importlib.metadata as metadata
 import json
@@ -109,6 +112,7 @@ print(json.dumps({"python": platform.python_version(), "packages": packages}))
     return {
         "python_executable": str(python),
         "python_source": python_source,
+        "pythonpath": str(pythonpath) if pythonpath is not None else None,
         "versions": versions,
         "lockfiles": lockfiles,
     }
@@ -142,7 +146,6 @@ def validate_common(args: argparse.Namespace) -> tuple[Path, Path, Path, Path, s
     artifact_dir = run_dir / "validation" / args.probe_id
     if artifact_dir.exists() and any(artifact_dir.iterdir()):
         raise ValueError("probe id already has artifacts; use a unique id for every attempt")
-    secure_directory(artifact_dir)
     return project_root, worktree, run_dir, python, python_source
 
 
@@ -266,6 +269,7 @@ def run_probe(args: argparse.Namespace) -> int:
             raise ValueError("at least one focused pytest selector is required")
         if not module_available(python, "pytest"):
             artifact_dir = run_dir / "validation" / args.probe_id
+            secure_directory(artifact_dir)
             stdout_path = artifact_dir / "stdout.txt"
             stderr_path = artifact_dir / "stderr.txt"
             stdout_path.write_text("", encoding="utf-8")
@@ -279,7 +283,7 @@ def run_probe(args: argparse.Namespace) -> int:
                 "probe_status": "unavailable",
                 "reason": "pytest is unavailable in the selected interpreter",
                 "repo_sha": git_output(worktree, "rev-parse", "HEAD"),
-                "environment": environment_fingerprint(worktree, python, python_source),
+                "environment": environment_fingerprint(worktree, python, python_source, pythonpath),
                 "returncode": None,
                 "timed_out": False,
                 "worktree_unchanged": True,
@@ -318,12 +322,12 @@ def run_probe(args: argparse.Namespace) -> int:
         }
 
     before = git_output(worktree, "status", "--porcelain=v1", "--untracked-files=all")
-    stdout_path = artifact_dir / "stdout.txt"
-    stderr_path = artifact_dir / "stderr.txt"
     started = time.monotonic()
     timed_out = False
     with tempfile.TemporaryDirectory(prefix="qwen-audit-probe-") as temporary:
         environment = sanitized_environment(Path(temporary), pythonpath)
+        stdout_path = Path(temporary) / "stdout.txt"
+        stderr_path = Path(temporary) / "stderr.txt"
         command = namespace_command(worktree, python.parent.parent, inner_command)
         with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
             process = subprocess.Popen(
@@ -344,58 +348,72 @@ def run_probe(args: argparse.Namespace) -> int:
                 except subprocess.TimeoutExpired:
                     os.killpg(process.pid, signal.SIGKILL)
                     returncode = process.wait()
-    duration = time.monotonic() - started
-    after = git_output(worktree, "status", "--porcelain=v1", "--untracked-files=all")
-    stdout_excerpt, stdout_truncated = read_excerpt(stdout_path)
-    stderr_excerpt, stderr_truncated = read_excerpt(stderr_path)
-    result = {
-        "schema_version": 1,
-        "probe_id": args.probe_id,
-        "probe": probe_identity,
-        "repo_sha": git_output(worktree, "rev-parse", "HEAD"),
-        "environment": environment_fingerprint(worktree, python, python_source),
-        "probe_status": "timed-out"
-        if timed_out
-        else ("succeeded" if returncode == 0 else "failed"),
-        "limits": {
-            "wall_seconds": WALL_SECONDS,
-            "cpu_seconds": CPU_SECONDS,
-            "output_bytes_per_stream": OUTPUT_BYTES,
-            "threads": 1,
-            "network_namespace": True,
-            "read_only_worktree_mount": True,
-        },
-        "returncode": returncode,
-        "timed_out": timed_out,
-        "duration_seconds": round(duration, 6),
-        "worktree_unchanged": before == after,
-        "worktree_status_before": before,
-        "worktree_status_after": after,
-        "stdout_path": str(stdout_path),
-        "stderr_path": str(stderr_path),
-        "stdout_excerpt": stdout_excerpt,
-        "stderr_excerpt": stderr_excerpt,
-        "stdout_truncated": stdout_truncated,
-        "stderr_truncated": stderr_truncated,
-    }
-    result_path = artifact_dir / "result.json"
-    result_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.chmod(stdout_path, 0o600)
-    os.chmod(stderr_path, 0o600)
-    os.chmod(result_path, 0o600)
+        after = git_output(worktree, "status", "--porcelain=v1", "--untracked-files=all")
+        duration = time.monotonic() - started
+        stdout_excerpt, stdout_truncated = read_excerpt(stdout_path)
+        stderr_excerpt, stderr_truncated = read_excerpt(stderr_path)
+        if before != after:
+            probe_status = "worktree-modified"
+        elif timed_out:
+            probe_status = "timed-out"
+        elif returncode == 0:
+            probe_status = "succeeded"
+        else:
+            probe_status = "failed"
+        # Create the artifact directory only once a result is recorded, so a
+        # failed or refused attempt cannot poison the probe id.
+        secure_directory(artifact_dir)
+        stdout_path = shutil.move(stdout_path, artifact_dir / "stdout.txt")
+        stderr_path = shutil.move(stderr_path, artifact_dir / "stderr.txt")
+        result = {
+            "schema_version": 1,
+            "probe_id": args.probe_id,
+            "probe": probe_identity,
+            "repo_sha": git_output(worktree, "rev-parse", "HEAD"),
+            "environment": environment_fingerprint(worktree, python, python_source, pythonpath),
+            "probe_status": probe_status,
+            "limits": {
+                "wall_seconds": WALL_SECONDS,
+                "cpu_seconds": CPU_SECONDS,
+                "output_bytes_per_stream": OUTPUT_BYTES,
+                "threads": 1,
+                "network_namespace": True,
+                "read_only_worktree_mount": True,
+            },
+            "returncode": returncode,
+            "timed_out": timed_out,
+            "duration_seconds": round(duration, 6),
+            "worktree_unchanged": before == after,
+            "worktree_status_before": before,
+            "worktree_status_after": after,
+            "stdout_path": str(stdout_path),
+            "stderr_path": str(stderr_path),
+            "stdout_excerpt": stdout_excerpt,
+            "stderr_excerpt": stderr_excerpt,
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
+        }
+        result_path = artifact_dir / "result.json"
+        result_path.write_text(
+            json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        os.chmod(stdout_path, 0o600)
+        os.chmod(stderr_path, 0o600)
+        os.chmod(result_path, 0o600)
     print(
         json.dumps(
             {
                 "result": str(result_path),
+                "probe_status": probe_status,
                 "returncode": returncode,
                 "timed_out": timed_out,
                 "worktree_unchanged": before == after,
             }
         )
     )
-    if before != after:
-        return 3
-    return 124 if timed_out else returncode
+    # The helper exit code is the probe program's own exit code; the structured
+    # artifact fields carry the timeout and worktree-modification outcomes.
+    return returncode
 
 
 def parser() -> argparse.ArgumentParser:

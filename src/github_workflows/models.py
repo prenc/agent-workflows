@@ -18,8 +18,15 @@ WorkflowName = Literal["gh-audit-repo", "gh-curate-issues", "gh-implement-issue"
 NON_BLANK_PATTERN = r"\S"
 FULL_SHA_PATTERN = r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
 REPOSITORY_PATTERN = r"^[^/\s]+/[^/\s]+$"
+# A worktree-relative path: non-blank components that are not absolute and
+# never the ".." parent component (pydantic patterns cannot use lookaround).
+_SOURCE_ROOT_COMPONENT = r"[^\s/\x00]{3,}|[^\s/\x00.][^\s/\x00]|\.[^\s/\x00.]|[^\s/\x00]"
+RELATIVE_SOURCE_ROOT_PATTERN = rf"^({_SOURCE_ROOT_COMPONENT})(/({_SOURCE_ROOT_COMPONENT}))*$"
 
 type NonBlankString = Annotated[str, Field(pattern=NON_BLANK_PATTERN)]
+type RelativeSourceRoot = Annotated[
+    str, Field(min_length=1, max_length=256, pattern=RELATIVE_SOURCE_ROOT_PATTERN)
+]
 type PositiveInteger = Annotated[int, Field(strict=True, ge=1)]
 type HistoryLimit = Annotated[int, Field(strict=True, ge=1, le=100)]
 type FullSha = Annotated[str, Field(pattern=FULL_SHA_PATTERN)]
@@ -553,6 +560,7 @@ class PytestProbeRequest(StrictRequest):
     probe_id: NonBlankString
     candidate_id: NonBlankString
     selectors: list[str] = Field(min_length=1)
+    pythonpath: RelativeSourceRoot | None = None
 
 
 class PythonProbeRequest(StrictRequest):
@@ -560,6 +568,7 @@ class PythonProbeRequest(StrictRequest):
     probe_id: NonBlankString
     candidate_id: NonBlankString
     code: NonBlankString
+    pythonpath: RelativeSourceRoot | None = None
 
 
 ProbeAction = Annotated[PytestProbeRequest | PythonProbeRequest, Field(discriminator="kind")]

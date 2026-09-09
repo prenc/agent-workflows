@@ -85,9 +85,9 @@ class TestRuntimeSafety:
     def test_probe_timeout_payload_is_available_for_registration(self) -> None:
         def timed_out(_: Any) -> int:
             print(json.dumps({"returncode": -15, "timed_out": True}))
-            return 124
+            return -15
 
-        payload = WorkflowRuntime._invoke(timed_out, allow_timeout=True)
+        payload = WorkflowRuntime._invoke(timed_out)
 
         assert payload["timed_out"] is True
         assert payload["returncode"] == -15
@@ -95,10 +95,10 @@ class TestRuntimeSafety:
     def test_non_timeout_exit_mismatch_remains_an_error(self) -> None:
         def mismatched(_: Any) -> int:
             print(json.dumps({"returncode": -15, "timed_out": False}))
-            return 124
+            return 3
 
         with pytest.raises(RuntimeError):
-            WorkflowRuntime._invoke(mismatched, allow_timeout=True)
+            WorkflowRuntime._invoke(mismatched)
 
     def test_timed_out_probe_is_returned_and_registered(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-probe-timeout-") as directory:
@@ -133,7 +133,7 @@ class TestRuntimeSafety:
                 }
                 (artifact_dir / "result.json").write_text(json.dumps(artifact))
                 print(json.dumps({"returncode": -15, "timed_out": True}))
-                return 124
+                return -15
 
             with mock.patch(
                 "github_workflows.runtime.audit_probe.run_probe", side_effect=timed_out
@@ -202,12 +202,233 @@ class TestRuntimeSafety:
             ({"returncode": 0, "timed_out": False}, "succeeded"),
             ({"returncode": 7, "timed_out": False}, "failed"),
             ({"returncode": -15, "timed_out": True}, "timed-out"),
+            ({"probe_status": "worktree-modified"}, "worktree-modified"),
         ],
     )
     def test_probe_validation_status_reflects_execution(
         self, result: dict[str, object], expected: str
     ) -> None:
         assert WorkflowRuntime._probe_validation_status(result) == expected
+
+    def test_probe_request_exposes_worktree_relative_source_root(self) -> None:
+        request = ProbeRequest(
+            kind="python",
+            probe_id="probe-src",
+            candidate_id="candidate-src",
+            code="pass",
+            pythonpath="src",
+        )
+        assert request.pythonpath == "src"
+        plain = ProbeRequest(
+            kind="python",
+            probe_id="probe-src",
+            candidate_id="candidate-src",
+            code="pass",
+        )
+        assert plain.pythonpath is None
+        for invalid in ("/src", "../src", "src/..", "src package"):
+            with pytest.raises(ValidationError):
+                ProbeRequest(
+                    kind="python",
+                    probe_id="probe-src",
+                    candidate_id="candidate-src",
+                    code="pass",
+                    pythonpath=invalid,
+                )
+
+    def test_audit_probe_passes_the_requested_source_root(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-probe-source-root-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.audit_record(
+                AuditRecordRequest(
+                    action="candidate",
+                    candidate={"id": "candidate-src", "status": "discovered"},
+                )
+            )
+            seen: dict[str, Any] = {}
+
+            def captured(args: Any) -> int:
+                seen.update(vars(args))
+                artifact_dir = args.run_dir / "validation" / args.probe_id
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                artifact = {
+                    "probe_id": args.probe_id,
+                    "probe_status": "succeeded",
+                    "returncode": 0,
+                    "timed_out": False,
+                    "worktree_unchanged": True,
+                    "environment": {
+                        "python_executable": "python",
+                        "python_source": "system",
+                        "pythonpath": args.pythonpath,
+                    },
+                    "stdout_excerpt": "",
+                    "stderr_excerpt": "",
+                }
+                (artifact_dir / "result.json").write_text(json.dumps(artifact))
+                print(json.dumps({"returncode": 0}))
+                return 0
+
+            with mock.patch("github_workflows.runtime.audit_probe.run_probe", side_effect=captured):
+                result = runtime.audit_probe(
+                    ProbeRequest(
+                        kind="python",
+                        probe_id="probe-src",
+                        candidate_id="candidate-src",
+                        code="pass",
+                        pythonpath="src",
+                    )
+                )
+
+            assert result["status"] == "succeeded"
+            assert seen["pythonpath"] == "src"
+            validation = runtime.state("gh-audit-repo")["validations"]["probe-src"]
+            assert validation["status"] == "succeeded"
+
+    def test_terminal_candidate_probe_is_refused_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-probe-terminal-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.audit_record(
+                AuditRecordRequest(
+                    action="candidate",
+                    candidate={"id": "candidate-terminal", "status": "discovered"},
+                )
+            )
+            runtime.audit_record(
+                AuditRecordRequest(
+                    action="candidate",
+                    candidate={"id": "candidate-terminal", "status": "rejected"},
+                )
+            )
+
+            with mock.patch("github_workflows.runtime.audit_probe.run_probe") as probe:
+                with pytest.raises(ValueError, match="terminal status"):
+                    runtime.audit_probe(
+                        ProbeRequest(
+                            kind="python",
+                            probe_id="probe-terminal",
+                            candidate_id="candidate-terminal",
+                            code="pass",
+                        )
+                    )
+                probe.assert_not_called()
+
+            state = runtime.state("gh-audit-repo")
+            assert state["candidates"]["candidate-terminal"]["status"] == "rejected"
+            assert state["validations"] == {}
+            assert not (runtime.current("gh-audit-repo") / "validation" / "probe-terminal").exists()
+
+    def test_failed_probe_transaction_keeps_disk_and_state_in_agreement(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-probe-worktree-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.audit_record(
+                AuditRecordRequest(
+                    action="candidate",
+                    candidate={"id": "candidate-worktree", "status": "discovered"},
+                )
+            )
+
+            def modified_worktree(args: Any) -> int:
+                artifact_dir = args.run_dir / "validation" / args.probe_id
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                artifact = {
+                    "probe_id": args.probe_id,
+                    "probe_status": "worktree-modified",
+                    "returncode": 0,
+                    "timed_out": False,
+                    "worktree_unchanged": False,
+                    "stdout_excerpt": "",
+                    "stderr_excerpt": "",
+                }
+                (artifact_dir / "result.json").write_text(json.dumps(artifact))
+                print(json.dumps({"returncode": 0, "worktree_unchanged": False}))
+                return 0
+
+            with mock.patch(
+                "github_workflows.runtime.audit_probe.run_probe",
+                side_effect=modified_worktree,
+            ):
+                with pytest.raises(ValueError, match="modified the audit worktree"):
+                    runtime.audit_probe(
+                        ProbeRequest(
+                            kind="python",
+                            probe_id="probe-worktree",
+                            candidate_id="candidate-worktree",
+                            code="pass",
+                        )
+                    )
+
+            state = runtime.state("gh-audit-repo")
+            validation = state["validations"]["probe-worktree"]
+            assert validation["status"] == "worktree-modified"
+            assert validation["worktree_unchanged"] is False
+            artifact_path = (
+                runtime.current("gh-audit-repo") / "validation" / "probe-worktree" / "result.json"
+            )
+            assert artifact_path.is_file()
+            blockers = workflow_run.audit_finish_blockers(runtime.current("gh-audit-repo"), state)
+            assert not any(
+                blocker["kind"] == "validation-registration-mismatch" for blocker in blockers
+            )
+
+    def test_rejected_candidate_upsert_removes_the_orphaned_artifact(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-probe-orphan-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.audit_record(
+                AuditRecordRequest(
+                    action="candidate",
+                    candidate={"id": "candidate-race", "status": "discovered"},
+                )
+            )
+
+            def successful_probe(args: Any) -> int:
+                artifact_dir = args.run_dir / "validation" / args.probe_id
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                artifact = {
+                    "probe_id": args.probe_id,
+                    "probe_status": "succeeded",
+                    "returncode": 0,
+                    "timed_out": False,
+                    "worktree_unchanged": True,
+                    "stdout_excerpt": "",
+                    "stderr_excerpt": "",
+                }
+                (artifact_dir / "result.json").write_text(json.dumps(artifact))
+                print(json.dumps({"returncode": 0}))
+                return 0
+
+            with (
+                mock.patch(
+                    "github_workflows.runtime.audit_probe.run_probe",
+                    side_effect=successful_probe,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_event",
+                    side_effect=ValueError("terminal candidate cannot be reopened or redisposed"),
+                ),
+            ):
+                with pytest.raises(ValueError, match="terminal candidate"):
+                    runtime.audit_probe(
+                        ProbeRequest(
+                            kind="python",
+                            probe_id="probe-race",
+                            candidate_id="candidate-race",
+                            code="pass",
+                        )
+                    )
+
+            state = runtime.state("gh-audit-repo")
+            assert state["validations"] == {}
+            assert not (runtime.current("gh-audit-repo") / "validation" / "probe-race").exists()
+            blockers = workflow_run.audit_finish_blockers(runtime.current("gh-audit-repo"), state)
+            assert not any(
+                blocker["kind"] == "validation-registration-mismatch" for blocker in blockers
+            )
 
     def test_audit_task_context_rejects_worktree_head_drift(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-head-drift-") as directory:

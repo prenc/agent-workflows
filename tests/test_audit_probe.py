@@ -46,7 +46,9 @@ class TestAuditProbe:
     def teardown_method(self) -> None:
         self.temporary.cleanup()
 
-    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+    def invoke(
+        self, *arguments: str, probe_id: str = "probe-1"
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
                 str(HELPER),
@@ -60,7 +62,7 @@ class TestAuditProbe:
                 "--project-dir",
                 str(self.project_dir),
                 "--probe-id",
-                "probe-1",
+                probe_id,
                 *arguments,
             ],
             check=False,
@@ -138,6 +140,42 @@ print("isolated")
         result = self.invoke("--code", "x" * (8 * 1024 + 1))
         assert result.returncode == 2
         assert "inline Python" in result.stderr
+        # A refused attempt must not pre-create artifacts that poison the id.
+        assert not (self.run_dir / "validation" / "probe-1").exists()
+        retry = self.invoke("--code", "print('retry')")
+        assert retry.returncode == 0, retry.stdout + retry.stderr
+
+    def test_pythonpath_root_is_importable_and_fingerprinted(self) -> None:
+        source_root = self.project / "source"
+        source_root.mkdir()
+        (source_root / "fixture_root.py").write_text(
+            "print('from worktree source root')\n", encoding="utf-8"
+        )
+        result = self.invoke("--pythonpath", "source", "--code", "import fixture_root")
+        assert result.returncode == 0, result.stdout + result.stderr
+        summary = json.loads(result.stdout)
+        assert summary["probe_status"] == "succeeded"
+        artifact = json.loads(Path(summary["result"]).read_text())
+        assert artifact["environment"]["pythonpath"] == str(source_root.resolve())
+        assert "from worktree source root" in artifact["stdout_excerpt"]
+
+        bare = self.invoke("--code", "print('ok')", probe_id="probe-nop")
+        assert bare.returncode == 0, bare.stdout + bare.stderr
+        bare_artifact = json.loads(Path(json.loads(bare.stdout)["result"]).read_text())
+        assert bare_artifact["environment"]["pythonpath"] is None
+
+    @pytest.mark.parametrize("program_exit", [3, 124])
+    def test_exit_code_is_the_programs_own_code(self, program_exit: int) -> None:
+        probe_id = f"probe-exit-{program_exit}"
+        result = self.invoke("--code", f"import sys; sys.exit({program_exit})", probe_id=probe_id)
+        assert result.returncode == program_exit, result.stdout + result.stderr
+        summary = json.loads(result.stdout)
+        assert summary["probe_status"] == "failed"
+        artifact = json.loads(Path(summary["result"]).read_text())
+        assert artifact["probe_status"] == "failed"
+        assert artifact["returncode"] == program_exit
+        assert artifact["worktree_unchanged"] is True
+        assert artifact["timed_out"] is False
 
     def test_python_probe_uses_project_venv_site_packages(self) -> None:
         venv.EnvBuilder(with_pip=False).create(self.project / ".venv")
