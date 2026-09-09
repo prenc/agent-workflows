@@ -1396,6 +1396,24 @@ class TestRuntimeSafety:
                 records=[{"kind": "issue", "number": number} for number in range(101)],
             )
 
+    def test_history_record_numbers_require_positive_integers(self) -> None:
+        ingested = HistoryManageRequest(
+            action="ingest",
+            records=[{"kind": "issue", "number": 1}],
+        )
+        assert ingested.root.records[0].number == 1
+        for number in (0, -3, True, "5", None):
+            with pytest.raises(ValidationError):
+                HistoryManageRequest(
+                    action="ingest",
+                    records=[{"kind": "issue", "number": number}],
+                )
+        queried = HistoryQueryRequest(linked=[{"kind": "pull", "number": 9}])
+        assert queried.linked[0].number == 9
+        for number in (0, -3, True, "5"):
+            with pytest.raises(ValidationError):
+                HistoryQueryRequest(linked=[{"kind": "pull", "number": number}])
+
     def test_history_commit_missing_staging_fails_typed_without_creating_file(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-history-commit-") as directory:
             runtime = self.make_runtime(Path(directory))

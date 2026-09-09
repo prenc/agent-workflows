@@ -14,7 +14,7 @@ import pytest
 from pydantic import ValidationError
 
 import github_workflows.github_cache as github_cache_module
-from github_workflows.github_cache import RECORDS_INPUT_BYTES
+from github_workflows.github_cache import RECORDS_INPUT_BYTES, RECORDS_SCHEMA_VERSION
 from github_workflows.models import HistoryQueryRequest
 
 SCRIPT = Path(__file__).parents[1] / "src/github_workflows/github_cache.py"
@@ -121,11 +121,11 @@ class TestGithubCache:
             "body-only-secret-term",
         )
         assert body_only["records"] == []
+        assert "pruned" not in committed
         with sqlite3.connect(expected) as connection:
-            stored = connection.execute(
-                "SELECT body, comments_json, hydration FROM records WHERE number=1"
-            ).fetchone()
-        assert stored == ("", "[]", "summary")
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(records)")}
+        for column in ("body", "comments_json", "relationships_json", "commits_json", "hydration"):
+            assert column not in columns
 
     def test_generation_conflict_preserves_live_database(self) -> None:
         left = self.parsed("prepare-records", *self.common(), "--run-id", "left")
@@ -154,48 +154,218 @@ class TestGithubCache:
         assert failed.returncode == 2
         assert "generation conflict" in failed.stderr
 
-    def test_reused_database_compacts_unrefreshed_legacy_records(self) -> None:
-        first = self.parsed("prepare-records", *self.common(), "--run-id", "first")
-        self.parsed(
+    def commit_args(self, work_db: str, run_id: str, base_generation: int | str) -> list[str]:
+        return [
             "commit-records",
             *self.common(),
             "--run-id",
-            "first",
+            run_id,
             "--db",
-            first["work_db"],
+            work_db,
             "--base-generation",
-            "0",
+            str(base_generation),
             "--synced-at",
             "2026-08-30T00:00:00Z",
             "--default-sha",
             "abc",
-        )
+        ]
+
+    def seed_legacy_live(self, records: list[dict[str, Any]], generation: int = 3) -> Path:
+        """Seed a pre-migration (schema v1) committed records cache with detail payloads."""
         live = self.live_db()
+        live.parent.mkdir(parents=True)
         with sqlite3.connect(live) as connection:
-            connection.execute(
-                """INSERT INTO records (
-                    kind, number, state, title, body, comments_json, labels_json,
-                    assignees_json, relationships_json, commits_json, content_sha256,
-                    hydration, source, fetched_at
-                ) VALUES ('issue', 9, 'closed', 'Legacy', 'secret', '[{\"body\":\"secret\"}]',
-                    '[\"old\"]', '[]', '{\"pull\":1}', '[{\"sha\":\"abc\"}]', 'old',
-                    'detail', 'legacy', '2024-01-01T00:00:00Z')"""
+            connection.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            connection.executemany(
+                "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                [
+                    ("schema_version", "1"),
+                    ("database_kind", "records"),
+                    ("repository", REPO),
+                    ("generation", str(generation)),
+                    ("last_sync_at", ""),
+                    ("default_sha", ""),
+                    ("full_history_complete", "true"),
+                ],
             )
             connection.execute(
-                "INSERT INTO records_fts(kind, number, title, body, labels) "
-                "VALUES ('issue', 9, 'Legacy', 'secret', '[\"old\"]')"
+                """
+                CREATE TABLE records (
+                    kind TEXT NOT NULL CHECK(kind IN ('issue', 'pull')),
+                    number INTEGER NOT NULL,
+                    state TEXT NOT NULL,
+                    state_reason TEXT,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    comments_json TEXT NOT NULL,
+                    labels_json TEXT NOT NULL,
+                    assignees_json TEXT NOT NULL,
+                    relationships_json TEXT NOT NULL,
+                    commits_json TEXT NOT NULL,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    closed_at TEXT,
+                    merged_at TEXT,
+                    url TEXT,
+                    base_ref TEXT,
+                    head_ref TEXT,
+                    head_sha TEXT,
+                    content_sha256 TEXT NOT NULL,
+                    hydration TEXT NOT NULL CHECK(hydration IN ('summary', 'detail')),
+                    source TEXT NOT NULL,
+                    fetched_at TEXT NOT NULL,
+                    PRIMARY KEY(kind, number)
+                )
+                """
             )
+            connection.execute(
+                """
+                CREATE VIRTUAL TABLE records_fts USING fts5(
+                    kind UNINDEXED,
+                    number UNINDEXED,
+                    title,
+                    body,
+                    labels
+                )
+                """
+            )
+            for record in records:
+                connection.execute(
+                    """INSERT INTO records (
+                        kind, number, state, title, body, comments_json, labels_json,
+                        assignees_json, relationships_json, commits_json, content_sha256,
+                        hydration, source, fetched_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        record["kind"],
+                        record["number"],
+                        record["state"],
+                        record["title"],
+                        record.get("body", ""),
+                        record.get("comments_json", "[]"),
+                        record.get("labels_json", "[]"),
+                        record.get("assignees_json", "[]"),
+                        record.get("relationships_json", "{}"),
+                        record.get("commits_json", "[]"),
+                        record.get("content_sha256", "legacy"),
+                        record.get("hydration", "summary"),
+                        record.get("source", "legacy"),
+                        record.get("fetched_at", "2024-01-01T00:00:00Z"),
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO records_fts(kind, number, title, body, labels) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        record["kind"],
+                        record["number"],
+                        record["title"],
+                        record.get("body", ""),
+                        record.get("labels_json", "[]"),
+                    ),
+                )
+        return live
+
+    def test_prepare_reuses_current_schema_cache_without_full_table_rewrite(self) -> None:
+        first = self.parsed("prepare-records", *self.common(), "--run-id", "first")
+        self.parsed(*self.ingest_args(first["work_db"]))
+        self.parsed(*self.commit_args(first["work_db"], "first", "0"))
+        live = self.live_db()
         reused = self.parsed("prepare-records", *self.common(), "--run-id", "second")
-        with sqlite3.connect(reused["work_db"]) as connection:
-            stored = connection.execute(
-                "SELECT body, comments_json, relationships_json, commits_json, hydration "
-                "FROM records WHERE number=9"
+        assert reused["mode"] == "reuse"
+        assert reused["base_generation"] == 1
+        work = Path(reused["work_db"])
+        # No per-prepare legacy rewrite remains: the work copy is an untouched
+        # copy of the committed cache.
+        assert work.read_bytes() == live.read_bytes()
+        queried = self.parsed(
+            "query-records", *self.common(), "--db", str(work), "--terms", "Scoped"
+        )
+        assert [item["number"] for item in queried["records"]] == [1]
+
+    def test_legacy_cache_migrates_exactly_once(self) -> None:
+        live = self.seed_legacy_live(
+            [
+                {
+                    "kind": "issue",
+                    "number": 7,
+                    "state": "closed",
+                    "title": "Legacy parser",
+                    "body": "secret detail payload",
+                    "comments_json": '[{"body": "secret"}]',
+                    "labels_json": '["old"]',
+                    "relationships_json": '{"pull": 1}',
+                    "commits_json": '[{"sha": "abc"}]',
+                    "hydration": "detail",
+                },
+                {
+                    "kind": "issue",
+                    "number": 8,
+                    "state": "open",
+                    "title": "Legacy search",
+                    "labels_json": '["bug"]',
+                },
+            ],
+            generation=3,
+        )
+        prepared = self.parsed("prepare-records", *self.common(), "--run-id", "first")
+        assert prepared["mode"] == "reuse"
+        assert prepared["base_generation"] == 3
+        work = Path(prepared["work_db"])
+        with sqlite3.connect(work) as connection:
+            meta = {row[0]: row[1] for row in connection.execute("SELECT key, value FROM metadata")}
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(records)")}
+            fts_columns = {row[1] for row in connection.execute("PRAGMA table_info(records_fts)")}
+            row = connection.execute(
+                "SELECT title, labels_json, source FROM records WHERE number=7"
             ).fetchone()
-            body_matches = connection.execute(
-                "SELECT count(*) FROM records_fts WHERE records_fts MATCH 'body : secret'"
-            ).fetchone()[0]
-        assert stored == ("", "[]", "{}", "[]", "summary")
-        assert body_matches == 0
+        for column in ("body", "comments_json", "relationships_json", "commits_json", "hydration"):
+            assert column not in columns
+            assert column not in fts_columns
+        assert meta["schema_version"] == str(RECORDS_SCHEMA_VERSION)
+        assert meta["generation"] == "3"
+        assert row == ("Legacy parser", '["old"]', "legacy")
+        stripped = self.parsed(
+            "query-records", *self.common(), "--db", str(work), "--terms", "secret"
+        )
+        assert stripped["records"] == []
+        self.parsed(*self.commit_args(str(work), "first", prepared["base_generation"]))
+        with sqlite3.connect(live) as connection:
+            meta = {row[0]: row[1] for row in connection.execute("SELECT key, value FROM metadata")}
+        assert meta["schema_version"] == str(RECORDS_SCHEMA_VERSION)
+        assert meta["generation"] == "4"
+        # Query output contract unchanged: logical record fields survive migration.
+        queried = self.parsed(
+            "query-records", *self.common(), "--db", str(live), "--terms", "Legacy"
+        )
+        by_number = {record["number"]: record for record in queried["records"]}
+        assert set(by_number) == {7, 8}
+        assert by_number[7]["title"] == "Legacy parser"
+        assert by_number[7]["labels"] == ["old"]
+        assert by_number[7]["state"] == "closed"
+        assert by_number[8]["title"] == "Legacy search"
+        assert by_number[8]["labels"] == ["bug"]
+        assert by_number[8]["state"] == "open"
+        # The next prepare sees the current schema marker and performs no rewrite.
+        reused = self.parsed("prepare-records", *self.common(), "--run-id", "second")
+        assert reused["mode"] == "reuse"
+        assert reused["base_generation"] == 4
+        assert Path(reused["work_db"]).read_bytes() == live.read_bytes()
+
+    def test_legacy_migration_failure_recovers_cache_instead_of_committing_partial(self) -> None:
+        live = self.seed_legacy_live(
+            [{"kind": "issue", "number": 0, "state": "open", "title": "Bad number"}],
+            generation=2,
+        )
+        prepared = self.parsed("prepare-records", *self.common(), "--run-id", "first")
+        assert prepared["mode"] == "recovery"
+        assert prepared["base_generation"] == 0
+        assert not live.exists()
+        assert len(list(self.project_dir.glob("github/**/*.invalid-*"))) == 1
+        queried = self.parsed(
+            "query-records", *self.common(), "--db", prepared["work_db"], "--terms", "Bad"
+        )
+        assert queried["records"] == []
 
     def failed_call(self, *args: str) -> subprocess.CompletedProcess[str]:
         return self.call(*args, check=False)
@@ -255,10 +425,36 @@ class TestGithubCache:
         rebuilt = self.parsed("prepare-records", *self.common(), "--run-id", "first", "--rebuild")
 
         assert rebuilt["mode"] == "rebuild"
+        assert rebuilt["base_generation"] == 0
         queried = self.parsed(
             "query-records", *self.common(), "--db", rebuilt["work_db"], "--terms", "Scoped"
         )
         assert queried["records"] == []
+
+    def test_rebuild_commits_against_precommitted_live_cache(self) -> None:
+        first = self.parsed("prepare-records", *self.common(), "--run-id", "first")
+        self.parsed(*self.ingest_args(first["work_db"]))
+        committed = self.parsed(*self.commit_args(first["work_db"], "first", "0"))
+        assert committed["generation"] == 1
+        rebuilt = self.parsed("prepare-records", *self.common(), "--run-id", "second", "--rebuild")
+        assert rebuilt["mode"] == "rebuild"
+        assert rebuilt["base_generation"] == 1
+        self.parsed(
+            *self.ingest_args(
+                rebuilt["work_db"],
+                "second",
+                records=[{"number": 2, "state": "open", "title": "Rebuilt"}],
+            )
+        )
+        committed = self.parsed(*self.commit_args(rebuilt["work_db"], "second", "1"))
+        assert committed["generation"] == 2
+        live = self.live_db()
+        queried = self.parsed(
+            "query-records", *self.common(), "--db", str(live), "--terms", "Rebuilt"
+        )
+        assert [record["number"] for record in queried["records"]] == [2]
+        stale = self.parsed("query-records", *self.common(), "--db", str(live), "--terms", "Scoped")
+        assert stale["records"] == []
 
     def test_invalid_staging_requires_abort_and_abort_does_not_follow_symlink(self) -> None:
         prepared = self.parsed("prepare-records", *self.common(), "--run-id", "first")
@@ -371,6 +567,35 @@ class TestGithubCache:
         assert payload.stat().st_size == RECORDS_INPUT_BYTES
         result = self.parsed(*self.ingest_args(prepared["work_db"], records=[record]))
         assert result["ingested"] == 1
+
+    def test_ingest_rejects_non_positive_and_boolean_numbers(self) -> None:
+        prepared = self.parsed("prepare-records", *self.common(), "--run-id", "first")
+        work_db = prepared["work_db"]
+        payload = Path(self.temp.name) / "bad-records.json"
+        # normalize_record is the guard shared by the artifact-feed path, which
+        # skips the request-model boundary; JSON booleans arrive as int subclasses.
+        for number in (0, -3, True):
+            payload.write_text(
+                json.dumps({"records": [{"number": number, "state": "open", "title": "Bad"}]})
+            )
+            failed = self.failed_call(
+                "ingest-records",
+                *self.common(),
+                "--run-id",
+                "first",
+                "--db",
+                work_db,
+                "--kind",
+                "issue",
+                "--input",
+                str(payload),
+                "--source",
+                "test",
+            )
+            assert failed.returncode == 2
+            assert "positive integer" in failed.stderr
+        queried = self.parsed("query-records", *self.common(), "--db", work_db, "--terms", "Bad")
+        assert queried["records"] == []
 
     def test_project_directory_is_required(self) -> None:
         failed = self.call("status", "--repo", REPO, check=False)

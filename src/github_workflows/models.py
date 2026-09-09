@@ -344,7 +344,7 @@ class HistoryRecord(ExtensibleRecord):
     """Compact issue or pull-request metadata returned by the GitHub MCP server."""
 
     kind: Literal["issue", "pull"]
-    number: int
+    number: PositiveInteger
     state: str = "unknown"
     title: str = ""
     labels: list[Any] = Field(default_factory=list)
@@ -421,7 +421,7 @@ class HistoryManageRequest(ActionRequest, RootModel[HistoryAction]):
 
 class LinkedRecord(StrictRequest):
     kind: Literal["issue", "pull"]
-    number: int
+    number: PositiveInteger
 
 
 class HistoryQueryRequest(StrictRequest):

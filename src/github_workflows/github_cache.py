@@ -82,7 +82,7 @@ except ImportError as error:  # pragma: no cover - depends on the host Python bu
     ) from error
 
 
-RECORDS_SCHEMA_VERSION = 1
+RECORDS_SCHEMA_VERSION = 2
 RECORDS_DB = "records-v1.sqlite3"
 RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 TOKEN_RE = re.compile(r"[A-Za-z0-9_]{2,}")
@@ -187,45 +187,48 @@ def initialize_common(
     )
 
 
+RECORDS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS records (
+    kind TEXT NOT NULL CHECK(kind IN ('issue', 'pull')),
+    number INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    state_reason TEXT,
+    title TEXT NOT NULL,
+    labels_json TEXT NOT NULL,
+    assignees_json TEXT NOT NULL,
+    created_at TEXT,
+    updated_at TEXT,
+    closed_at TEXT,
+    merged_at TEXT,
+    url TEXT,
+    base_ref TEXT,
+    head_ref TEXT,
+    head_sha TEXT,
+    content_sha256 TEXT NOT NULL,
+    source TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    PRIMARY KEY(kind, number)
+)
+"""
+
+RECORDS_FTS_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(
+    kind UNINDEXED,
+    number UNINDEXED,
+    title,
+    labels
+)
+"""
+
+
+def create_records_tables(connection: sqlite3.Connection) -> None:
+    connection.execute(RECORDS_TABLE_SQL)
+    connection.execute(RECORDS_FTS_SQL)
+
+
 def initialize_records(connection: sqlite3.Connection, repo: str) -> None:
     initialize_common(connection, repo, "records", RECORDS_SCHEMA_VERSION)
-    connection.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS records (
-            kind TEXT NOT NULL CHECK(kind IN ('issue', 'pull')),
-            number INTEGER NOT NULL,
-            state TEXT NOT NULL,
-            state_reason TEXT,
-            title TEXT NOT NULL,
-            body TEXT NOT NULL,
-            comments_json TEXT NOT NULL,
-            labels_json TEXT NOT NULL,
-            assignees_json TEXT NOT NULL,
-            relationships_json TEXT NOT NULL,
-            commits_json TEXT NOT NULL,
-            created_at TEXT,
-            updated_at TEXT,
-            closed_at TEXT,
-            merged_at TEXT,
-            url TEXT,
-            base_ref TEXT,
-            head_ref TEXT,
-            head_sha TEXT,
-            content_sha256 TEXT NOT NULL,
-            hydration TEXT NOT NULL CHECK(hydration IN ('summary', 'detail')),
-            source TEXT NOT NULL,
-            fetched_at TEXT NOT NULL,
-            PRIMARY KEY(kind, number)
-        );
-        CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(
-            kind UNINDEXED,
-            number UNINDEXED,
-            title,
-            body,
-            labels
-        );
-        """
-    )
+    create_records_tables(connection)
     connection.execute(
         "INSERT OR IGNORE INTO metadata(key, value) VALUES ('full_history_complete', 'false')"
     )
@@ -244,6 +247,25 @@ def validate(connection: sqlite3.Connection, repo: str, kind: str) -> dict[str, 
         raise ValueError("cache database kind does not match")
     count = connection.execute("SELECT COUNT(*) FROM records").fetchone()[0]
     return {"metadata": meta, "count": count}
+
+
+def committed_generation(path: Path, repo: str, kind: str) -> int:
+    """Read a committed cache's generation for the generation-conflict check.
+
+    A committing transaction replaces this database wholesale once the work
+    database has been fully validated, so the committed cache only needs a
+    safe integrity, identity, and generation read rather than a full check;
+    this also keeps legacy caches migratable or replaceable through a commit.
+    """
+    with connect(path) as connection:
+        if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise ValueError("SQLite integrity check failed")
+        meta = metadata(connection)
+        if meta.get("repository") != normalized_repo(repo):
+            raise ValueError("cache repository identity does not match")
+        if meta.get("database_kind") != "records":
+            raise ValueError("cache database kind does not match")
+        return int(meta.get("generation", "0"))
 
 
 def database_state(path: Path, repo: str, kind: str) -> dict[str, Any]:
@@ -312,6 +334,15 @@ def is_no_cache_database(path: Path) -> bool:
     )
 
 
+def move_invalid_live_to_backup(directory: Path, live: Path) -> None:
+    suffix = utc_now().strftime("%Y%m%dT%H%M%SZ")
+    backup = directory / f"{live.name}.invalid-{suffix}"
+    if backup.exists():
+        raise RuntimeError(f"cache recovery backup already exists: {backup}")
+    os.replace(live, backup)
+    secure_file(backup)
+
+
 def prepare_database(args: argparse.Namespace, kind: str) -> None:
     run_id = validated_run_id(args.run_id)
     directory = repo_dir(args.cache_root, args.repo)
@@ -360,11 +391,21 @@ def prepare_database(args: argparse.Namespace, kind: str) -> None:
     base_generation = 0
     mode = "recovered-empty" if recovered_empty else "new"
     reuse_live = live.exists() and not args.rebuild
+    if args.rebuild and live.exists():
+        # A rebuild replaces the committed cache; anchor the commit's
+        # generation-conflict check to the cache being replaced.
+        base_generation = committed_generation(live, args.repo, kind)
     if reuse_live:
         stored_repo = None
+        stored_generation = 0
+        legacy = False
         try:
             with connect(live) as current:
-                stored_repo = metadata(current).get("repository")
+                live_meta = metadata(current)
+                stored_repo = live_meta.get("repository")
+                stored_generation = int(live_meta.get("generation", "0"))
+                stored_version = int(live_meta.get("schema_version", "-1"))
+                legacy = 0 < stored_version < RECORDS_SCHEMA_VERSION
         except (ValueError, sqlite3.DatabaseError):
             stored_repo = None
         if stored_repo is not None and stored_repo != normalized_repo(args.repo):
@@ -372,24 +413,33 @@ def prepare_database(args: argparse.Namespace, kind: str) -> None:
                 f"cache repository identity mismatch: the committed cache belongs to "
                 f"{stored_repo}, not {normalized_repo(args.repo)}; refusing to move it aside"
             )
-        try:
-            with connect(live) as current:
-                previous = validate(current, args.repo, kind)
-                base_generation = int(previous["metadata"]["generation"])
-        except (ValueError, sqlite3.DatabaseError):
-            suffix = utc_now().strftime("%Y%m%dT%H%M%SZ")
-            backup = directory / f"{live.name}.invalid-{suffix}"
-            if backup.exists():
-                raise RuntimeError(f"cache recovery backup already exists: {backup}")
-            os.replace(live, backup)
-            secure_file(backup)
-            reuse_live = False
-            mode = "recovered-empty" if recovered_empty else "recovery"
-        else:
+        if legacy:
+            # One-time legacy migration: upgrade the copied committed cache so
+            # current-schema prepares stop re-writing the full table.
             shutil.copy2(live, work)
-            with connect(work) as connection, connection:
-                compact_existing_records(connection)
-            mode = "recovered-empty" if recovered_empty else "reuse"
+            try:
+                with connect(work) as connection, connection:
+                    migrate_legacy_records(connection)
+            except (ValueError, KeyError, sqlite3.DatabaseError):
+                work.unlink(missing_ok=True)
+                reuse_live = False
+                move_invalid_live_to_backup(directory, live)
+                mode = "recovered-empty" if recovered_empty else "recovery"
+            else:
+                base_generation = stored_generation
+                mode = "recovered-empty" if recovered_empty else "reuse"
+        else:
+            try:
+                with connect(live) as current:
+                    previous = validate(current, args.repo, kind)
+                    base_generation = int(previous["metadata"]["generation"])
+            except (ValueError, sqlite3.DatabaseError):
+                reuse_live = False
+                move_invalid_live_to_backup(directory, live)
+                mode = "recovered-empty" if recovered_empty else "recovery"
+            else:
+                shutil.copy2(live, work)
+                mode = "recovered-empty" if recovered_empty else "reuse"
     if not reuse_live:
         with connect(work) as connection:
             initialize_records(connection, args.repo)
@@ -431,8 +481,8 @@ def normalize_record(
     record: dict[str, Any], kind: str, source: str, fetched_at: str
 ) -> dict[str, Any]:
     number = first(record, "number", "issue_number", "pull_number")
-    if not isinstance(number, int):
-        raise ValueError("record number must be an integer")
+    if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+        raise ValueError("record number must be a positive integer")
     labels = names(first(record, "labels") or [])
     assignees = names(first(record, "assignees") or [])
     base = first(record, "base_ref", "base")
@@ -472,12 +522,8 @@ def normalize_record(
         "state": state,
         "state_reason": first(record, "state_reason", "stateReason"),
         "title": title,
-        "body": "",
-        "comments_json": "[]",
         "labels_json": json.dumps(labels, sort_keys=True),
         "assignees_json": json.dumps(assignees, sort_keys=True),
-        "relationships_json": "{}",
-        "commits_json": "[]",
         "created_at": created_at,
         "updated_at": updated_at,
         "closed_at": closed_at,
@@ -487,7 +533,6 @@ def normalize_record(
         "head_ref": head,
         "head_sha": head_sha,
         "content_sha256": hashlib.sha256(canonical.encode()).hexdigest(),
-        "hydration": "summary",
         "source": source,
         "fetched_at": fetched_at,
     }
@@ -522,25 +567,35 @@ def upsert_record(connection: sqlite3.Connection, item: dict[str, Any]) -> None:
         "DELETE FROM records_fts WHERE kind=? AND number=?", (item["kind"], item["number"])
     )
     connection.execute(
-        "INSERT INTO records_fts(kind, number, title, body, labels) VALUES (?, ?, ?, ?, ?)",
-        (item["kind"], item["number"], item["title"], item["body"], item["labels_json"]),
+        "INSERT INTO records_fts(kind, number, title, labels) VALUES (?, ?, ?, ?)",
+        (item["kind"], item["number"], item["title"], item["labels_json"]),
     )
 
 
-def compact_existing_records(connection: sqlite3.Connection) -> None:
-    """Remove detail payloads from every record copied from a legacy live cache."""
-    records = list(connection.execute("SELECT * FROM records"))
-    for row in records:
-        raw = dict(row)
-        raw["labels"] = json.loads(raw.pop("labels_json") or "[]")
-        raw["assignees"] = json.loads(raw.pop("assignees_json") or "[]")
+def migrate_legacy_records(connection: sqlite3.Connection) -> None:
+    """One-time upgrade of a legacy detail-hydration records cache to the current schema.
+
+    Re-normalizes every row so the removed detail columns and payloads do not
+    survive, then stamps the schema marker so later prepares never re-migrate.
+    """
+    legacy = [dict(row) for row in connection.execute("SELECT * FROM records")]
+    connection.execute("DROP TABLE records")
+    connection.execute("DROP TABLE records_fts")
+    create_records_tables(connection)
+    for row in legacy:
+        row["labels"] = json.loads(row.pop("labels_json") or "[]")
+        row["assignees"] = json.loads(row.pop("assignees_json") or "[]")
         item = normalize_record(
-            raw,
-            raw["kind"],
-            raw.get("source") or "cache-migration",
-            raw.get("fetched_at") or iso_utc(utc_now()),
+            row,
+            row["kind"],
+            row.get("source") or "cache-migration",
+            row.get("fetched_at") or iso_utc(utc_now()),
         )
         upsert_record(connection, item)
+    connection.execute(
+        "UPDATE metadata SET value=? WHERE key='schema_version'",
+        (str(RECORDS_SCHEMA_VERSION),),
+    )
 
 
 def ingest_records(args: argparse.Namespace) -> None:
@@ -760,15 +815,13 @@ def commit_database(args: argparse.Namespace, kind: str) -> None:
         live = live_path(directory, kind)
         live_generation = 0
         if live.exists():
-            with connect(live) as current:
-                live_generation = int(validate(current, args.repo, kind)["metadata"]["generation"])
+            live_generation = committed_generation(live, args.repo, kind)
         if live_generation != args.base_generation:
             raise RuntimeError(
                 f"cache generation conflict: expected {args.base_generation}, found {live_generation}"
             )
         with connect(work) as connection:
             validate(connection, args.repo, kind)
-            removed = 0
             updates = {
                 "generation": str(live_generation + 1),
                 "last_sync_at": args.synced_at,
@@ -785,9 +838,7 @@ def commit_database(args: argparse.Namespace, kind: str) -> None:
         secure_file(live)
     finally:
         os.close(descriptor)
-    print(
-        json.dumps({"committed": str(live), "generation": live_generation + 1, "pruned": removed})
-    )
+    print(json.dumps({"committed": str(live), "generation": live_generation + 1}))
 
 
 def abort_database(args: argparse.Namespace) -> None:
