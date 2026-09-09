@@ -840,6 +840,72 @@ class TestWorkflowRun:
         assert failed.returncode == 2
         assert "without mutation records" in failed.stderr
 
+    def test_mutation_record_requires_a_coherent_publication_operation(self) -> None:
+        self.initialize()
+        current = self.project_dir / "workflows/gh-audit-repo/current"
+        self.audit_event(
+            1,
+            {"type": "candidate-upsert", "candidate": {"id": "C-1", "status": "published"}},
+        )
+        fabricated = self.audit_event(
+            2,
+            {
+                "type": "mutation-record",
+                "mutation": {"candidate_id": "C-1", "action": "fabricate-nonexistent-operation"},
+            },
+            check=False,
+        )
+        assert fabricated.returncode == 2
+        assert "publication operation is unsupported" in fabricated.stderr
+        incoherent = self.audit_event(
+            2,
+            {"type": "mutation-record", "mutation": {"candidate_id": "C-1", "action": "close"}},
+            check=False,
+        )
+        assert incoherent.returncode == 2
+        assert "conflicts with the terminal candidate disposition" in incoherent.stderr
+        state = json.loads((current / "state.json").read_text())
+        assert state["mutations"] == []
+        revision = 2
+        for phase in (
+            "source",
+            "history",
+            "structure",
+            "discovery",
+            "verification",
+            "publication",
+        ):
+            result = self.audit_event(
+                revision,
+                {
+                    "type": "phase-set",
+                    "phase": phase,
+                    "value": {"status": "complete"},
+                },
+            )
+            revision = json.loads(result.stdout)["revision"]
+        result = self.audit_event(
+            revision,
+            {
+                "type": "mutation-record",
+                "mutation": {
+                    "candidate_id": "C-1",
+                    "action": "create",
+                    "receipt": {"url": "https://example.invalid/1"},
+                },
+            },
+        )
+        revision = json.loads(result.stdout)["revision"]
+        finalized = self.call(
+            "finalize",
+            "gh-audit-repo",
+            "--expected-revision",
+            str(revision),
+            "--status",
+            "complete",
+        )
+        assert json.loads(finalized.stdout)["status"] == "complete"
+
     def test_audit_source_uses_primary_local_head(self) -> None:
         subprocess.run(["git", "init", "-q", "-b", "main", str(self.project)], check=True)
         subprocess.run(
@@ -887,6 +953,29 @@ class TestWorkflowRun:
             )
             assert rejected.returncode == 2
             assert "depth-1 probe layout" in rejected.stderr
+        state = json.loads((current / "state.json").read_text())
+        assert state["validations"] == {}
+
+    def test_validation_record_id_must_match_the_artifact_probe_path(self) -> None:
+        self.initialize()
+        current = self.project_dir / "workflows/gh-audit-repo/current"
+        artifact = current / "validation/probe-1/result.json"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text("{}\n")
+        rejected = self.audit_event(
+            1,
+            {
+                "type": "validation-record",
+                "validation": {
+                    "id": "probe-2",
+                    "artifact": "validation/probe-1/result.json",
+                    "status": "succeeded",
+                },
+            },
+            check=False,
+        )
+        assert rejected.returncode == 2
+        assert "validation/probe-2/result.json" in rejected.stderr
         state = json.loads((current / "state.json").read_text())
         assert state["validations"] == {}
 
