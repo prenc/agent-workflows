@@ -6,7 +6,10 @@ import json
 import os
 import re
 import stat
+import subprocess
 import threading
+import tracemalloc
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
@@ -752,6 +755,67 @@ def test_feedback_repository_attribution_accepts_only_remote_urls(
     assert feedback.repository_from_workspace(tmp_path) == expected
 
 
+def timed_out_run(*args: object, **kwargs: object) -> object:
+    raise subprocess.TimeoutExpired(cmd=list(args[0]), timeout=kwargs["timeout"])  # type: ignore[index]
+
+
+def test_feedback_git_remote_timeout_degrades_to_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(feedback.subprocess, "run", timed_out_run)
+
+    assert feedback.repository_from_workspace(tmp_path) is None
+
+
+def test_feedback_transcript_search_timeout_reports_typed_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "projects").mkdir()
+    monkeypatch.setattr(feedback.subprocess, "run", timed_out_run)
+
+    with pytest.raises(RuntimeError, match="transcript search timed out"):
+        feedback._candidate_transcripts("fb-000000000001", tmp_path)
+
+
+def test_feedback_trace_reports_transcript_timeout(
+    cache: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = append_feedback(origin=None, provenance=None)
+    (tmp_path / "qwen-home" / "projects" / "workspace" / "chats").mkdir(parents=True)
+    monkeypatch.setenv("QWEN_HOME", str(tmp_path / "qwen-home"))
+    monkeypatch.setattr(feedback.subprocess, "run", timed_out_run)
+
+    with pytest.raises(RuntimeError, match="transcript search timed out"):
+        feedback.trace(str(result["feedback_id"]))
+
+
+def test_feedback_fallback_transcript_scan_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    feedback_id = "fb-000000000001"
+    chats = tmp_path / "projects" / "workspace" / "chats"
+    chats.mkdir(parents=True)
+    all_files = []
+    for index in range(3):
+        path = chats / f"t{index}.jsonl"
+        path.write_text(json.dumps({"message": feedback_id}) + "\n", encoding="utf-8")
+        all_files.append(path)
+
+    def missing(*args: object, **kwargs: object) -> object:
+        raise FileNotFoundError("rg")
+
+    monkeypatch.setattr(feedback.subprocess, "run", missing)
+
+    assert set(feedback._candidate_transcripts(feedback_id, tmp_path)) == set(all_files)
+
+    monkeypatch.setattr(feedback, "FALLBACK_SCAN_FILE_LIMIT", 2)
+    with pytest.warns(UserWarning, match="stopped after"):
+        bounded = feedback._candidate_transcripts(feedback_id, tmp_path)
+
+    assert len(bounded) == 2
+    assert set(bounded) <= set(all_files)
+
+
 @pytest.mark.parametrize("message", ["", " " * 3, "x" * 2001])
 def test_feedback_cli_add_validates_the_message(cache: Path, message: str) -> None:
     args = build_parser().parse_args(["feedback", "add", message])
@@ -1104,6 +1168,74 @@ def test_feedback_summary_supports_inclusive_normalized_cutoff(cache: Path) -> N
     }
     with pytest.raises(ValueError, match="ISO-8601"):
         feedback.feedback_summary(cutoff="yesterday")
+
+
+def test_feedback_invalid_timestamp_is_quarantined_without_blocking_summary(cache: Path) -> None:
+    path = feedback.storage_path()
+    path.parent.mkdir(parents=True)
+    good = {
+        "feedback_id": "fb-000000000001",
+        "timestamp": "2026-09-02T12:00:00Z",
+        "status": "open",
+        "message": "Readable record",
+        "tool": "task_manage",
+    }
+    bad = {
+        "feedback_id": "fb-000000000002",
+        "timestamp": "not-a-date",
+        "status": "open",
+        "message": "Blocked-looking record",
+        "tool": "task_manage",
+    }
+    path.write_text(json.dumps(good) + "\n" + json.dumps(bad) + "\n", encoding="utf-8")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        records = feedback.read_records()
+        summary = feedback.feedback_summary()
+        listed = feedback.list_records(cutoff="2026-09-02T00:00:00Z", status="all")
+        compact = feedback.compact_records(cutoff="2026-09-02T00:00:00Z", status="all")
+
+    assert [record["feedback_id"] for record in records] == ["fb-000000000001"]
+    assert any(
+        "fb-000000000002" in str(warning.message) and "invalid timestamp" in str(warning.message)
+        for warning in caught
+    )
+    assert summary["open"]["records"] == 1
+    assert summary["range"] == {"oldest": "2026-09-02T12:00:00Z", "newest": "2026-09-02T12:00:00Z"}
+    assert [record["feedback_id"] for record in listed] == ["fb-000000000001"]
+    assert [item["feedback_id"] for item in compact] == ["fb-000000000001"]
+
+
+@pytest.mark.parametrize("timestamp", ["not-a-date", 1234567890, None])
+def test_feedback_non_parseable_timestamp_variants_are_quarantined(
+    cache: Path, timestamp: object
+) -> None:
+    path = feedback.storage_path()
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "feedback_id": "fb-000000000003",
+                "timestamp": timestamp,
+                "status": "open",
+                "message": "Unreadable timestamp",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.warns(UserWarning, match=r"fb-000000000003.*invalid timestamp"):
+        assert feedback.read_records() == []
+
+    assert feedback.feedback_summary()["open"]["records"] == 0
+    assert feedback.feedback_summary()["range"] == {"oldest": None, "newest": None}
+
+
+def test_feedback_record_time_error_identifies_the_record() -> None:
+    with pytest.raises(ValueError, match="fb-000000000004 has an invalid timestamp"):
+        feedback._record_time({"feedback_id": "fb-000000000004", "timestamp": "not-a-date"})
 
 
 @pytest.mark.parametrize(
@@ -1503,6 +1635,201 @@ def test_feedback_trace_falls_back_for_legacy_unlinked_record(
     )
 
 
+def _write_synthetic_transcript(path: Path, feedback_id: str, filler_rows: int) -> None:
+    """Write a transcript whose feedback call sits near the start, padded after."""
+    call = {
+        "type": "assistant",
+        "message": {
+            "role": "model",
+            "parts": [
+                {
+                    "functionCall": {
+                        "id": "feedback-call",
+                        "name": "mcp__github_workflows__workflow_feedback",
+                        "args": {"message": "The probe was unclear"},
+                    }
+                }
+            ],
+        },
+    }
+    result = {
+        "type": "tool_result",
+        "timestamp": "2026-09-02T12:00:01Z",
+        "sessionId": "memory-session",
+        "message": {
+            "role": "user",
+            "parts": [
+                {
+                    "functionResponse": {
+                        "id": "feedback-call",
+                        "name": "mcp__github_workflows__workflow_feedback",
+                        "response": {
+                            "output": json.dumps({"recorded": True, "feedback_id": feedback_id})
+                        },
+                    }
+                }
+            ],
+        },
+    }
+    filler = json.dumps(
+        {
+            "type": "user",
+            "timestamp": "2026-09-02T11:00:00Z",
+            "message": {"role": "user", "parts": [{"text": "x" * 4000}]},
+        }
+    )
+    rows = [json.dumps(call), json.dumps(result)]
+    rows.extend([filler] * filler_rows)
+    path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+
+def test_feedback_trace_peak_memory_stays_bounded_as_transcript_grows(
+    cache: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = append_feedback(
+        origin=None,
+        provenance={
+            "conversation": {
+                "client": "qwen",
+                "session_id": "memory-session",
+                "transcript": "$QWEN_HOME/projects/workspace/chats/memory.jsonl",
+            }
+        },
+    )
+    feedback_id = str(result["feedback_id"])
+    transcript = tmp_path / "qwen-home" / "projects" / "workspace" / "chats" / "memory.jsonl"
+    transcript.parent.mkdir(parents=True)
+    monkeypatch.setenv("QWEN_HOME", str(tmp_path / "qwen-home"))
+
+    for filler_rows in (256, 1024):
+        _write_synthetic_transcript(transcript, feedback_id, filler_rows)
+        assert transcript.stat().st_size > 1024 * 1024
+        tracemalloc.start()
+        try:
+            traced = feedback.trace(feedback_id)
+        finally:
+            _, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+
+        assert len(traced["matches"]) == 1
+        assert traced["matches"][0]["transcript"] == (
+            "$QWEN_HOME/projects/workspace/chats/memory.jsonl"
+        )
+        assert peak < 3 * 1024 * 1024
+
+
+def test_feedback_trace_lookback_is_bounded_by_the_window(
+    cache: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = append_feedback(origin=None, provenance=None)
+    feedback_id = str(result["feedback_id"])
+    transcript = tmp_path / "qwen-home" / "projects" / "workspace" / "chats" / "bounded.jsonl"
+    transcript.parent.mkdir(parents=True)
+    rows = [
+        {
+            "message": {
+                "role": "model",
+                "parts": [
+                    {
+                        "functionCall": {
+                            "id": "tool-a",
+                            "name": "run_shell_command",
+                            "args": {"command": "echo hi"},
+                        }
+                    }
+                ],
+            }
+        },
+        {
+            "message": {
+                "role": "user",
+                "parts": [
+                    {
+                        "functionResponse": {
+                            "id": "tool-a",
+                            "name": "run_shell_command",
+                            "response": {"output": "hi"},
+                        }
+                    }
+                ],
+            }
+        },
+    ]
+    rows.extend(
+        {"message": {"role": "user", "parts": [{"text": f"filler {index}"}]}} for index in range(12)
+    )
+    rows.append(
+        {
+            "message": {
+                "role": "model",
+                "parts": [
+                    {
+                        "functionCall": {
+                            "id": "feedback-call",
+                            "name": "mcp__github_workflows__workflow_feedback",
+                            "args": {"message": "Bounded probe"},
+                        }
+                    }
+                ],
+            }
+        }
+    )
+    rows.append(
+        {
+            "message": {
+                "role": "user",
+                "parts": [
+                    {
+                        "functionResponse": {
+                            "id": "feedback-call",
+                            "name": "mcp__github_workflows__workflow_feedback",
+                            "response": {
+                                "output": json.dumps({"recorded": True, "feedback_id": feedback_id})
+                            },
+                        }
+                    }
+                ],
+            }
+        }
+    )
+    transcript.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    monkeypatch.setenv("QWEN_HOME", str(tmp_path / "qwen-home"))
+
+    with mock.patch.object(feedback, "TRACE_WINDOW_ROWS", 3):
+        traced = feedback.trace(feedback_id)
+
+    match = traced["matches"][0]
+    assert match["feedback_tool_call_id"] == "feedback-call"
+    assert match["tools"] == []
+
+
+def test_feedback_fallback_transcript_scan_streams_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    feedback_id = "fb-000000000001"
+    transcript = tmp_path / "projects" / "workspace" / "chats" / "streamed.jsonl"
+    transcript.parent.mkdir(parents=True)
+    rows = [
+        json.dumps({"message": f"filler {index}", "padding": "x" * 4000}) for index in range(512)
+    ]
+    rows.append(json.dumps({"message": feedback_id}))
+    transcript.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    def missing(*args: object, **kwargs: object) -> object:
+        raise FileNotFoundError("rg")
+
+    monkeypatch.setattr(feedback.subprocess, "run", missing)
+    tracemalloc.start()
+    try:
+        found = feedback._candidate_transcripts(feedback_id, tmp_path)
+    finally:
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+    assert found == [transcript]
+    assert peak < 1536 * 1024
+
+
 def test_trace_rejects_unknown_detail() -> None:
     with pytest.raises(ValueError, match="tools, context, or data"):
         feedback.trace("12345678", detail="everything")
@@ -1638,13 +1965,59 @@ def test_feedback_table_escapes_terminal_controls() -> None:
     assert r"hidden\u200btext" in table
 
 
-def test_feedback_reader_reports_malformed_record_line(cache: Path) -> None:
+def test_feedback_reader_quarantines_malformed_and_torn_lines(cache: Path) -> None:
     path = feedback.storage_path()
     path.parent.mkdir(parents=True)
-    path.write_text("{}\n", encoding="utf-8")
+    valid = {
+        "feedback_id": "fb-123456789abc",
+        "timestamp": "2026-09-02T12:00:00Z",
+        "status": "open",
+        "message": "Surviving record",
+    }
+    path.write_bytes(
+        (json.dumps(valid) + "\n").encode()
+        + b"{}\n"
+        + b"\xff\xfe broken line\n"
+        + b'{"feedback_id": "fb-torn0000000000", "timestamp": "2026-'
+    )
 
-    with pytest.raises(ValueError, match="line 1"):
-        feedback.read_records()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        records = feedback.read_records()
+
+    assert [record["feedback_id"] for record in records] == ["fb-123456789abc"]
+    messages = [str(warning.message) for warning in caught]
+    assert "line 2" in messages[0]
+    assert "missing required fields" in messages[0]
+    assert "line 3" in messages[1]
+    assert "UTF-8" in messages[1]
+    assert "line 4" in messages[2]
+    assert "feedback JSON" in messages[2]
+
+    # Subsequent reads and appends work without manual file editing.
+    assert len(feedback.read_records()) == 1
+    appended = append_feedback(message="Recorded after corruption")
+    stored_ids = [record["feedback_id"] for record in feedback.read_records()]
+    assert stored_ids == ["fb-123456789abc", appended["feedback_id"]]
+
+
+def test_feedback_append_recovers_torn_trailing_line(cache: Path) -> None:
+    first = append_feedback(message="Surviving record")
+    path = feedback.storage_path()
+    original = path.read_bytes()
+    path.write_bytes(original + b'{"feedback_id": "fb-torn0000000000", "timestamp": "2026-09-')
+
+    with pytest.warns(UserWarning, match="line 2"):
+        second = append_feedback(message="Recorded after the torn write")
+
+    records = feedback.read_records()
+    assert [record["feedback_id"] for record in records] == [
+        first["feedback_id"],
+        second["feedback_id"],
+    ]
+    stored = path.read_bytes()
+    assert stored.endswith(b"\n")
+    assert b"fb-torn0000000000" not in stored
 
 
 def test_workers_receive_only_context_and_feedback_tools() -> None:

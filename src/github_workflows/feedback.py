@@ -12,6 +12,8 @@ import subprocess
 import textwrap
 import unicodedata
 import uuid
+import warnings
+from collections import deque
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
@@ -26,6 +28,10 @@ TRACE_MESSAGE_BYTES = 1024
 TRACE_CONTEXT_BYTES = 4 * 1024
 TRACE_PAYLOAD_BYTES = 4 * 1024
 TRACE_DATA_BYTES = 16 * 1024
+GIT_REMOTE_TIMEOUT_SECONDS = 5
+TRANSCRIPT_SEARCH_TIMEOUT_SECONDS = 10
+TRACE_WINDOW_ROWS = 128
+FALLBACK_SCAN_FILE_LIMIT = 4096
 SAFE_SELECTOR_ARGUMENTS = frozenset({"action", "kind", "method", "workflow"})
 SAFE_ARGUMENT_NAMES = frozenset(
     {
@@ -113,8 +119,9 @@ def repository_from_workspace(workspace: Path) -> str | None:
             check=False,
             capture_output=True,
             text=True,
+            timeout=GIT_REMOTE_TIMEOUT_SECONDS,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return None
     match = REMOTE_REPOSITORY.fullmatch(result.stdout.strip()) if result.returncode == 0 else None
     return f"{match.group(1)}/{match.group(2)}" if match else None
@@ -156,30 +163,61 @@ def _read(path: Path) -> list[dict[str, Any]]:
         return []
     _private_file(path)
     records: list[dict[str, Any]] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError as error:
-            raise ValueError(f"invalid feedback JSON on line {line_number}") from error
-        if not isinstance(value, dict):
-            raise ValueError(f"feedback line {line_number} must be an object")
-        required = {"feedback_id", "timestamp", "message"}
-        if not required.issubset(value):
-            raise ValueError(f"feedback line {line_number} is missing required fields")
-        if value.get("status", "open") not in {"open", "closed"}:
-            raise ValueError(f"feedback line {line_number} has an invalid status")
-        resolution = value.get("resolution")
-        if resolution is not None and (
-            not isinstance(resolution, dict)
-            or resolution.get("disposition") not in RESOLUTION_DISPOSITIONS
-            or (
-                "note" in resolution
-                and (not isinstance(resolution["note"], str) or len(resolution["note"]) > 500)
-            )
-        ):
-            raise ValueError(f"feedback line {line_number} has an invalid resolution")
-        records.append(value)
+    for line_number, raw_line in enumerate(path.read_bytes().split(b"\n"), 1):
+        if not raw_line.strip():
+            continue
+        record = _parse_record_line(raw_line, line_number)
+        if record is not None:
+            records.append(record)
     return records
+
+
+def _quarantine_line(line_number: int, feedback_id: Any, reason: str) -> None:
+    identifier = f" ({feedback_id})" if isinstance(feedback_id, str) and feedback_id else ""
+    warnings.warn(
+        f"quarantining feedback line {line_number}{identifier}: {reason}",
+        stacklevel=2,
+    )
+
+
+def _parse_record_line(raw_line: bytes, line_number: int) -> dict[str, Any] | None:
+    """Validate one store line, quarantining invalid content with a record diagnostic."""
+    try:
+        line = raw_line.decode("utf-8")
+    except UnicodeDecodeError:
+        _quarantine_line(line_number, None, "is not valid UTF-8")
+        return None
+    try:
+        value = json.loads(line)
+    except json.JSONDecodeError:
+        _quarantine_line(line_number, None, "is not valid feedback JSON")
+        return None
+    if not isinstance(value, dict):
+        _quarantine_line(line_number, None, "must be an object")
+        return None
+    feedback_id = value.get("feedback_id")
+    required = {"feedback_id", "timestamp", "message"}
+    if not required.issubset(value):
+        _quarantine_line(line_number, feedback_id, "is missing required fields")
+        return None
+    if value.get("status", "open") not in {"open", "closed"}:
+        _quarantine_line(line_number, feedback_id, "has an invalid status")
+        return None
+    resolution = value.get("resolution")
+    if resolution is not None and (
+        not isinstance(resolution, dict)
+        or resolution.get("disposition") not in RESOLUTION_DISPOSITIONS
+        or (
+            "note" in resolution
+            and (not isinstance(resolution["note"], str) or len(resolution["note"]) > 500)
+        )
+    ):
+        _quarantine_line(line_number, feedback_id, "has an invalid resolution")
+        return None
+    if _parse_feedback_time(value["timestamp"]) is None:
+        _quarantine_line(line_number, feedback_id, "has an invalid timestamp")
+        return None
+    return value
 
 
 def read_records() -> list[dict[str, Any]]:
@@ -298,6 +336,15 @@ def _encoded_size(value: Mapping[str, Any]) -> int:
     return len(json.dumps(value, sort_keys=True, separators=(",", ":")).encode())
 
 
+def _needs_tail_repair(path: Path) -> bool:
+    """Return True when the store ends in an unterminated (torn) trailing line."""
+    if not path.exists() or path.lstat().st_size == 0:
+        return False
+    with path.open("rb") as stream:
+        stream.seek(-1, os.SEEK_END)
+        return stream.read(1) != b"\n"
+
+
 def append(
     *,
     message: str,
@@ -343,7 +390,7 @@ def append(
         encoded = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
         if len(encoded) > MAX_RECORD_BYTES:
             raise ValueError("feedback record exceeds 8 KiB; shorten the PHI-free summary")
-        if normalized:
+        if normalized or _needs_tail_repair(path):
             _rewrite(path, existing)
         flags = os.O_CREAT | os.O_RDWR | os.O_APPEND
         if hasattr(os, "O_NOFOLLOW"):
@@ -545,7 +592,9 @@ def relative_cutoff(value: str | None, *, now: dt.datetime | None = None) -> str
 def _record_time(record: Mapping[str, Any]) -> dt.datetime:
     parsed = _parse_feedback_time(record.get("timestamp"))
     if parsed is None:
-        raise ValueError("feedback record has an invalid timestamp")
+        feedback_id = record.get("feedback_id")
+        identifier = f" {feedback_id}" if isinstance(feedback_id, str) and feedback_id else ""
+        raise ValueError(f"feedback record{identifier} has an invalid timestamp")
     return parsed
 
 
@@ -790,17 +839,14 @@ def _candidate_transcripts(feedback_id: str, root: Path) -> list[Path]:
             check=False,
             capture_output=True,
             text=True,
+            timeout=TRANSCRIPT_SEARCH_TIMEOUT_SECONDS,
         )
     except FileNotFoundError:
-        matches = []
-        for path in projects.rglob("*.jsonl"):
-            if any(part in {"chats", "subagents"} for part in path.parts):
-                try:
-                    if feedback_id in path.read_text(encoding="utf-8", errors="replace"):
-                        matches.append(path)
-                except OSError:
-                    continue
-        return [path for path in matches if _valid_transcript_candidate(path, root)]
+        return _fallback_transcript_matches(feedback_id, projects, root)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            f"Qwen transcript search timed out after {TRANSCRIPT_SEARCH_TIMEOUT_SECONDS} seconds"
+        ) from error
     if result.returncode not in {0, 1}:
         raise RuntimeError("could not search Qwen transcripts")
     matches = [Path(line) for line in result.stdout.splitlines() if line]
@@ -810,6 +856,33 @@ def _candidate_transcripts(feedback_id: str, root: Path) -> list[Path]:
         if any(part in {"chats", "subagents"} for part in path.parts)
         and _valid_transcript_candidate(path, root)
     ]
+
+
+def _fallback_transcript_matches(feedback_id: str, projects: Path, root: Path) -> list[Path]:
+    """Bounded ripgrep-missing scan that streams each transcript one row at a time."""
+    matches: list[Path] = []
+    scanned = 0
+    limited = False
+    for path in projects.rglob("*.jsonl"):
+        if scanned >= FALLBACK_SCAN_FILE_LIMIT:
+            limited = True
+            break
+        scanned += 1
+        if not any(part in {"chats", "subagents"} for part in path.parts):
+            continue
+        try:
+            with path.open(encoding="utf-8", errors="replace") as stream:
+                if any(feedback_id in line for line in stream):
+                    matches.append(path)
+        except OSError:
+            continue
+    if limited:
+        warnings.warn(
+            f"feedback transcript scan stopped after {FALLBACK_SCAN_FILE_LIMIT} files; "
+            "the feedback call may be in an unscanned transcript",
+            stacklevel=2,
+        )
+    return [path for path in matches if _valid_transcript_candidate(path, root)]
 
 
 def _valid_transcript_candidate(path: Path, root: Path) -> bool:
@@ -846,9 +919,11 @@ def _result_feedback_id(result: Mapping[str, Any]) -> str | None:
     return _hook_feedback_id(result.get("response"))
 
 
-def _read_transcript(path: Path) -> list[dict[str, Any]]:
-    """Read valid JSON objects while tolerating partial concurrent JSONL rows."""
-    transcript: list[dict[str, Any]] = []
+def _iter_transcript_windows(
+    path: Path,
+) -> Iterator[tuple[list[dict[str, Any]], dict[str, Any]]]:
+    """Stream parsed transcript rows, each with a bounded window of preceding rows."""
+    window: deque[dict[str, Any]] = deque(maxlen=TRACE_WINDOW_ROWS)
     with path.open(encoding="utf-8", errors="replace") as stream:
         for line in stream:
             if not line.strip():
@@ -857,9 +932,10 @@ def _read_transcript(path: Path) -> list[dict[str, Any]]:
                 value = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if isinstance(value, dict):
-                transcript.append(value)
-    return transcript
+            if not isinstance(value, dict):
+                continue
+            yield list(window), value
+            window.append(value)
 
 
 def _stored_transcript(record: Mapping[str, Any], root: Path) -> Path | None:
@@ -1038,38 +1114,38 @@ def trace(feedback_id: str, *, detail: str = "tools") -> dict[str, Any]:
     locator = provenance.get("conversation") if isinstance(provenance, Mapping) else None
     for path in _trace_paths(record, actual_id, root):
         try:
-            transcript = _read_transcript(path)
+            for window, item in _iter_transcript_windows(path):
+                result = _result_from_parts(item)
+                if (
+                    result is None
+                    or result.get("name") != "mcp__github_workflows__workflow_feedback"
+                    or _result_feedback_id(result) != actual_id
+                ):
+                    continue
+                call_id = str(result.get("id") or "")
+                before = len(window)
+                found = _find_call(window, before, call_id) if call_id else None
+                call_index = found[0] if found is not None else before
+                relative = path.resolve().relative_to(root.resolve())
+                display_path = f"$QWEN_HOME/{relative.as_posix()}"
+                interactions = _recent_tools(window, call_index)
+                replacements = _replacements([(root, "$QWEN_HOME"), (Path.home(), "<home>")])
+                match: dict[str, Any] = {
+                    "timestamp": item.get("timestamp"),
+                    "session_id": (locator or {}).get("session_id") or item.get("sessionId"),
+                    "prompt_id": (locator or {}).get("prompt_id"),
+                    "agent_id": (locator or {}).get("agent_id") or item.get("agentId"),
+                    "mcp_request_id": (locator or {}).get("mcp_request_id"),
+                    "feedback_tool_use_id": (locator or {}).get("tool_use_id"),
+                    "feedback_tool_call_id": call_id or None,
+                    "transcript": display_path,
+                    "tools": _public_tools(interactions, detail, replacements),
+                }
+                if detail in {"context", "data"}:
+                    match["messages"] = _visible_context(window, call_index, replacements)
+                matches.append({key: value for key, value in match.items() if value is not None})
         except OSError:
             continue
-        for index, item in enumerate(transcript):
-            result = _result_from_parts(item)
-            if (
-                result is None
-                or result.get("name") != "mcp__github_workflows__workflow_feedback"
-                or _result_feedback_id(result) != actual_id
-            ):
-                continue
-            call_id = str(result.get("id") or "")
-            found = _find_call(transcript, index, call_id) if call_id else None
-            call_index = found[0] if found is not None else index
-            relative = path.resolve().relative_to(root.resolve())
-            display_path = f"$QWEN_HOME/{relative.as_posix()}"
-            interactions = _recent_tools(transcript, call_index)
-            replacements = _replacements([(root, "$QWEN_HOME"), (Path.home(), "<home>")])
-            match: dict[str, Any] = {
-                "timestamp": item.get("timestamp"),
-                "session_id": (locator or {}).get("session_id") or item.get("sessionId"),
-                "prompt_id": (locator or {}).get("prompt_id"),
-                "agent_id": (locator or {}).get("agent_id") or item.get("agentId"),
-                "mcp_request_id": (locator or {}).get("mcp_request_id"),
-                "feedback_tool_use_id": (locator or {}).get("tool_use_id"),
-                "feedback_tool_call_id": call_id or None,
-                "transcript": display_path,
-                "tools": _public_tools(interactions, detail, replacements),
-            }
-            if detail in {"context", "data"}:
-                match["messages"] = _visible_context(transcript, call_index, replacements)
-            matches.append({key: value for key, value in match.items() if value is not None})
     if not matches:
         raise ValueError("feedback was not found in Qwen transcripts")
     return {"feedback_id": actual_id, "detail": detail, "matches": matches}
