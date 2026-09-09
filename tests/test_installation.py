@@ -850,7 +850,10 @@ def test_moved_qwen_extension_is_relinked(
     installer.plan_qwen()
     assert installer.changes == ["link the github-workflows extension"]
     installer.apply_qwen()
-    assert commands == [("/bin/qwen", "extensions", "link", str(new_source))]
+    assert commands == [
+        ("/bin/qwen", "extensions", "uninstall", "github-workflows"),
+        ("/bin/qwen", "extensions", "link", str(new_source)),
+    ]
 
     (target / ".qwen-extension-install.json").write_text(
         json.dumps({"type": "link", "source": str(new_source)})
