@@ -4,10 +4,37 @@ import json
 import os
 import subprocess
 import tempfile
+import time
+import uuid
 import venv
 from pathlib import Path
 
+from github_workflows import audit_inventory as inventory_module
+from github_workflows import audit_sandbox
+
 HELPER = Path(__file__).parents[1] / "src/github_workflows/audit_inventory.py"
+
+
+def _open_handles_named(name: str) -> list[int]:
+    """Host pid-space pids holding an open fd whose path contains ``name``."""
+    pids = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        fd_dir = Path("/proc", entry, "fd")
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                link = os.readlink(fd_dir / fd)
+            except OSError:
+                continue
+            if name in link:
+                pids.append(int(entry))
+                break
+    return pids
 
 
 class TestAuditInventory:
@@ -164,6 +191,8 @@ class TestAuditInventory:
                 "try:\n socket.create_connection(('1.1.1.1', 53), timeout=0.1)\n"
                 "except OSError:\n pass\n"
                 "else:\n raise SystemExit(9)\n"
+                "nspid = [line for line in Path('/proc/self/status').read_text().splitlines() if line.startswith('NSpid')]\n"
+                "if len(nspid) != 1 or len(nspid[0].split()) < 3:\n raise SystemExit(10)\n"
                 "print('isolated version')\n"
             )
             executable.chmod(0o755)
@@ -194,3 +223,61 @@ class TestAuditInventory:
         assert fact["available"]
         assert fact["probe_status"] == "failed"
         assert fact["returncode"] == 7
+
+    def test_program_probe_stdout_is_bounded_to_stored_limit(self) -> None:
+        self.call("initialize")
+        with tempfile.TemporaryDirectory(prefix="audit-inventory-bin-") as binary_dir:
+            executable = Path(binary_dir) / "loud-version"
+            executable.write_text(
+                "#!/usr/bin/python3\nimport sys\nsys.stdout.write('x' * (4 * 1024 * 1024))\n"
+            )
+            executable.chmod(0o755)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{binary_dir}:{environment['PATH']}"
+            source = self.program_input([{"name": "loud-version", "arguments": ["--version"]}])
+            result = self.call(
+                "program", "--input", str(source), "--expected-revision", "1", env=environment
+            )
+        fact = json.loads(result.stdout)["facts"]["loud-version"]
+        assert fact["available"]
+        # file-backed capture: the child's stdout is a file capped at the
+        # FSIZE rlimit, so oversized output fails in the child (the write is
+        # clamped to the limit and surfaces as EFBIG) instead of being
+        # buffered in the parent (MCP server) process
+        assert fact["probe_status"] == "failed"
+        assert fact["returncode"] == 1
+        assert len(fact["stdout"]) == inventory_module.OUTPUT_BYTES
+
+    def test_program_probe_timeout_kills_sandboxed_descendants(self, monkeypatch) -> None:
+        monkeypatch.setattr(inventory_module, "WALL_SECONDS", 2)
+        sentinel = f"orphan-sentinel-{uuid.uuid4().hex}"
+        with tempfile.TemporaryDirectory(prefix="audit-inventory-bin-") as binary_dir:
+            executable = Path(binary_dir) / "orphan-spawner"
+            executable.write_text(
+                f'#!/bin/sh\n( trap "" TERM; exec 9>"$TMPDIR/{sentinel}"; sleep 45 ) &\nsleep 45\n'
+            )
+            executable.chmod(0o755)
+            monkeypatch.setenv("PATH", f"{binary_dir}:{os.environ['PATH']}")
+            fact = inventory_module.probe_program(
+                self.project, self.worktree, self.run_dir, "orphan-spawner", ["--version"]
+            )
+        assert fact["available"]
+        assert fact["probe_status"] == "timed-out"
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and _open_handles_named(sentinel):
+            time.sleep(0.1)
+        assert not _open_handles_named(sentinel), (
+            "SIGTERM-ignoring sandboxed descendant survived the probe_program timeout"
+        )
+
+    def test_read_bounded_limits_parent_memory(self, tmp_path) -> None:
+        big = tmp_path / "big"
+        big.write_bytes(b"y" * (1024 * 1024))
+        text, truncated = audit_sandbox.read_bounded(big, inventory_module.OUTPUT_BYTES)
+        assert len(text) == inventory_module.OUTPUT_BYTES
+        assert truncated is True
+        small = tmp_path / "small"
+        small.write_bytes(b"hello")
+        text, truncated = audit_sandbox.read_bounded(small, inventory_module.OUTPUT_BYTES)
+        assert text == "hello"
+        assert truncated is False
