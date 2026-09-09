@@ -953,6 +953,11 @@ def audit_event(args: argparse.Namespace) -> None:
                     "validation artifact must follow the depth-1 probe layout "
                     "validation/<probe_id>/result.json"
                 )
+            if relative.parts[0] != unit_id:
+                raise ValueError(
+                    f"validation record id must match the artifact probe path "
+                    f"validation/{unit_id}/result.json"
+                )
             if not artifact_path.is_file():
                 raise ValueError("validation artifact must be an existing result.json")
             candidate_id = value.get("candidate_id")
@@ -1005,7 +1010,20 @@ def audit_event(args: argparse.Namespace) -> None:
         candidate_id = require_string(mutation.get("candidate_id"), "mutation candidate_id")
         if candidate_id not in state["candidates"]:
             raise ValueError("mutation record refers to an unknown candidate")
-        require_string(mutation.get("action"), "mutation action")
+        action = require_string(mutation.get("action"), "mutation action")
+        terminal_status = {
+            "create": "published",
+            "update": "updated",
+            "no-op": "no-op",
+            "close": "closed",
+            "dry-run": "dry-run",
+        }.get(action)
+        if terminal_status is None:
+            raise ValueError("publication operation is unsupported")
+        candidate = state["candidates"][candidate_id]
+        current_status = candidate.get("status")
+        if current_status in AUDIT_CANDIDATE_TERMINAL and current_status != terminal_status:
+            raise ValueError("publication conflicts with the terminal candidate disposition")
         state["mutations"].append(mutation)
         detail = {"candidate_id": mutation["candidate_id"], "action": mutation.get("action")}
     elif event_type == "limitation-add":
