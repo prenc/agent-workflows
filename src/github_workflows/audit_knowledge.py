@@ -282,9 +282,12 @@ def reconcile(args: argparse.Namespace) -> None:
         path, document = active[area_id]
         document["status"] = "invalidated"
         document["invalidated_at"] = utc_now()
-        archive = (
-            root / "invalidated" / f"{slug(area_id)}-{document['area']['fingerprint'][:12]}.md"
-        )
+        base = f"{slug(area_id)}-{document['area']['fingerprint'][:12]}"
+        archive = root / "invalidated" / f"{base}.md"
+        counter = 2
+        while archive.exists():
+            archive = root / "invalidated" / f"{base}-{counter}.md"
+            counter += 1
         write_document(archive, document)
         path.unlink()
         invalidated_documents.append(document)
