@@ -39,7 +39,10 @@ The spawn prompt contains only a namespaced task reference. Call
 stored assignment to contain exactly one issue, its current snapshot, and a
 run-relative candidate-bundle path. Require repository, immutable SHA,
 documentation guidance, and dry-run state from the server-derived run context,
-and require cutoff and watermark inside the bundle. Return `CONTEXT_UNAVAILABLE` with
+and require absolute `candidate_bundle` and `issue_snapshot` paths in
+`run_context.assigned_artifacts`. Read only those resolved artifact paths; do
+not probe for private run state or derive a run directory from the relative
+stored paths. Require cutoff and watermark inside the bundle. Return `CONTEXT_UNAVAILABLE` with
 the missing field when context retrieval fails or is incomplete. The
 supervisor owns recovery and reassignment decisions.
 

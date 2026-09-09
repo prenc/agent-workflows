@@ -312,8 +312,9 @@ an existing PR implementation round, remove `ready-to-merge`, apply PR
 `in-progress`, and preserve `partial` while accepted scope remains incomplete.
 Do not mutate labels or draft state before a verification-only round.
 
-Every existing-PR assignment records `initial_draft`, `pr_round_mode`,
-`pr_expected_end_state`, and `required_worker_draft`. Use `implementation`,
+Every existing-PR assignment records `pull_request.initial_draft`,
+`pull_request.pr_round_mode`, `pull_request.pr_expected_end_state`, and
+`pull_request.required_worker_draft`. Use `implementation`,
 `draft`, and `true` for an editing round; explicitly keep an existing draft or
 change a ready PR to draft before editing because only the supervisor may
 restore ready status. An inherited draft always uses implementation mode so it
@@ -364,7 +365,8 @@ Register the complete round assignment with
 Include non-empty `issues` entries with `number`, non-empty compact string
 `snapshot`, and `accepted_scope`. For new work use
 `pull_request: {"state": "none"}`; for an existing PR use an extensible object
-whose `state` is `open` plus the available PR evidence. Also include `worktree`,
+whose `state` is `open`, whose four round fields follow the Stage 3 contract,
+and which contains the available PR evidence. Also include `worktree`,
 `branch`, full
 `rebased_base_sha`, `remote_lease`, `round_objective`, `acceptance_condition`,
 `repository_instructions`, `validation_plan`, and `execution_environment`.

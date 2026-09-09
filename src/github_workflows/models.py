@@ -266,7 +266,10 @@ class TaskPlan(StrictRequest):
             "assignments require issue, issue_snapshot, and candidate_bundle. Implementation "
             "assignments require issues whose snapshot and accepted_scope are non-empty "
             'compact strings. They require pull_request={"state":"none"} for new work, '
-            'or an extensible pull_request object with state="open" for existing work, plus '
+            'or an extensible pull_request object with state="open" for existing work. Existing '
+            "work also requires boolean initial_draft and required_worker_draft fields, "
+            "pr_round_mode set to implementation or verification-only, and "
+            "pr_expected_end_state set to draft or unchanged inside pull_request, plus "
             "worktree, branch, rebased_base_sha, "
             "remote_lease, round_objective, acceptance_condition, repository_instructions, "
             "validation_plan, and execution_environment. Audit assignments use canonical "

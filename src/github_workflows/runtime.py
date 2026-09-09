@@ -721,34 +721,37 @@ class WorkflowRuntime:
             raise ValueError(f"assignment.{field} must be a non-empty string")
         return value.strip()
 
+    def _curation_assigned_artifacts(
+        self, assignment: dict[str, Any], run_dir: Path | None = None
+    ) -> dict[str, Path]:
+        paths = {
+            field: Path(self._non_blank(assignment.get(field), field))
+            for field in ("candidate_bundle", "issue_snapshot")
+        }
+        if any(path.is_absolute() or ".." in path.parts for path in paths.values()):
+            raise ValueError("curation artifact paths must be run-relative")
+        run_root = run_dir or self.current("gh-curate-issues")
+        artifacts = (run_root / "artifacts").resolve()
+        resolved: dict[str, Path] = {}
+        for field, path in paths.items():
+            unresolved = run_root / path
+            if unresolved.is_symlink():
+                raise ValueError(f"assignment.{field} must name a non-symlink file")
+            candidate = unresolved.resolve()
+            try:
+                candidate.relative_to(artifacts)
+            except ValueError as error:
+                raise ValueError(f"assignment.{field} must be under run artifacts") from error
+            if not candidate.is_file():
+                raise ValueError(f"assignment.{field} must name an existing regular file")
+            resolved[field] = candidate
+        return resolved
+
     def _curation_bundle(self, assignment: dict[str, Any]) -> dict[str, Any]:
         issue = assignment.get("issue")
         if isinstance(issue, bool) or not isinstance(issue, int) or issue < 1:
             raise ValueError("curation assignment.issue must be a positive integer")
-        relative = self._non_blank(assignment.get("candidate_bundle"), "candidate_bundle")
-        snapshot_relative = self._non_blank(assignment.get("issue_snapshot"), "issue_snapshot")
-        path = Path(relative)
-        snapshot_path = Path(snapshot_relative)
-        if any(item.is_absolute() or ".." in item.parts for item in (path, snapshot_path)):
-            raise ValueError("curation artifact paths must be run-relative")
-        artifacts = (self.current("gh-curate-issues") / "artifacts").resolve()
-        snapshot = self.current("gh-curate-issues") / snapshot_path
-        if snapshot.is_symlink() or not snapshot.is_file():
-            raise ValueError("assignment.issue_snapshot must name an existing non-symlink file")
-        try:
-            snapshot.resolve().relative_to(artifacts)
-        except ValueError as error:
-            raise ValueError("assignment.issue_snapshot must be under run artifacts") from error
-        unresolved = self.current("gh-curate-issues") / path
-        if unresolved.is_symlink():
-            raise ValueError("assignment.candidate_bundle must name a non-symlink file")
-        resolved = unresolved.resolve()
-        try:
-            resolved.relative_to(artifacts)
-        except ValueError as error:
-            raise ValueError("assignment.candidate_bundle must be under run artifacts") from error
-        if not resolved.is_file():
-            raise ValueError("assignment.candidate_bundle must name an existing regular file")
+        resolved = self._curation_assigned_artifacts(assignment)["candidate_bundle"]
         try:
             bundle = json.loads(resolved.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
@@ -848,6 +851,43 @@ class WorkflowRuntime:
             raise ValueError("assignment.pull_request.state must be none or open")
         if pull_state == "none" and set(assignment["pull_request"]) != {"state"}:
             raise ValueError("assignment.pull_request for new work must contain only state=none")
+        if pull_state == "open":
+            pull_request = assignment["pull_request"]
+            for field in ("initial_draft", "required_worker_draft"):
+                if not isinstance(pull_request.get(field), bool):
+                    raise ValueError(f"assignment.pull_request.{field} must be a boolean")
+            round_mode = self._non_blank(
+                pull_request.get("pr_round_mode"), "pull_request.pr_round_mode"
+            )
+            if round_mode not in {"implementation", "verification-only"}:
+                raise ValueError(
+                    "assignment.pull_request.pr_round_mode must be implementation or "
+                    "verification-only"
+                )
+            expected_end_state = self._non_blank(
+                pull_request.get("pr_expected_end_state"),
+                "pull_request.pr_expected_end_state",
+            )
+            if expected_end_state not in {"draft", "unchanged"}:
+                raise ValueError(
+                    "assignment.pull_request.pr_expected_end_state must be draft or unchanged"
+                )
+            if round_mode == "implementation" and (
+                not pull_request["required_worker_draft"] or expected_end_state != "draft"
+            ):
+                raise ValueError(
+                    "implementation PR rounds require required_worker_draft=true and "
+                    "pr_expected_end_state=draft"
+                )
+            if round_mode == "verification-only" and (
+                pull_request["initial_draft"]
+                or pull_request["required_worker_draft"]
+                or expected_end_state != "unchanged"
+            ):
+                raise ValueError(
+                    "verification-only PR rounds require initial_draft=false, "
+                    "required_worker_draft=false, and pr_expected_end_state=unchanged"
+                )
         self._non_blank(assignment["remote_lease"].get("state"), "remote_lease.state")
         environment = assignment["execution_environment"]
         if environment.get("mode") not in {"native", "shared", "isolated"}:
@@ -2185,6 +2225,13 @@ class WorkflowRuntime:
         }
 
     def task_context(self, task_ref: str, history_cursor: str | None = None) -> dict[str, Any]:
+        workflow, _, _ = self._parse_task_ref(task_ref)
+        if workflow == "gh-curate-issues":
+            with self.lock():
+                return self._task_context(task_ref, history_cursor)
+        return self._task_context(task_ref, history_cursor)
+
+    def _task_context(self, task_ref: str, history_cursor: str | None = None) -> dict[str, Any]:
         workflow, run_ref, task_id = self._parse_task_ref(task_ref)
         state = self.state(workflow)
         if not self._task_ref_matches(state, run_ref):
@@ -2255,6 +2302,16 @@ class WorkflowRuntime:
                 "dry_run": bool(state.get("inputs", {}).get("dry_run", False)),
             },
         }
+        if workflow == "gh-curate-issues":
+            run_dir = state.get("run_dir")
+            if not isinstance(run_dir, str) or not run_dir:
+                raise ValueError("current curation run does not contain a run directory")
+            result["run_context"]["assigned_artifacts"] = {
+                field: str(path)
+                for field, path in self._curation_assigned_artifacts(
+                    assignment, Path(run_dir).resolve()
+                ).items()
+            }
         continuation = self._continuation_context(workflow, state, task)
         if continuation is not None:
             result["continuation"] = continuation

@@ -85,6 +85,164 @@ class TestRuntimeSafety:
             "execution_environment": {"mode": "shared", "pythonpath": ["src"]},
         }
 
+    def test_curation_task_context_revalidates_resolved_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-curation-context-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            runtime.run_manage(
+                RunManageRequest(
+                    action="start",
+                    workflow="gh-curate-issues",
+                    repository="example/repo",
+                )
+            )
+            assignment = self.curation_assignment(runtime, 1)
+            planned = runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    workflow="gh-curate-issues",
+                    task={"logical_id": "issue-1", "assignment": assignment},
+                )
+            )
+
+            context = runtime.task_context(planned["task_ref"])
+            resolved = context["run_context"]["assigned_artifacts"]
+            assert resolved == {
+                field: str((runtime.current("gh-curate-issues") / assignment[field]).resolve())
+                for field in ("candidate_bundle", "issue_snapshot")
+            }
+            assert context["assignment"] == assignment
+            assert "run_dir" not in context["run_context"]
+
+            Path(resolved["issue_snapshot"]).unlink()
+            with pytest.raises(ValueError, match=r"issue_snapshot.*existing regular file"):
+                runtime.task_context(planned["task_ref"])
+
+            outside = Path(directory) / "outside-snapshot.json"
+            outside.write_text("{}\n", encoding="utf-8")
+            Path(resolved["issue_snapshot"]).symlink_to(outside)
+            with pytest.raises(ValueError, match=r"issue_snapshot.*non-symlink file"):
+                runtime.task_context(planned["task_ref"])
+
+    def test_curation_task_context_blocks_concurrent_run_replacement(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-curation-context-race-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            started = runtime.run_manage(
+                RunManageRequest(
+                    action="start",
+                    workflow="gh-curate-issues",
+                    repository="example/repo",
+                )
+            )
+            assignment = self.curation_assignment(runtime, 1)
+            planned = runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    workflow="gh-curate-issues",
+                    task={"logical_id": "issue-1", "assignment": assignment},
+                )
+            )
+            resolving = threading.Event()
+            release = threading.Event()
+            replacement_started = threading.Event()
+            replacement_done = threading.Event()
+            contexts: list[dict[str, Any]] = []
+            receipts: list[dict[str, Any]] = []
+            errors: list[Exception] = []
+            real_resolve = runtime._curation_assigned_artifacts
+
+            def blocked_resolve(
+                assigned: dict[str, Any], run_dir: Path | None = None
+            ) -> dict[str, Path]:
+                resolving.set()
+                if not release.wait(10):
+                    raise RuntimeError("test did not release artifact resolution")
+                return real_resolve(assigned, run_dir)
+
+            def read_context() -> None:
+                try:
+                    contexts.append(runtime.task_context(planned["task_ref"]))
+                except Exception as error:  # noqa: BLE001 - cross-thread error capture
+                    errors.append(error)
+
+            def replace_run() -> None:
+                replacement_started.set()
+                try:
+                    receipts.append(
+                        runtime.run_manage(
+                            RunManageRequest(
+                                action="start",
+                                workflow="gh-curate-issues",
+                                repository="example/repo",
+                            )
+                        )
+                    )
+                except Exception as error:  # noqa: BLE001 - cross-thread error capture
+                    errors.append(error)
+                finally:
+                    replacement_done.set()
+
+            with mock.patch.object(
+                runtime, "_curation_assigned_artifacts", side_effect=blocked_resolve
+            ):
+                context_thread = threading.Thread(target=read_context)
+                context_thread.start()
+                assert resolving.wait(10)
+                replacement_thread = threading.Thread(target=replace_run)
+                replacement_thread.start()
+                assert replacement_started.wait(10)
+                time.sleep(0.2)
+                assert not replacement_done.is_set()
+                release.set()
+                context_thread.join(timeout=10)
+                replacement_thread.join(timeout=10)
+
+            assert not context_thread.is_alive()
+            assert not replacement_thread.is_alive()
+            assert errors == []
+            assert contexts[0]["run_id"] == started["run_id"]
+            assert receipts[0]["run_id"] != started["run_id"]
+
+    def test_legacy_existing_pull_task_requires_corrected_retry_assignment(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-legacy-pr-round-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            workflow = "gh-implement-issue"
+            runtime.run_manage(
+                RunManageRequest(
+                    action="start",
+                    workflow=workflow,
+                    repository="example/repo",
+                    targets=["#1"],
+                )
+            )
+            planned = runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    workflow=workflow,
+                    task={
+                        "logical_id": "unit",
+                        "assignment": self.implementation_assignment(1),
+                    },
+                )
+            )
+            state = runtime.state(workflow)
+            task = state["tasks"][planned["task_id"]]
+            task["assignment"]["pull_request"] = {"state": "open", "number": 44}
+            task["status"] = "completed"
+            workflow_run.write_state(runtime.current(workflow), state)
+
+            assert runtime.task_context(planned["task_ref"])["assignment"]["pull_request"] == {
+                "state": "open",
+                "number": 44,
+            }
+            with pytest.raises(ValueError, match=r"pull_request\.initial_draft"):
+                runtime.task_manage(
+                    TaskManageRequest(
+                        action="retry",
+                        workflow=workflow,
+                        task_id=planned["task_id"],
+                    )
+                )
+
     def test_probe_timeout_payload_is_available_for_registration(self) -> None:
         def timed_out(_: Any) -> int:
             print(json.dumps({"returncode": -15, "timed_out": True}))

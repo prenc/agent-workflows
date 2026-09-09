@@ -635,6 +635,20 @@ class TestExtensionMcp:
                 assert context.structured_content["workflow"] == "gh-curate-issues"
                 assert context.structured_content["task_ref"] == task_ref
                 assert context.structured_content["assignment"]["issue"] == 12
+                assigned_artifacts = context.structured_content["run_context"]["assigned_artifacts"]
+                assert set(assigned_artifacts) == {"candidate_bundle", "issue_snapshot"}
+                assert "run_dir" not in context.structured_content["run_context"]
+                for field, path in assigned_artifacts.items():
+                    resolved = Path(path)
+                    assert resolved.is_absolute()
+                    assert resolved.is_file()
+                    assert (
+                        resolved
+                        == (
+                            runtime.current("gh-curate-issues")
+                            / context.structured_content["assignment"][field]
+                        ).resolve()
+                    )
                 assert context.structured_content["documentation"]["context7_query_budget"] == 12
                 assert (
                     context.structured_content["documentation"]["source_priority"][0]
@@ -1521,12 +1535,84 @@ class TestExtensionMcp:
                         )
                     )
 
-            existing_pull = self.implementation_assignment(1)
-            existing_pull["pull_request"] = {
+            existing_pull_fields = {
                 "state": "open",
                 "number": 44,
                 "head_sha": "b" * 40,
+                "initial_draft": True,
+                "pr_round_mode": "implementation",
+                "pr_expected_end_state": "draft",
+                "required_worker_draft": True,
             }
+            for field in (
+                "initial_draft",
+                "pr_round_mode",
+                "pr_expected_end_state",
+                "required_worker_draft",
+            ):
+                invalid_pull = self.implementation_assignment(1)
+                invalid_pull["pull_request"] = {
+                    key: value for key, value in existing_pull_fields.items() if key != field
+                }
+                with pytest.raises(ValueError, match=field):
+                    implementer.task_manage(
+                        TaskManageRequest(
+                            action="plan",
+                            workflow="gh-implement-issue",
+                            task={
+                                "logical_id": f"missing-{field}",
+                                "assignment": invalid_pull,
+                            },
+                        )
+                    )
+
+            for logical_id, field, value in (
+                ("invalid-initial-draft", "initial_draft", "false"),
+                ("invalid-required-draft", "required_worker_draft", 1),
+                ("invalid-round-mode", "pr_round_mode", "review"),
+                ("invalid-end-state", "pr_expected_end_state", "ready"),
+            ):
+                invalid_pull = self.implementation_assignment(1)
+                invalid_pull["pull_request"] = {**existing_pull_fields, field: value}
+                with pytest.raises(ValueError, match=field):
+                    implementer.task_manage(
+                        TaskManageRequest(
+                            action="plan",
+                            workflow="gh-implement-issue",
+                            task={"logical_id": logical_id, "assignment": invalid_pull},
+                        )
+                    )
+
+            for logical_id, changes, message in (
+                (
+                    "invalid-implementation-state",
+                    {"required_worker_draft": False},
+                    "implementation PR rounds",
+                ),
+                (
+                    "invalid-verification-draft",
+                    {
+                        "initial_draft": True,
+                        "pr_round_mode": "verification-only",
+                        "pr_expected_end_state": "unchanged",
+                        "required_worker_draft": False,
+                    },
+                    "verification-only PR rounds",
+                ),
+            ):
+                invalid_pull = self.implementation_assignment(1)
+                invalid_pull["pull_request"] = {**existing_pull_fields, **changes}
+                with pytest.raises(ValueError, match=message):
+                    implementer.task_manage(
+                        TaskManageRequest(
+                            action="plan",
+                            workflow="gh-implement-issue",
+                            task={"logical_id": logical_id, "assignment": invalid_pull},
+                        )
+                    )
+
+            existing_pull = self.implementation_assignment(1)
+            existing_pull["pull_request"] = existing_pull_fields
             assert (
                 implementer.task_manage(
                     TaskManageRequest(
@@ -1536,6 +1622,39 @@ class TestExtensionMcp:
                     )
                 )["task"]["assignment"]["pull_request"]["number"]
                 == 44
+            )
+
+            ready_pull = self.implementation_assignment(1)
+            ready_pull["pull_request"] = {**existing_pull_fields, "initial_draft": False}
+            ready = implementer.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    workflow="gh-implement-issue",
+                    task={"logical_id": "ready-existing-pull", "assignment": ready_pull},
+                )
+            )
+            assert ready["task"]["assignment"]["pull_request"]["initial_draft"] is False
+
+            verification_only = self.implementation_assignment(1)
+            verification_only["pull_request"] = {
+                **existing_pull_fields,
+                "initial_draft": False,
+                "pr_round_mode": "verification-only",
+                "pr_expected_end_state": "unchanged",
+                "required_worker_draft": False,
+            }
+            verified = implementer.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    workflow="gh-implement-issue",
+                    task={
+                        "logical_id": "verification-only-pull",
+                        "assignment": verification_only,
+                    },
+                )
+            )
+            assert verified["task"]["assignment"]["pull_request"]["pr_round_mode"] == (
+                "verification-only"
             )
 
             worktree = workspace / ".worktrees" / "unit"
