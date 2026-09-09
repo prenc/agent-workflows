@@ -672,6 +672,7 @@ class Installer:
             self.run(qwen, "extensions", "link", str(source), input_text="y\n")
         elif self._qwen_extension_owned(target, current):
             self.apply_notice("re-link the github-workflows extension")
+            self.run(qwen, "extensions", "uninstall", "github-workflows")
             self.run(qwen, "extensions", "link", str(source), input_text="y\n")
 
     def apply_mcp(self) -> None:
