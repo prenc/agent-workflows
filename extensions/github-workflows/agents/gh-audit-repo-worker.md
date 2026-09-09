@@ -138,9 +138,14 @@ This worker is read-only and must not create or execute any orchestration file.
   source in the established order. Do not request a query-budget extension for
   a provider that cannot accept queries.
 - Do not recommend silent research-semantic changes.
-- Treat any supplied area and applicable `area/shared-core` Markdown documents
-  as the complete interface to earlier audits. When none are supplied, continue
-  with current source and history; their absence alone is not a context gap.
+- Treat any supplied area and applicable `area/shared-core` snapshots in
+  `task_context.knowledge.documents` as the complete interface to earlier
+  audits. Consume each document's server-supplied `content` directly, record
+  its `revision`, and treat `matches_audit_sha: false` as requiring
+  current-source revalidation. Do not seek the durable backing files, which
+  remain private workflow storage. When `documents` is empty or
+  `missing_areas` is non-empty, continue with current source and history;
+  absence alone is not a context gap.
   Recheck code findings in current source. Reuse a documentation or capability
   conclusion only when every recorded version dependency matches the current
   inventory.

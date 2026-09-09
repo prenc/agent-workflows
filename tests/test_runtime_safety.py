@@ -16,7 +16,7 @@ import pytest
 from mcp import Client
 from pydantic import ValidationError
 
-from github_workflows import github_cache, workflow_run
+from github_workflows import audit_knowledge, github_cache, workflow_run
 from github_workflows.mcp_server import create_server
 from github_workflows.models import (
     AuditRecordRequest,
@@ -2784,6 +2784,119 @@ class TestRuntimeSafety:
             assert set(state["shards"]) == {"shard-new"}
             assert revised["task"]["assignment"]["shard_id"] == "shard-new"
             assert state["shards"]["shard-new"]["status"] == "pending"
+
+    def test_audit_task_context_supplies_only_relevant_area_knowledge(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-audit-knowledge-context-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.history_manage(HistoryManageRequest(action="prepare"))
+            runtime.history_manage(
+                HistoryManageRequest(
+                    action="commit",
+                    full_history_complete=True,
+                    default_sha=runtime.state("gh-audit-repo")["sha"],
+                )
+            )
+            runtime.audit_knowledge(
+                KnowledgeRequest(
+                    action="reconcile",
+                    areas=[
+                        {
+                            "area": "area/core",
+                            "description": "Core behavior.",
+                            "paths": ["src/core"],
+                        },
+                        {
+                            "area": "area/shared-core",
+                            "description": "Shared behavior.",
+                            "paths": ["src/shared"],
+                        },
+                        {
+                            "area": "area/other",
+                            "description": "Unrelated behavior.",
+                            "paths": ["src/other"],
+                        },
+                    ],
+                )
+            )
+            knowledge_root = (
+                runtime.project_dir / "workflows" / "gh-audit-repo" / "knowledge" / "areas"
+            )
+            core_path = knowledge_root / "core.md"
+            core = audit_knowledge.parse_document(core_path)
+            core["revision"] = 2
+            core["source_sha"] = "0" * 40
+            audit_knowledge.write_document(core_path, core)
+
+            planned = runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    task={
+                        "logical_id": "discover-core",
+                        "assignment": {"mode": "discover", "area": "area/core"},
+                    },
+                )
+            )
+            knowledge = runtime.task_context(planned["task_ref"])["knowledge"]
+
+            assert knowledge["requested_areas"] == ["area/core", "area/shared-core"]
+            assert knowledge["missing_areas"] == []
+            assert [document["area"] for document in knowledge["documents"]] == [
+                "area/core",
+                "area/shared-core",
+            ]
+            assert all("path" not in document for document in knowledge["documents"])
+            by_area = {document["area"]: document for document in knowledge["documents"]}
+            assert by_area["area/core"]["revision"] == 2
+            assert by_area["area/core"]["matches_audit_sha"] is False
+            assert by_area["area/core"]["content"] == {
+                "area": core["area"],
+                "findings": core["findings"],
+                "bootstrap_leads": core["bootstrap_leads"],
+            }
+            assert by_area["area/shared-core"]["matches_audit_sha"] is True
+
+            verifier = runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    task={
+                        "logical_id": "verify-core",
+                        "assignment": {
+                            "mode": "verify",
+                            "candidate": {"id": "C-core", "area": "area/core"},
+                        },
+                    },
+                )
+            )
+            verifier_knowledge = runtime.task_context(verifier["task_ref"])["knowledge"]
+            assert verifier_knowledge["requested_areas"] == [
+                "area/core",
+                "area/shared-core",
+            ]
+            assert [document["area"] for document in verifier_knowledge["documents"]] == [
+                "area/core",
+                "area/shared-core",
+            ]
+
+            missing = runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    task={
+                        "logical_id": "discover-missing",
+                        "assignment": {"mode": "discover", "area": "area/missing"},
+                    },
+                )
+            )
+            missing_knowledge = runtime.task_context(missing["task_ref"])["knowledge"]
+            assert missing_knowledge["missing_areas"] == ["area/missing"]
+            assert [document["area"] for document in missing_knowledge["documents"]] == [
+                "area/shared-core"
+            ]
+
+            core["area"]["id"] = "area/other"
+            audit_knowledge.write_document(core_path, core)
+            with pytest.raises(ValueError, match="identifies area 'area/other'"):
+                runtime.task_context(planned["task_ref"])
 
     def test_audit_task_context_supplies_bounded_compact_history(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-audit-context-") as directory:

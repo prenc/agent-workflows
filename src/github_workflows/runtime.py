@@ -2224,9 +2224,87 @@ class WorkflowRuntime:
             "records": records,
         }
 
+    def _audit_task_knowledge(
+        self, state: dict[str, Any], assignment: dict[str, Any]
+    ) -> dict[str, Any]:
+        area = assignment.get("area")
+        if (not isinstance(area, str) or not area) and assignment.get("mode") == "verify":
+            candidate = assignment.get("candidate")
+            if isinstance(candidate, dict):
+                area = candidate.get("area")
+        requested: list[str] = []
+        if isinstance(area, str) and area:
+            audit_knowledge.slug(area)
+            requested.append(area)
+            if area != "area/shared-core":
+                requested.append("area/shared-core")
+        documents: list[dict[str, Any]] = []
+        missing: list[str] = []
+        areas_root = self.project_dir / "workflows" / "gh-audit-repo" / "knowledge" / "areas"
+        if areas_root.is_symlink():
+            raise ValueError("audit knowledge areas directory must not be a symlink")
+        if not areas_root.is_dir():
+            return {
+                "requested_areas": requested,
+                "documents": documents,
+                "missing_areas": requested,
+            }
+        resolved_root = areas_root.resolve()
+        for requested_area in requested:
+            path = areas_root / f"{audit_knowledge.slug(requested_area)}.md"
+            if not path.exists():
+                missing.append(requested_area)
+                continue
+            if path.is_symlink():
+                raise ValueError(f"knowledge document for {requested_area} must not be a symlink")
+            resolved = path.resolve()
+            try:
+                resolved.relative_to(resolved_root)
+            except ValueError as error:
+                raise ValueError(
+                    f"knowledge document for {requested_area} must remain under active areas"
+                ) from error
+            if not resolved.is_file():
+                raise ValueError(f"knowledge document for {requested_area} must be a file")
+            document = audit_knowledge.parse_document(resolved)
+            document_area = document.get("area")
+            actual_area = document_area.get("id") if isinstance(document_area, dict) else None
+            if actual_area != requested_area:
+                raise ValueError(
+                    f"knowledge document for {requested_area} identifies area {actual_area!r}"
+                )
+            revision = document.get("revision")
+            if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+                raise ValueError(f"knowledge document for {requested_area} has invalid revision")
+            source_sha = document.get("source_sha")
+            if not isinstance(source_sha, str) or not source_sha:
+                raise ValueError(f"knowledge document for {requested_area} has invalid source SHA")
+            findings = document.get("findings", [])
+            bootstrap_leads = document.get("bootstrap_leads", [])
+            if not isinstance(findings, list) or not isinstance(bootstrap_leads, list):
+                raise ValueError(f"knowledge document for {requested_area} has invalid content")
+            documents.append(
+                {
+                    "area": requested_area,
+                    "revision": revision,
+                    "source_sha": source_sha,
+                    "matches_audit_sha": source_sha == state.get("sha"),
+                    "content": {
+                        "area": document_area,
+                        "findings": findings,
+                        "bootstrap_leads": bootstrap_leads,
+                    },
+                }
+            )
+        return {
+            "requested_areas": requested,
+            "documents": documents,
+            "missing_areas": missing,
+        }
+
     def task_context(self, task_ref: str, history_cursor: str | None = None) -> dict[str, Any]:
         workflow, _, _ = self._parse_task_ref(task_ref)
-        if workflow == "gh-curate-issues":
+        if workflow in {"gh-audit-repo", "gh-curate-issues"}:
             with self.lock():
                 return self._task_context(task_ref, history_cursor)
         return self._task_context(task_ref, history_cursor)
@@ -2317,6 +2395,7 @@ class WorkflowRuntime:
             result["continuation"] = continuation
         if workflow == "gh-audit-repo":
             result["audit_worktree_head"] = self._verified_audit_worktree_head(state)
+            result["knowledge"] = self._audit_task_knowledge(state, assignment)
             result["history"] = self._audit_task_history(
                 state, assignment, task_ref, history_cursor
             )
