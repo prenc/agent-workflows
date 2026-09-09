@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -692,6 +693,45 @@ class TestRuntimeSafety:
                     "candidate_id": "candidate-verdict",
                     "conclusion": "confirmed",
                 }
+            }
+
+    def test_audit_record_receipt_labels_competing_upsert_as_update(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-audit-record-race-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            real_lock = runtime.lock
+
+            @contextmanager
+            def lock_with_competing_upsert():
+                # A competing process upserts the same candidate in the window
+                # before this call acquires the runtime lock.
+                state = runtime.state("gh-audit-repo")
+                payload = {
+                    "type": "candidate-upsert",
+                    "candidate": {"id": "candidate-race", "status": "discovered"},
+                }
+                with runtime._json_file(payload) as source:
+                    runtime._invoke(
+                        workflow_run.audit_event,
+                        **runtime._base("gh-audit-repo"),
+                        expected_revision=state["revision"],
+                        input=source,
+                    )
+                with real_lock():
+                    yield
+
+            with mock.patch.object(runtime, "lock", lock_with_competing_upsert):
+                result = runtime.audit_record(
+                    AuditRecordRequest(
+                        action="candidate",
+                        candidate={"id": "candidate-race", "status": "verification-pending"},
+                    )
+                )
+
+            assert result["operation"] == "updated"
+            assert runtime.state("gh-audit-repo")["candidates"]["candidate-race"] == {
+                "id": "candidate-race",
+                "status": "verification-pending",
             }
 
     def make_runtime(self, root: Path) -> WorkflowRuntime:
