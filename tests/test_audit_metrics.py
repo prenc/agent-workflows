@@ -155,3 +155,43 @@ class TestAuditMetrics:
             text=True,
         )
         assert result.returncode == 2
+
+    def _append_agent_log_line(self, line: str) -> None:
+        log = self.project_dir / "subagents" / "task-1" / "agent-task-1.jsonl"
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+
+    def test_skips_deeply_nested_string_system_payload(self) -> None:
+        # 50000-deep nesting overflows the JSON decoder stack, so
+        # telemetry_event's json.loads branch raises RecursionError.
+        deep = "[" * 50000 + "]" * 50000
+        line = json.dumps(
+            {
+                "type": "system",
+                "subtype": "ui_telemetry",
+                "systemPayload": (
+                    '{"uiEvent": {"event.name": "qwen-code.api_response", '
+                    '"input_token_count": 4242}, "nested": ' + deep + "}"
+                ),
+            }
+        )
+        self._append_agent_log_line(line)
+        metrics = self.metrics()
+        assert metrics["telemetry"]["model_responses"] == 1
+        assert metrics["telemetry"]["input_token_count"] == 100
+        assert metrics["context7_calls"] == 2
+
+    def test_skips_deeply_nested_outer_record(self) -> None:
+        # A deeply nested outer record overflows summarize's per-line
+        # json.loads before telemetry_event is ever reached.
+        deep = "[" * 50000 + "]" * 50000
+        line = (
+            '{"type": "system", "subtype": "ui_telemetry", '
+            '"systemPayload": {"uiEvent": {"event.name": '
+            '"qwen-code.api_response"}, "nested": ' + deep + "}}"
+        )
+        self._append_agent_log_line(line)
+        metrics = self.metrics()
+        assert metrics["telemetry"]["model_responses"] == 1
+        assert metrics["telemetry"]["input_token_count"] == 100
+        assert metrics["context7_calls"] == 2
