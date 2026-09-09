@@ -84,6 +84,22 @@ WORKFLOW_REF_NAMES: dict[WorkflowName, str] = {
 REF_WORKFLOWS = {name: workflow for workflow, name in WORKFLOW_REF_NAMES.items()}
 
 
+def _extension_references_root() -> Path:
+    """Resolve the extension references directory for this install layout."""
+    package_file = Path(__file__).resolve()
+    reference_root = package_file.parents[2] / "extensions" / "github-workflows" / "references"
+    if not reference_root.is_dir():
+        raise RuntimeError(
+            "extension references root is missing: "
+            f"{reference_root}; the package loaded from {package_file} is not an "
+            "agent-workflows repository checkout, so the extension references "
+            "cannot be resolved. Install the package editable from a checkout "
+            "or run the workflow from a checkout so workers can read the "
+            "reference documents."
+        )
+    return reference_root
+
+
 class WorkflowRuntime:
     """Resolve ambient Qwen state and expose atomic workflow operations."""
 
@@ -2202,9 +2218,7 @@ class WorkflowRuntime:
             if source_kind == "program"
             else ["repository source", "official documentation", "Context7"]
         )
-        reference_root = (
-            Path(__file__).resolve().parents[2] / "extensions" / "github-workflows" / "references"
-        )
+        reference_root = _extension_references_root()
         references = {
             "runtime_policy": str(reference_root / "github-runtime-policy.md"),
             "issue_conventions": str(reference_root / "github-issue-conventions.md"),
@@ -2732,7 +2746,6 @@ class WorkflowRuntime:
             "supervisor_finish": ("supervisor-complete", None),
         }
         event_type, field = mapping[request.action]
-        before = self.state("gh-audit-repo")
         operation: str | None = None
         if field:
             raw_value = getattr(request, field)
@@ -2742,15 +2755,6 @@ class WorkflowRuntime:
                 field
             ]
             identity = value["candidate_id"] if field == "verdict" else value["id"]
-            registry = before.get(collection, {})
-            existed = identity in registry or (
-                field == "verdict"
-                and any(
-                    isinstance(record, dict) and record.get("candidate_id") == identity
-                    for record in registry.values()
-                )
-            )
-            operation = "updated" if existed else "created"
         elif request.action == "phase":
             phase = request.phase
             phase_value = phase.model_dump(mode="json", exclude={"name"}, exclude_none=True)
@@ -2774,6 +2778,19 @@ class WorkflowRuntime:
         else:
             payload = {"type": event_type}
         with self.lock():
+            # Derive the created/updated label from a state read under the lock
+            # so it matches the merge actually applied by the event below.
+            if field:
+                before = self.state("gh-audit-repo")
+                registry = before.get(collection, {})
+                existed = identity in registry or (
+                    field == "verdict"
+                    and any(
+                        isinstance(record, dict) and record.get("candidate_id") == identity
+                        for record in registry.values()
+                    )
+                )
+                operation = "updated" if existed else "created"
             result = self._event(payload)
             state = self.state("gh-audit-repo")
             return self._receipt(

@@ -18,6 +18,7 @@ from mcp import Client
 from pydantic import ValidationError
 
 from github_workflows import feedback
+from github_workflows import runtime as runtime_module
 from github_workflows.mcp_server import (
     _render_validation_error,
     _request_invocation_id,
@@ -1267,6 +1268,40 @@ class TestExtensionMcp:
             )
             with pytest.raises(ValueError, match="task_ref is stale"):
                 runtime.task_context(stale)
+
+    def test_task_context_references_fail_loudly_outside_checkout(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="github-workflows-references-") as directory:
+            root = Path(directory)
+            workspace = root / "repo"
+            workspace.mkdir()
+            runtime = WorkflowRuntime(workspace, root / "qwen-project")
+            runtime.run_manage(
+                RunManageRequest(
+                    action="start",
+                    workflow="gh-curate-issues",
+                    repository="example/repo",
+                    n=1,
+                )
+            )
+            receipt = runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    workflow="gh-curate-issues",
+                    task={
+                        "logical_id": "issue-12",
+                        "assignment": self.curation_assignment(runtime, 12),
+                    },
+                )
+            )
+            site_packages = root / "venv" / "lib" / "python3" / "site-packages"
+            (site_packages / "github_workflows").mkdir(parents=True)
+            with mock.patch.object(
+                runtime_module,
+                "__file__",
+                str(site_packages / "github_workflows" / "runtime.py"),
+            ):
+                with pytest.raises(RuntimeError, match="extension references root is missing"):
+                    runtime.task_context(receipt["task_ref"])
 
     def test_generic_scheduler_enforces_lanes_and_finish_gates(self) -> None:
         with tempfile.TemporaryDirectory(prefix="github-workflows-scheduler-") as directory:
