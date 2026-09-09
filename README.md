@@ -15,6 +15,12 @@ Install `uv`, Qwen Code, and/or Codex first, then run:
 uv run agent-workflows install
 ```
 
+The `gh` CLI is an additional prerequisite for the `gh-reassess-work`
+managed-comment update and deletion paths and for the conditional `gh api`
+capability-gap fallbacks. GitHub MCP creates comments but cannot edit or delete
+them, so a host without `gh` can create the initial managed comment but cannot
+update or delete it.
+
 The command installs the project into `.venv`, renders the user-level Codex and
 Qwen instruction files, links this checkout as the Qwen extension, links the
 Codex skills, and installs the official Polars skill for both agents.

@@ -16,6 +16,7 @@ MARKER = "<!-- codex:github-work-reassessment:v1 -->"
 LEGACY_MARKER = "<!-- codex:github-issue-reevaluation:v1 -->"
 REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 MAX_BODY_BYTES = 128 * 1024
+GH_TIMEOUT_SECONDS = 60
 
 
 class UpdateError(RuntimeError):
@@ -57,9 +58,12 @@ def run_gh(
             text=True,
             capture_output=True,
             check=False,
+            timeout=GH_TIMEOUT_SECONDS,
         )
     except FileNotFoundError as exc:
         raise UpdateError("gh is not installed or is not on PATH") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise UpdateError(f"gh api request timed out after {GH_TIMEOUT_SECONDS} seconds") from exc
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "unknown gh error"
         raise UpdateError(f"gh api request failed: {detail}")
@@ -128,6 +132,13 @@ def resolve_owned_managed_comment(
     return comment
 
 
+def update_managed_comment(
+    repo: str, comment_id: int, artifact_number: int, body: str
+) -> dict[str, Any]:
+    resolve_owned_managed_comment(repo, comment_id, artifact_number)
+    return update_comment(repo, comment_id, body)
+
+
 def delete_comment(repo: str, comment_id: int, artifact_number: int) -> dict[str, Any]:
     comment = resolve_owned_managed_comment(repo, comment_id, artifact_number)
     run_gh(["gh", "api", "--method", "DELETE", f"repos/{repo}/issues/comments/{comment_id}"])
@@ -166,12 +177,15 @@ def main() -> int:
 
     if args.body_file is None:
         raise UpdateError("--body-file is required for update")
+    if args.artifact_number is None or args.artifact_number <= 0:
+        raise UpdateError("--artifact-number must be positive for update")
     body = load_body(args.body_file)
     if args.dry_run:
+        resolve_owned_managed_comment(args.repo, args.comment_id, args.artifact_number)
         emit("would-update", comment_id=args.comment_id)
         return 0
 
-    updated = update_comment(args.repo, args.comment_id, body)
+    updated = update_managed_comment(args.repo, args.comment_id, args.artifact_number, body)
     returned_id = updated.get("id")
     if returned_id != args.comment_id:
         raise UpdateError("updated comment response has an unexpected comment ID")

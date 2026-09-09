@@ -114,7 +114,9 @@ write.
   capability-gap kind before using the fallback. It must use
   the same `GH_TOKEN`; never run `gh auth status` or `gh auth login`. An
   authentication or authorization failure suspends the run under
-  `../../references/github-mcp-suspension.md`.
+  `../../references/github-mcp-suspension.md`. The fallback requires the
+  `gh` CLI to be installed and on PATH; when it is unavailable, record the
+  unresolved capability gap as a limitation.
 - Never edit source, configuration, tests, documentation, dependencies,
   existing comments, pull requests, assignments, or branches. The only
   repository writes are private run state. GitHub writes are required label
@@ -329,7 +331,8 @@ inconclusive. Then call `issue_read` or `pull_request_read` for every plausible
 match and obtain relevant comments, commits/SHAs, native relationships, and
 resolution evidence live. Do not ingest those detail payloads into history. Use
 the full-timeline `gh api` fallback only when MCP relationships are incomplete
-or contradictory.
+or contradictory. It requires the `gh` CLI to be installed and on PATH; when
+it is unavailable, record the unresolved capability gap as a limitation.
 
 Build an area-aware GitHub history view from compact summaries, then use live full reads
 to establish root cause, paths/symbols, failure mode, requested outcome, required outcomes,
@@ -763,8 +766,9 @@ After an area's discovery and every candidate verification finish:
 
 Use MCP to verify the stored artifact. If MCP cannot provide exact body bytes,
 record the `exact-body-read` capability gap and use the narrow read-only
-`gh api` fallback once. It does not authorize any additional GitHub read or
-write surface.
+`gh api` fallback once. The fallback requires the `gh` CLI to be installed and
+on PATH; when it is unavailable, record the unresolved capability gap as a
+limitation. It does not authorize any additional GitHub read or write surface.
 
 After all known GitHub mutations, run a short second optimistic record-cache
 transaction to refresh affected issues. A cache refresh failure is reported but
