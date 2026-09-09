@@ -33,10 +33,10 @@ def telemetry_event(payload: object) -> dict[str, Any]:
     if isinstance(payload, str):
         try:
             parsed = json.loads(payload)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             try:
                 parsed = ast.literal_eval(payload)
-            except (SyntaxError, ValueError):
+            except (SyntaxError, ValueError, RecursionError):
                 return {}
     if not isinstance(parsed, dict) or not isinstance(parsed.get("uiEvent"), dict):
         return {}
@@ -127,7 +127,7 @@ def summarize(project_dir: Path, run_dir: Path, state: dict[str, Any]) -> dict[s
             for line in handle:
                 try:
                     record = json.loads(line)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, RecursionError):
                     continue
                 if record.get("type") != "system" or record.get("subtype") != "ui_telemetry":
                     continue
