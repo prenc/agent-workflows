@@ -117,6 +117,100 @@ class TestAuditKnowledge:
             (self.project_dir / "workflows/gh-audit-repo/knowledge/invalidated").glob("*.md")
         )
 
+    def test_repeated_invalidation_preserves_earlier_archives(self) -> None:
+        def add_finding(payload_name: str, title: str, path: str) -> None:
+            payload = self.root / payload_name
+            payload.write_text(
+                json.dumps(
+                    {
+                        "findings": [
+                            {
+                                "title": title,
+                                "question": f"{title} question?",
+                                "kind": "code",
+                                "method": "inspection",
+                                "observed_result": "reachable",
+                                "conclusion": "yes",
+                                "disposition": "confirmed",
+                                "evidence_paths": [path],
+                            }
+                        ]
+                    }
+                )
+            )
+            self.call(
+                "update",
+                "--area",
+                "area/core",
+                "--input",
+                str(payload),
+                "--repo-sha",
+                "current",
+                "--expected-revision",
+                "1",
+            )
+
+        def archive_documents() -> dict[str, dict]:
+            store = self.project_dir / "workflows/gh-audit-repo/knowledge/invalidated"
+            documents = {}
+            for path in sorted(store.glob("*.md")):
+                marker = json.loads(path.read_text().split("\n-->", 1)[0].split("\n", 1)[1])
+                documents[path.name] = marker
+            return documents
+
+        # Definition A (paths src/core) is active and gains a finding.
+        self.call("reconcile", "--areas", str(self.areas), "--repo-sha", "sha1")
+        add_finding("first.json", "First lifetime", "src/core")
+        # Flap to definition B: A is invalidated and archived.
+        self.write_areas("src/flap")
+        self.call("reconcile", "--areas", str(self.areas), "--repo-sha", "sha2")
+        add_finding("flap.json", "Flap lifetime", "src/flap")
+        # Restore definition A: B is invalidated and archived.
+        self.write_areas("src/core")
+        self.call("reconcile", "--areas", str(self.areas), "--repo-sha", "sha3")
+        # Flap back to B: definition A is invalidated again and must not
+        # clobber its first archive.
+        self.write_areas("src/flap")
+        result = json.loads(
+            self.call("reconcile", "--areas", str(self.areas), "--repo-sha", "sha4").stdout
+        )
+        assert result["invalidated"] == ["area/core"]
+        archives = archive_documents()
+        assert len(archives) == 3
+        by_fingerprint: dict[str, list[str]] = {}
+        for name, marker in archives.items():
+            by_fingerprint.setdefault(marker["area"]["fingerprint"], []).append(name)
+        assert len(by_fingerprint) == 2
+        for fingerprint, names in by_fingerprint.items():
+            base = f"core-{fingerprint[:12]}"
+            expected = [f"{base}.md"] + [f"{base}-{index}.md" for index in range(2, len(names) + 1)]
+            assert sorted(names) == sorted(expected)
+        surviving = [
+            finding["title"]
+            for marker in archives.values()
+            for finding in marker.get("findings", [])
+        ]
+        assert sorted(surviving) == ["First lifetime", "Flap lifetime"]
+        original = next(
+            marker
+            for marker in archives.values()
+            if any(finding["title"] == "First lifetime" for finding in marker.get("findings", []))
+        )
+        assert original["revision"] == 2
+        assert original["status"] == "invalidated"
+        assert [finding["title"] for finding in original["findings"]] == ["First lifetime"]
+        second = next(
+            marker
+            for marker in archives.values()
+            if marker["area"]["fingerprint"] == original["area"]["fingerprint"]
+            and marker is not original
+        )
+        assert second["revision"] == 1
+        assert second["findings"] == []
+        listed = json.loads(self.call("show").stdout)
+        assert listed["invalidated"] == ["area/core"]
+        assert listed["active"] == [{"area": "area/core", "findings": 0, "revision": 1}]
+
     def test_inconclusive_finding_is_rejected(self) -> None:
         self.call("reconcile", "--areas", str(self.areas), "--repo-sha", "sha1")
         update = self.root / "bad.json"
