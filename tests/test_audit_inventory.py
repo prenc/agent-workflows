@@ -109,7 +109,9 @@ class TestAuditInventory:
         assert payload["revision"] == 2
         assert payload["state_revision"] == 3
         assert payload["facts"]["git"]["available"]
-        assert payload["facts"]["git"]["probe_status"] == "succeeded"
+        assert payload["facts"]["git"]["probe_status"] == "succeeded", json.dumps(
+            payload["facts"]["git"], sort_keys=True
+        )
         assert "git version" in payload["facts"]["git"]["stdout"]
         assert payload["facts"]["missing-fixture"]["probe_status"] == "not-found"
 

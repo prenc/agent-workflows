@@ -15,8 +15,7 @@ from unittest import mock
 
 import pytest
 
-from github_workflows import audit_probe
-from github_workflows import audit_sandbox
+from github_workflows import audit_probe, audit_sandbox
 
 HELPER = Path(__file__).parents[1] / "src/github_workflows/audit_probe.py"
 
@@ -113,9 +112,9 @@ else:
 print("isolated")
 """
         result = self.invoke("--code", code)
-        assert result.returncode == 0, result.stdout + result.stderr
         summary = json.loads(result.stdout)
         artifact = json.loads(Path(summary["result"]).read_text())
+        assert result.returncode == 0, result.stdout + result.stderr + artifact["stderr_excerpt"]
         assert artifact["schema_version"] == 1
         assert artifact["probe_status"] == "succeeded"
         assert artifact["environment"]["python_source"] == "system"
@@ -437,6 +436,28 @@ print("namespaced")
         while time.monotonic() < deadline and _pids_with_marker(marker):
             time.sleep(0.1)
         assert not _pids_with_marker(marker), "SIGTERM-ignoring probe survived the timeout"
+
+    def test_sandbox_rejects_writes_outside_worktree_and_scratch(self) -> None:
+        host_path = self.project.parent / "unrelated-host-write"
+        code = f"""
+from pathlib import Path
+
+try:
+    Path({str(host_path)!r}).write_text("x")
+except OSError:
+    pass
+else:
+    raise AssertionError("unrelated host path was writable")
+
+Path.home().joinpath("scratch-write").write_text("ok")
+print("isolated")
+"""
+        result = self.invoke("--code", code)
+        assert result.returncode == 0, result.stdout + result.stderr
+        artifact = json.loads(Path(json.loads(result.stdout)["result"]).read_text())
+        assert artifact["probe_status"] == "succeeded"
+        assert "isolated" in artifact["stdout_excerpt"]
+        assert not host_path.exists()
 
 
 class TestAuditSandboxKills:

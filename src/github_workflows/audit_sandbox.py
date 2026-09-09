@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
 import re
 import resource
 import signal
 import subprocess
+import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
@@ -15,7 +17,7 @@ from pathlib import Path
 # exhausting it fails with a normal non-zero exit instead of threatening the
 # host with an out-of-memory event.
 ADDRESS_SPACE_BYTES = 8 * 1024 * 1024 * 1024
-# Host-relative RLIMIT_NPROC policy: the live process count for our real UID
+# Host-relative RLIMIT_NPROC policy: the live task count for our real UID
 # plus a margin, floored so a small audit host keeps a sane spawn budget.
 # Enforced per user namespace, so the bound is a safe superset inside the
 # probe's namespace.
@@ -24,23 +26,38 @@ NPROC_FLOOR = 256
 KILL_GRACE_SECONDS = 5
 _NICE_ADJUSTMENT = 10
 
+_LANDLOCK_CREATE_RULESET = 444
+_LANDLOCK_ADD_RULE = 445
+_LANDLOCK_RESTRICT_SELF = 446
+_LANDLOCK_RULE_PATH_BENEATH = 1
+_PR_SET_NO_NEW_PRIVS = 38
+_LANDLOCK_WRITE_ACCESS = sum(1 << bit for bit in (1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14))
+
+
+class _LandlockRulesetAttr(ctypes.Structure):
+    _fields_ = [("handled_access_fs", ctypes.c_uint64)]
+
+
+class _LandlockPathBeneathAttr(ctypes.Structure):
+    _fields_ = [("allowed_access", ctypes.c_uint64), ("parent_fd", ctypes.c_int)]
+
+
 _MOUNT_ESCAPE_RE = re.compile(r"\\([0-7]{3})")
 
 # All mounts happen inside a single forked work subshell: on this kernel
 # line PID 1 of a --pid namespace cannot fork again once its first child has
 # died, so the keeper shell (PID 1) forks exactly once and then only waits.
 # The work subshell execs the probe, so the probe itself is never PID 1 and
-# keeps ordinary signal semantics. Strict read-only binds (specific
-# audit-state roots, which must succeed) are applied first; mount-point
-# binds (which make the host filesystem read-only for everything else the
-# probe can reach) are best effort, because the root filesystem and some
-# network mounts cannot be bound read-only from a user namespace.
+# keeps ordinary signal semantics. Read-only binds protect known audit state;
+# Landlock independently denies filesystem writes outside probe scratch.
 _NAMESPACE_SCRIPT = (
     "set -eu\n"
     "(\n"
     '  worktree="$1"\n'
-    '  count="$2"\n'
-    "  shift 2\n"
+    '  scratch="$2"\n'
+    '  helper="$3"\n'
+    '  count="$4"\n'
+    "  shift 4\n"
     '  while [ "$count" -gt 0 ]; do\n'
     '    root="$1"\n'
     "    shift\n"
@@ -58,7 +75,7 @@ _NAMESPACE_SCRIPT = (
     '      && /usr/bin/mount -o remount,bind,ro "$root"; } 2>/dev/null || true\n'
     "  done\n"
     '  cd "$worktree"\n'
-    '  exec "$@"\n'
+    '  exec /usr/bin/python3 "$helper" --restrict-writes "$scratch" "$@"\n'
     ") &\n"
     "work=$!\n"
     "trap '' TERM INT\n"
@@ -119,12 +136,9 @@ def readonly_binds(
     first, so nested paths stay reachable through the topmost mount) and the
     mount points those roots live on come last (deepest first, applied
     strictly after every specific bind underneath them). Binding a mount
-    point read-only makes the host filesystem read-only for everything under
-    it that the probe can reach; on hosts where the containing mount cannot
-    be bound read-only from a user namespace (the root filesystem, some NFS
-    mounts), the mount-point bind is skipped and the specific binds alone
-    protect the audit state. The scratch's own mount is never bound so probe
-    scratch stays writable.
+    point read-only adds defense in depth for everything under it that the
+    probe can reach. Scratch's own mount is skipped because it must remain
+    writable; Landlock provides the comprehensive write boundary.
     """
     specific: list[Path] = []
     seen: set[Path] = set()
@@ -223,6 +237,7 @@ def namespace_command(
     command: Sequence[str],
     *,
     worktree: Path,
+    scratch: Path,
     readonly_binds: tuple[Sequence[Path], Sequence[Path]],
     label: str,
 ) -> list[str]:
@@ -252,6 +267,8 @@ def namespace_command(
         _NAMESPACE_SCRIPT,
         label,
         str(worktree),
+        str(scratch),
+        str(Path(__file__).resolve()),
         str(len(specific)),
         *(str(root) for root in specific),
         str(len(mountpoints)),
@@ -261,7 +278,7 @@ def namespace_command(
 
 
 def live_process_count() -> int:
-    """The live host process count that bounds a root-mapped sandbox.
+    """The live host task count that bounds a root-mapped sandbox.
 
     A ``--map-root-user`` probe is charged by the kernel against the
     initial user namespace's uid-0 (root) process count plus a small
@@ -280,7 +297,11 @@ def live_process_count() -> int:
                         fields = line.split()
                         if len(fields) > 1:
                             uid = int(fields[1])
-                            counts[uid] = counts.get(uid, 0) + 1
+                            try:
+                                tasks = sum(1 for _ in Path("/proc", entry, "task").iterdir())
+                            except OSError:
+                                tasks = 1
+                            counts[uid] = counts.get(uid, 0) + tasks
                         break
         except (OSError, ValueError):
             continue
@@ -288,7 +309,7 @@ def live_process_count() -> int:
 
 
 def nproc_bound() -> int:
-    """Host-relative RLIMIT_NPROC: live count + margin, floored.
+    """Host-relative RLIMIT_NPROC: live task count + margin, floored.
 
     The margin covers the sandbox's own in-namespace processes and count
     drift between the bound computation and the fork; the floor keeps a
@@ -325,6 +346,63 @@ def make_limits(
         os.nice(_NICE_ADJUSTMENT)
 
     return limits
+
+
+def restrict_writes_to(root: Path) -> None:
+    """Use Landlock to deny filesystem mutations outside ``root``."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    ruleset_attr = _LandlockRulesetAttr(_LANDLOCK_WRITE_ACCESS)
+    ruleset_fd = libc.syscall(
+        _LANDLOCK_CREATE_RULESET,
+        ctypes.byref(ruleset_attr),
+        ctypes.sizeof(ruleset_attr),
+        0,
+    )
+    if ruleset_fd < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    path_fds: list[int] = []
+    try:
+        for path, access in ((root, _LANDLOCK_WRITE_ACCESS), (Path("/dev/null"), 1 << 1)):
+            path_fd = os.open(path, os.O_PATH | os.O_CLOEXEC)
+            path_fds.append(path_fd)
+            path_attr = _LandlockPathBeneathAttr(access, path_fd)
+            if (
+                libc.syscall(
+                    _LANDLOCK_ADD_RULE,
+                    ruleset_fd,
+                    _LANDLOCK_RULE_PATH_BENEATH,
+                    ctypes.byref(path_attr),
+                    0,
+                )
+                < 0
+            ):
+                error = ctypes.get_errno()
+                raise OSError(error, os.strerror(error))
+        if libc.prctl(_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+        if libc.syscall(_LANDLOCK_RESTRICT_SELF, ruleset_fd, 0) < 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+    finally:
+        for path_fd in path_fds:
+            os.close(path_fd)
+        os.close(ruleset_fd)
+
+
+def _main() -> int:
+    if len(sys.argv) < 4 or sys.argv[1] != "--restrict-writes":
+        raise SystemExit("usage: audit_sandbox.py --restrict-writes ROOT COMMAND [ARG ...]")
+    restrict_writes_to(Path(sys.argv[2]))
+    # The command was constructed from validated probe inputs by the parent;
+    # exec is required so the Landlock policy applies to the actual probe.
+    os.execvpe(sys.argv[3], sys.argv[3:], os.environ)  # noqa: S606
+    return 127
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
 
 
 def kill_process_group(process: subprocess.Popen, signum: int) -> None:

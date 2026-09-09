@@ -384,6 +384,7 @@ def probe_program(
             command = audit_sandbox.namespace_command(
                 [str(executable), *arguments],
                 worktree=worktree,
+                scratch=temporary_path,
                 readonly_binds=audit_sandbox.readonly_binds(
                     worktree,
                     probe_readonly_roots(worktree, run_dir, executable, readonly_root),
