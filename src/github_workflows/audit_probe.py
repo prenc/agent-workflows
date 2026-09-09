@@ -327,6 +327,7 @@ def run_probe(args: argparse.Namespace) -> int:
         command = audit_sandbox.namespace_command(
             inner_command,
             worktree=worktree,
+            scratch=temporary_path,
             readonly_binds=audit_sandbox.readonly_binds(
                 worktree,
                 probe_readonly_roots(worktree, python.parent.parent, python, run_dir),
@@ -348,12 +349,8 @@ def run_probe(args: argparse.Namespace) -> int:
             returncode, timed_out = audit_sandbox.wait_bounded(process, WALL_SECONDS)
         after = git_output(worktree, "status", "--porcelain=v1", "--untracked-files=all")
         duration = time.monotonic() - started
-        stdout_excerpt, stdout_truncated = audit_sandbox.read_bounded(
-            stdout_path, EXCERPT_BYTES
-        )
-        stderr_excerpt, stderr_truncated = audit_sandbox.read_bounded(
-            stderr_path, EXCERPT_BYTES
-        )
+        stdout_excerpt, stdout_truncated = audit_sandbox.read_bounded(stdout_path, EXCERPT_BYTES)
+        stderr_excerpt, stderr_truncated = audit_sandbox.read_bounded(stderr_path, EXCERPT_BYTES)
         if before != after:
             probe_status = "worktree-modified"
         elif timed_out:
