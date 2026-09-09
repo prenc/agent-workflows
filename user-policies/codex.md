@@ -114,7 +114,15 @@ statuses, or status rollups, and never run `gh pr checks`. Determine readiness
 from the implementation, proportionate local validation, review state already
 present in ordinary PR metadata, and the confirmed pushed SHA.
 
-## Secrets
+## Confidential Data and Secrets
+
+Treat a `data/` directory at the root of any repository as confidential. After
+detecting one, acknowledge once per conversation that its contents will remain
+unread. Never read, open, inspect, search within, summarize, print, copy, or
+modify file contents under it. List file and directory names only when needed
+to understand structure. If contents are required, request a sanitized sample
+outside `data/`. A repository may impose a stricter prohibition, including on
+listing names.
 
 Never access `.envrc`. Do not access other files that commonly contain secrets
 unless explicitly instructed, including `.env`, `.env.*`, `secrets.*`,

@@ -4,12 +4,15 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from github_workflows import cli, installation
+
+ROOT = Path(__file__).parents[1]
 
 
 def arguments(**overrides: object) -> argparse.Namespace:
@@ -312,6 +315,25 @@ def test_matching_user_policy_files_are_adopted_as_managed_files(
     assert not qwen_target.is_symlink()
     assert codex_target.read_text().startswith(installation.USER_POLICY_MARKER)
     assert qwen_target.read_text().startswith(installation.USER_POLICY_MARKER)
+
+
+def test_data_confidentiality_rule_is_codex_only() -> None:
+    rule = (
+        "Treat a `data/` directory at the root of any repository as confidential. "
+        "After detecting one, acknowledge once per conversation that its contents "
+        "will remain unread. Never read, open, inspect, search within, summarize, "
+        "print, copy, or modify file contents under it. List file and directory "
+        "names only when needed to understand structure. If contents are required, "
+        "request a sanitized sample outside `data/`. A repository may impose a "
+        "stricter prohibition, including on listing names."
+    )
+    codex = (ROOT / "user-policies" / "codex.md").read_text(encoding="utf-8")
+    qwen = (ROOT / "user-policies" / "qwen.md").read_text(encoding="utf-8")
+
+    assert "## Confidential Data and Secrets" in codex
+    assert rule in re.sub(r"\s+", " ", codex)
+    assert "## Confidential Data and Secrets" not in qwen
+    assert rule not in re.sub(r"\s+", " ", qwen)
 
 
 def test_remote_compute_policy_is_only_rendered_for_remote_role(repository: Path) -> None:
