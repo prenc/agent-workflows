@@ -562,7 +562,7 @@ def _public_input_schema(name: str, schema: dict[str, Any]) -> dict[str, Any]:
                     },
                     {
                         "required": ["linked"],
-                        "properties": {"linked": {"type": "array", "minItems": 1}},
+                        "properties": {"linked": {"type": "array", "minItems": 1, "maxItems": 100}},
                     },
                 ]
             }
