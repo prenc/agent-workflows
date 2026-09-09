@@ -26,6 +26,7 @@ from github_workflows.mcp_server import (
 )
 from github_workflows.models import (
     AuditRecordRequest,
+    InventoryProgramRequest,
     KnowledgeRequest,
     RunManageRequest,
     TaskManageRequest,
@@ -109,6 +110,54 @@ class TestExtensionMcp:
         assert first == repeated
         assert first != later
         assert _request_invocation_id(None) is None
+
+    def test_inventory_program_request_bounds_and_probe_contract(self) -> None:
+        over_cap = [{"name": "python"} for _ in range(101)]
+        with pytest.raises(ValidationError) as validation:
+            InventoryProgramRequest.model_validate({"action": "program", "programs": over_cap})
+        issues = _validation_issues(validation.value, {"action": "program"})
+        assert [(issue.field, issue.requirement) for issue in issues] == [
+            ("programs", "must contain at most 100 item(s)")
+        ]
+
+        at_cap = InventoryProgramRequest.model_validate(
+            {"action": "program", "programs": [{"name": "python"} for _ in range(100)]}
+        )
+        assert len(at_cap.programs) == 100
+
+        with pytest.raises(ValidationError) as validation:
+            InventoryProgramRequest.model_validate(
+                {"action": "program", "programs": [{"name": "bad name"}]}
+            )
+        issues = _validation_issues(validation.value, {"action": "program"})
+        assert [(issue.field, issue.kind) for issue in issues] == [
+            ("programs[].name", "string_pattern_mismatch")
+        ]
+
+        with pytest.raises(ValidationError) as validation:
+            InventoryProgramRequest.model_validate(
+                {
+                    "action": "program",
+                    "programs": [{"name": "python", "arguments": ["--rc-file"]}],
+                }
+            )
+        issues = _validation_issues(validation.value, {"action": "program"})
+        assert [(issue.field, issue.kind) for issue in issues] == [
+            ("programs[].arguments", "value_error")
+        ]
+        assert issues[0].requirement == "program probes accept only version/help arguments"
+
+        with pytest.raises(ValidationError) as validation:
+            InventoryProgramRequest.model_validate(
+                {
+                    "action": "program",
+                    "programs": [{"name": "python", "arguments": ["--version"] * 101}],
+                }
+            )
+        issues = _validation_issues(validation.value, {"action": "program"})
+        assert [(issue.field, issue.requirement) for issue in issues] == [
+            ("programs[].arguments", "must contain at most 100 item(s)")
+        ]
 
     async def test_execution_blocked_retry_uses_mcp_invocation_metadata(self) -> None:
         with tempfile.TemporaryDirectory(prefix="github-workflows-invocation-") as directory:
@@ -377,6 +426,7 @@ class TestExtensionMcp:
                 linked_property = query_schema["properties"]["linked"]
                 linked_record = query_schema["$defs"]["LinkedRecord"]
                 assert linked_property["items"]["$ref"] == "#/$defs/LinkedRecord"
+                assert linked_property["maxItems"] == 100
                 assert linked_record["required"] == ["kind", "number"]
                 assert linked_record["additionalProperties"] is False
                 assert linked_record["properties"]["kind"]["enum"] == ["issue", "pull"]
@@ -412,6 +462,13 @@ class TestExtensionMcp:
                 assert conditional_required["audit_publish"]["begin"] == {"operation"}
                 assert conditional_required["audit_publish"]["finish"] == {"receipt"}
                 assert conditional_required["audit_publish"]["failed"] == {"error"}
+                inventory_program_then = next(
+                    condition["then"]
+                    for condition in tools["audit_inventory"].input_schema["allOf"]
+                    if condition.get("if", {}).get("properties", {}).get("action", {}).get("const")
+                    == "program"
+                )
+                assert inventory_program_then["properties"]["programs"]["maxItems"] == 100
                 implementation_start = next(
                     condition["then"]
                     for condition in tools["run_manage"].input_schema["allOf"]
@@ -714,7 +771,15 @@ class TestExtensionMcp:
             ("history_query", {}),
             ("history_query", {"state": None}),
             ("history_query", {"state": "open", "limit": 0}),
+            (
+                "history_query",
+                {"linked": [{"kind": "issue", "number": n} for n in range(101)]},
+            ),
             ("audit_inventory", {"action": "status", "facts": {}}),
+            (
+                "audit_inventory",
+                {"action": "program", "programs": [{"name": "python"} for _ in range(101)]},
+            ),
             ("audit_knowledge", {"action": "show", "findings": []}),
             (
                 "audit_probe",

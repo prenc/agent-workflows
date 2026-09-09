@@ -87,6 +87,9 @@ RECORDS_DB = "records-v1.sqlite3"
 RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 TOKEN_RE = re.compile(r"[A-Za-z0-9_]{2,}")
 RECORDS_INPUT_BYTES = 10 * 1024 * 1024
+# (kind, number) pairs per batched linked lookup; a CLI-linked list is unbounded,
+# so the chunk keeps every statement well below SQLite's bind-parameter limit.
+LINKED_QUERY_CHUNK = 400
 
 
 def utc_now() -> dt.datetime:
@@ -611,6 +614,23 @@ def linked_key_list(path: Path | None) -> list[tuple[str, int]]:
     return result
 
 
+def linked_rows(
+    connection: sqlite3.Connection, keys: list[tuple[str, int]]
+) -> dict[tuple[str, int], sqlite3.Row]:
+    """Return stored linked rows through bounded batched primary-key lookups."""
+    found: dict[tuple[str, int], sqlite3.Row] = {}
+    for start in range(0, len(keys), LINKED_QUERY_CHUNK):
+        batch = keys[start : start + LINKED_QUERY_CHUNK]
+        row_values = ", ".join("(?, ?)" for _ in batch)
+        parameters: list[Any] = [value for key in batch for value in key]
+        for row in connection.execute(
+            f"SELECT * FROM records WHERE (kind, number) IN ({row_values})",  # noqa: S608 - placeholders only
+            parameters,
+        ):
+            found[(row["kind"], row["number"])] = row
+    return found
+
+
 def event_time(row: sqlite3.Row) -> dt.datetime | None:
     if row["kind"] == "pull" and row["merged_at"]:
         return parse_time(row["merged_at"])
@@ -644,16 +664,16 @@ def query_records(args: argparse.Namespace) -> None:
         ordered_links.sort()
     text = args.terms or (args.terms_file.read_text() if args.terms_file else "")
     match = safe_match_query(text)
+    terms_blank = not text.strip()
     with connect_readonly(args.db) as connection:
         validate(connection, args.repo, "records")
         target = offset + args.limit + 1 if args.limit else None
         selected: dict[tuple[str, int], sqlite3.Row] = {}
         linked_selected: set[tuple[str, int]] = set()
+        linked_found = linked_rows(connection, ordered_links)
         for kind, number in ordered_links:
             key = (kind, number)
-            row = connection.execute(
-                "SELECT * FROM records WHERE kind=? AND number=?", key
-            ).fetchone()
+            row = linked_found.get(key)
             if row and (not args.kind or row["kind"] == args.kind):
                 linked_selected.add(key)
                 if target is None or len(selected) < target:
@@ -678,8 +698,13 @@ def query_records(args: argparse.Namespace) -> None:
                     "WHERE records_fts MATCH ? ORDER BY bm25(records_fts), r.kind, r.number",
                     (f"{{title labels}} : ({match})",),
                 )
-            else:
+            elif terms_blank:
                 rows = connection.execute("SELECT * FROM records ORDER BY kind, number")
+            else:
+                # Non-blank terms with no usable FTS token match nothing, so the
+                # term path contributes an empty record set (the no-match contract)
+                # instead of silently returning the unfiltered listing.
+                rows = ()
             collect(rows)
         if fill and match and (target is None or len(selected) < target):
             collect(connection.execute("SELECT * FROM records ORDER BY kind, number"))

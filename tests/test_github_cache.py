@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import shutil
@@ -9,7 +10,12 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import pytest
+from pydantic import ValidationError
+
+import github_workflows.github_cache as github_cache_module
 from github_workflows.github_cache import RECORDS_INPUT_BYTES
+from github_workflows.models import HistoryQueryRequest
 
 SCRIPT = Path(__file__).parents[1] / "src/github_workflows/github_cache.py"
 REPO = "example/private-repo"
@@ -557,3 +563,138 @@ class TestGithubCache:
         )
         assert outputs[0]["has_more"] is True
         assert outputs[0]["linked_dropped"] == 5
+
+
+class TestQueryBounds:
+    """Model-level and statement-level bounds for history query selectors."""
+
+    def setup_method(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.project_dir = Path(self.temp.name) / "qwen-project"
+
+    def teardown_method(self) -> None:
+        self.temp.cleanup()
+
+    def seed_records(self, records: list[tuple[int, str, str]]) -> Path:
+        repo_dir = github_cache_module.repo_dir(self.project_dir, REPO)
+        github_cache_module.secure_directory(repo_dir)
+        live = github_cache_module.live_path(repo_dir, "records")
+        with github_cache_module.connect(live) as connection:
+            github_cache_module.initialize_records(connection, REPO)
+            for number, title, state in records:
+                item = github_cache_module.normalize_record(
+                    {"number": number, "state": state, "title": title},
+                    "issue",
+                    "test",
+                    "2026-08-30T00:00:00Z",
+                )
+                github_cache_module.upsert_record(connection, item)
+        github_cache_module.secure_file(live)
+        return live
+
+    def query(
+        self,
+        live: Path,
+        linked: list[dict[str, Any]] | None = None,
+        terms: str | None = None,
+    ) -> tuple[dict[str, Any], list[str]]:
+        """Run query_records in-process, returning the result and traced statements."""
+        linked_path: Path | None = None
+        if linked is not None:
+            linked_path = Path(self.temp.name) / "linked.json"
+            linked_path.write_text(json.dumps(linked))
+        output = Path(self.temp.name) / "query-result.json"
+        statements: list[str] = []
+        original = github_cache_module.connect_readonly
+
+        def counting(path: Path) -> sqlite3.Connection:
+            connection = original(path)
+            connection.set_trace_callback(statements.append)
+            return connection
+
+        args = argparse.Namespace(
+            cutoff=None,
+            linked=linked_path,
+            offset=0,
+            fill=False,
+            terms=terms,
+            terms_file=None,
+            db=live,
+            repo=REPO,
+            kind=None,
+            state=None,
+            limit=0,
+            output=output,
+        )
+        try:
+            github_cache_module.connect_readonly = counting
+            github_cache_module.query_records(args)
+        finally:
+            github_cache_module.connect_readonly = original
+        return json.loads(output.read_text()), statements
+
+    @staticmethod
+    def linked_selects(statements: list[str]) -> list[str]:
+        assert not any("kind=? AND number=?" in statement for statement in statements)
+        return [statement for statement in statements if "(kind, number) IN" in statement]
+
+    def test_over_cap_linked_list_is_rejected_at_model_level(self) -> None:
+        over_cap = [{"kind": "issue", "number": n} for n in range(1, 102)]
+        with pytest.raises(ValidationError) as validation:
+            HistoryQueryRequest(linked=over_cap)
+        errors = validation.value.errors(include_url=False)
+        assert errors[0]["loc"] == ("linked",)
+        assert errors[0]["type"] == "too_long"
+        at_cap = HistoryQueryRequest(linked=[{"kind": "issue", "number": n} for n in range(1, 101)])
+        assert len(at_cap.linked) == 100
+
+    def test_large_linked_list_does_not_execute_one_select_per_key(self) -> None:
+        live = self.seed_records([(n, f"Record {n}", "open") for n in range(1, 11)])
+        phantom = [{"kind": "issue", "number": n} for n in range(1000, 3000)]
+        result, statements = self.query(live, linked=phantom, terms="nomatchtoken")
+        selects = self.linked_selects(statements)
+        assert selects
+        assert len(selects) < len(phantom)
+        assert (
+            len(selects)
+            <= (len(phantom) + github_cache_module.LINKED_QUERY_CHUNK - 1)
+            // github_cache_module.LINKED_QUERY_CHUNK
+        )
+        assert result["records"] == []
+        assert result["linked_dropped"] == 0
+
+    def test_large_valid_linked_list_returns_linked_records(self) -> None:
+        live = self.seed_records([(n, f"Record {n}", "open") for n in range(1, 11)])
+        links = [{"kind": "issue", "number": n} for n in range(1000, 3000)]
+        present = [{"kind": "issue", "number": number} for number in (7, 2, 5)]
+        result, statements = self.query(live, linked=links + present, terms="nomatchtoken")
+        selects = self.linked_selects(statements)
+        assert (
+            len(selects)
+            <= (len(links + present) + github_cache_module.LINKED_QUERY_CHUNK - 1)
+            // github_cache_module.LINKED_QUERY_CHUNK
+        )
+        assert [(record["kind"], record["number"]) for record in result["records"]] == [
+            ("issue", 2),
+            ("issue", 5),
+            ("issue", 7),
+        ]
+        assert result["linked_dropped"] == 0
+
+    def test_no_token_terms_yield_empty_record_set(self) -> None:
+        live = self.seed_records([(n, f"Record {n}", "open") for n in range(1, 4)])
+        result, _ = self.query(live, terms="a! b?")
+        assert result["records"] == []
+        assert result["has_more"] is False
+
+    def test_no_token_terms_preserve_linked_record_selection(self) -> None:
+        live = self.seed_records([(n, f"Record {n}", "open") for n in range(1, 4)])
+        result, _ = self.query(live, terms="a! b?", linked=[{"kind": "issue", "number": 2}])
+        assert [(record["kind"], record["number"]) for record in result["records"]] == [
+            ("issue", 2)
+        ]
+
+    def test_absent_terms_still_yield_unfiltered_listing(self) -> None:
+        live = self.seed_records([(n, f"Record {n}", "open") for n in range(1, 4)])
+        result, _ = self.query(live)
+        assert [record["number"] for record in result["records"]] == [1, 2, 3]

@@ -14,6 +14,8 @@ from pydantic import (
     model_validator,
 )
 
+from github_workflows.audit_inventory import ALLOWED_ARGUMENTS, NAME_RE
+
 WorkflowName = Literal["gh-audit-repo", "gh-curate-issues", "gh-implement-issue"]
 NON_BLANK_PATTERN = r"\S"
 FULL_SHA_PATTERN = r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
@@ -22,6 +24,8 @@ REPOSITORY_PATTERN = r"^[^/\s]+/[^/\s]+$"
 # never the ".." parent component (pydantic patterns cannot use lookaround).
 _SOURCE_ROOT_COMPONENT = r"[^\s/\x00]{3,}|[^\s/\x00.][^\s/\x00]|\.[^\s/\x00.]|[^\s/\x00]"
 RELATIVE_SOURCE_ROOT_PATTERN = rf"^({_SOURCE_ROOT_COMPONENT})(/({_SOURCE_ROOT_COMPONENT}))*$"
+# Anchored because pydantic applies pattern metadata with JSON Schema search semantics.
+PROGRAM_NAME_PATTERN = rf"^{NAME_RE.pattern}$"
 
 type NonBlankString = Annotated[str, Field(pattern=NON_BLANK_PATTERN)]
 type RelativeSourceRoot = Annotated[
@@ -428,7 +432,7 @@ class HistoryQueryRequest(StrictRequest):
     kind: Literal["issue", "pull"] | None = None
     state: Literal["open", "closed"] | None = None
     cutoff: NonBlankString | None = None
-    linked: list[LinkedRecord] = Field(default_factory=list)
+    linked: list[LinkedRecord] = Field(default_factory=list, max_length=100)
     limit: HistoryLimit = 25
 
 
@@ -437,14 +441,21 @@ class InventorySimpleRequest(StrictRequest):
 
 
 class ProgramProbe(StrictRequest):
-    name: NonBlankString
-    arguments: list[str] = Field(default_factory=list)
+    name: Annotated[str, Field(pattern=PROGRAM_NAME_PATTERN)]
+    arguments: list[str] = Field(default_factory=list, max_length=100)
     request_id: NonBlankString | None = None
+
+    @field_validator("arguments")
+    @classmethod
+    def allowed_probe_arguments(cls, value: list[str]) -> list[str]:
+        if any(argument not in ALLOWED_ARGUMENTS for argument in value):
+            raise ValueError("program probes accept only version/help arguments")
+        return value
 
 
 class InventoryProgramRequest(StrictRequest):
     action: Literal["program"]
-    programs: list[ProgramProbe] = Field(min_length=1)
+    programs: list[ProgramProbe] = Field(min_length=1, max_length=100)
 
 
 class InventoryDeclaredRequest(StrictRequest):
