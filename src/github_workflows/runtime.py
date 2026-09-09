@@ -2430,9 +2430,6 @@ class WorkflowRuntime:
                 synced_at=request.fetched_at or workflow_run.utc_now(),
                 default_sha=default_sha,
                 full_history_complete=full_history_complete,
-                repo_sha=None,
-                keep_shas=5,
-                retention_days=90,
             )
             history = {
                 **state.get("history", {}),
