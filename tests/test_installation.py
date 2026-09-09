@@ -619,3 +619,278 @@ def test_keyboard_interrupt_is_a_silent_cli_cancellation(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == ""
+
+
+@pytest.mark.parametrize("entrypoint", ["install", "workflow"])
+def test_subprocess_failure_is_a_clean_cli_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    entrypoint: str,
+) -> None:
+    class Parser:
+        @staticmethod
+        def parse_args() -> argparse.Namespace:
+            return argparse.Namespace(command=entrypoint)
+
+    monkeypatch.setattr(cli, "build_parser", Parser)
+
+    def fail(_args: argparse.Namespace) -> int:
+        raise subprocess.CalledProcessError(
+            1,
+            ["uv", "pip", "install", "pkg"],
+            output="partial stdout",
+            stderr="simulated uv failure: network unreachable",
+        )
+
+    if entrypoint == "install":
+        monkeypatch.setattr(cli, "install_from_args", fail)
+    else:
+        monkeypatch.setattr(cli, "run_workflow", fail)
+
+    assert cli.main() == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "uv pip install pkg" in captured.err
+    assert "simulated uv failure: network unreachable" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_subprocess_timeout_is_a_clean_cli_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class Parser:
+        @staticmethod
+        def parse_args() -> argparse.Namespace:
+            return argparse.Namespace(command="install")
+
+    monkeypatch.setattr(cli, "build_parser", Parser)
+
+    def stall(_args: argparse.Namespace) -> int:
+        raise subprocess.TimeoutExpired(["uv", "venv", "/checkout/.venv"], 1800.0)
+
+    monkeypatch.setattr(cli, "install_from_args", stall)
+
+    assert cli.main() == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "timed out" in captured.err
+    assert "uv venv /checkout/.venv" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_installer_run_binds_an_explicit_timeout(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(kwargs)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(installation.subprocess, "run", fake_run)
+
+    installer = installation.Installer(arguments(), repository)
+    installer.run("echo", "hi")
+
+    assert calls[0]["timeout"] == installation.INSTALL_STEP_TIMEOUT
+
+
+def test_installer_run_timeout_raises_typed_error(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(installation.subprocess, "run", fake_run)
+
+    installer = installation.Installer(arguments(), repository)
+    with pytest.raises(subprocess.TimeoutExpired) as excinfo:
+        installer.run("uv", "venv", "/checkout/.venv")
+
+    assert list(excinfo.value.cmd) == ["uv", "venv", "/checkout/.venv"]
+
+
+def test_codex_mcp_inspection_timeout_degrades_to_skip_warning(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = installation.Installer(arguments(install_mcp=True), repository)
+    installer.home = repository / "home"
+    monkeypatch.setattr(
+        installation, "command_path", lambda name: "/bin/codex" if name == "codex" else None
+    )
+    monkeypatch.delenv("QWEN_HOME", raising=False)
+    seen_timeouts: list[object] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        seen_timeouts.append(kwargs.get("timeout"))
+        raise subprocess.TimeoutExpired(command, kwargs.get("timeout"))
+
+    monkeypatch.setattr(installation.subprocess, "run", fake_run)
+
+    installer.plan_mcp()
+
+    assert seen_timeouts
+    assert all(timeout == installation.MCP_INSPECTION_TIMEOUT for timeout in seen_timeouts)
+    assert ("codex", "github") not in installer.mcp_changes
+    assert ("codex", "context7") not in installer.mcp_changes
+    assert any("could not inspect the Codex" in warning for warning in installer.warnings)
+
+
+@pytest.mark.parametrize("old_exists", [True, False])
+def test_moved_codex_skill_link_is_relinked(
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    old_exists: bool,
+) -> None:
+    monkeypatch.setattr(installation, "command_path", lambda _name: "/bin/tool")
+    home = repository / "home"
+    new_source = repository / "codex" / "skills" / "gh-audit-repo"
+    old_target = repository / "old-checkout" / "codex" / "skills" / "gh-audit-repo"
+    if old_exists:
+        old_target.mkdir(parents=True)
+    link = home / ".codex" / "skills" / "gh-audit-repo"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(old_target)
+
+    installer = installation.Installer(arguments(), repository)
+    installer.home = home
+    installer.plan_codex()
+    assert installer.changes == ["link skill gh-audit-repo"]
+    assert installer.warnings == []
+    installer.apply_codex()
+    assert link.is_symlink()
+    assert link.resolve() == new_source.resolve()
+
+    again = installation.Installer(arguments(verbose=True), repository)
+    again.home = home
+    again.plan_codex()
+    assert again.changes == []
+    assert "Codex skill gh-audit-repo is current" in capsys.readouterr().out
+
+
+def test_foreign_codex_skill_link_is_still_refused(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(installation, "command_path", lambda _name: "/bin/tool")
+    home = repository / "home"
+    foreign = repository / "elsewhere" / "skills" / "gh-audit-repo"
+    foreign.mkdir(parents=True)
+    target = home / ".codex" / "skills" / "gh-audit-repo"
+    target.parent.mkdir(parents=True)
+    target.symlink_to(foreign)
+
+    installer = installation.Installer(arguments(), repository)
+    installer.home = home
+    installer.plan_codex()
+
+    assert installer.changes == []
+    assert installer.warnings == [f"refusing unmanaged Codex skill: {target}"]
+
+
+def test_moved_agent_feedback_link_is_relinked(
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    old_exec = repository / "old-checkout" / ".venv" / "bin" / "agent-feedback"
+    old_exec.parent.mkdir(parents=True)
+    old_exec.touch()
+    new_source = repository / ".venv" / "bin" / "agent-feedback"
+    new_source.parent.mkdir(parents=True)
+    new_source.touch()
+    home = repository / "home"
+    link = home / ".local" / "bin" / "agent-feedback"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(old_exec)
+    monkeypatch.setenv("PATH", str(home / ".local" / "bin"))
+
+    installer = installation.Installer(arguments(), repository)
+    installer.home = home
+    installer.plan_agent_command()  # must offer re-linking, not abort
+    assert installer.changes == ["link the agent-feedback command"]
+    assert installer.warnings == []
+    installer.apply_agent_command()
+    assert link.is_symlink()
+    assert link.resolve() == new_source.resolve()
+
+    again = installation.Installer(arguments(verbose=True), repository)
+    again.home = home
+    again.plan_agent_command()
+    assert again.changes == []
+    assert "Agent feedback command is current" in capsys.readouterr().out
+
+
+def test_moved_qwen_extension_is_relinked(
+    repository: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        installation, "command_path", lambda name: "/bin/qwen" if name == "qwen" else None
+    )
+    home = repository / "home"
+    target = home / ".qwen" / "extensions" / "github-workflows"
+    target.mkdir(parents=True)
+    old_ext = repository / "old-checkout" / "extensions" / "github-workflows"
+    old_ext.mkdir(parents=True)
+    (target / ".qwen-extension-install.json").write_text(
+        json.dumps({"type": "link", "source": str(old_ext)})
+    )
+    new_source = repository / "extensions" / "github-workflows"
+    commands: list[tuple[str, ...]] = []
+
+    def fake_run(*command: str, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    installer = installation.Installer(arguments(), repository)
+    installer.home = home
+    monkeypatch.setattr(installer, "run", fake_run)
+
+    installer.plan_qwen()
+    assert installer.changes == ["link the github-workflows extension"]
+    installer.apply_qwen()
+    assert commands == [("/bin/qwen", "extensions", "link", str(new_source))]
+
+    (target / ".qwen-extension-install.json").write_text(
+        json.dumps({"type": "link", "source": str(new_source)})
+    )
+    again = installation.Installer(arguments(verbose=True), repository)
+    again.home = home
+    again.plan_qwen()
+    assert again.changes == []
+    assert "Qwen extension is current" in capsys.readouterr().out
+
+
+def test_moved_polars_links_are_reinstalled(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old_source = (
+        repository / "old-cache" / "agent-workflows" / "upstream" / "polars-skills" / "polars"
+    )
+    old_source.mkdir(parents=True)
+    home = repository / "home"
+    for agent in ("codex", "qwen"):
+        target = home / f".{agent}" / "skills" / "polars"
+        target.parent.mkdir(parents=True)
+        target.symlink_to(old_source)
+    cache = repository / "cache"
+    new_source = cache / "agent-workflows" / "upstream" / "polars-skills" / "polars"
+    new_source.mkdir(parents=True)
+
+    installer = installation.Installer(arguments(), repository)
+    installer.home = home
+    installer.cache = cache
+
+    def fake_run(*command: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(installer, "run", fake_run)
+
+    installer.plan_polars()
+    assert installer.changes == ["install the official Polars skill for Codex and Qwen"]
+    installer.apply_polars()
+    for agent in ("codex", "qwen"):
+        target = home / f".{agent}" / "skills" / "polars"
+        assert target.is_symlink()
+        assert target.resolve() == new_source.resolve()

@@ -19,6 +19,21 @@ MCP_SERVERS = {
     "context7": "https://mcp.context7.com/mcp",
 }
 
+# Upper bound (seconds) for a single installer subprocess step. Steps may involve
+# network operations (git clone, uv pip install) that are slow but must not hang
+# indefinitely; a stalled client CLI is cut off at this bound.
+INSTALL_STEP_TIMEOUT = 1800.0
+# Upper bound (seconds) for the Codex MCP inspection, a local command that should
+# return quickly. On expiry the inspection degrades to the skip warning.
+MCP_INSPECTION_TIMEOUT = 60.0
+
+# Trailing path components identifying the installer's own link targets, so a link
+# left behind by a moved checkout is re-linked rather than refused as unmanaged.
+_CODEX_SKILL_ROOT = ("codex", "skills")
+_QWEN_EXTENSION_SUFFIX = ("extensions", "github-workflows")
+_POLARS_SKILL_SUFFIX = ("agent-workflows", "upstream", "polars-skills", "polars")
+_AGENT_COMMAND_SUFFIX = (".venv", "bin", "agent-feedback")
+
 
 def strip_json_comments(value: str) -> str:
     """Remove JavaScript comments while preserving strings and line numbers."""
@@ -154,7 +169,32 @@ class Installer:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            timeout=INSTALL_STEP_TIMEOUT,
         )
+
+    @staticmethod
+    def _link_points_into(target: Path, suffix: tuple[str, ...]) -> bool:
+        """Return True if target is a symlink whose stored path ends with suffix."""
+        if not target.is_symlink():
+            return False
+        parts = target.resolve(strict=False).parts
+        if len(parts) < len(suffix):
+            return False
+        return parts[-len(suffix) :] == suffix
+
+    @staticmethod
+    def _path_ends_with(path: Path, suffix: tuple[str, ...]) -> bool:
+        """Return True if the normalized path ends with the suffix components."""
+        parts = path.parts
+        if len(parts) < len(suffix):
+            return False
+        return parts[-len(suffix) :] == suffix
+
+    def _qwen_extension_owned(self, target: Path, current: Path | None) -> bool:
+        """Return True if the extension target is this tool's own prior link."""
+        if current is not None and self._path_ends_with(current, _QWEN_EXTENSION_SUFFIX):
+            return True
+        return self._link_points_into(target, _QWEN_EXTENSION_SUFFIX)
 
     def plan_runtime(self) -> None:
         uv = command_path("uv")
@@ -188,6 +228,12 @@ class Installer:
         if current == source.resolve(strict=False):
             self.notice("Agent feedback command is current")
         elif not target.exists() and not target.is_symlink():
+            self.add_change(
+                "link the agent-feedback command",
+                group="Shared",
+                component="agent-command",
+            )
+        elif self._link_points_into(target, _AGENT_COMMAND_SUFFIX):
             self.add_change(
                 "link the agent-feedback command",
                 group="Shared",
@@ -232,6 +278,8 @@ class Installer:
             if current == source.resolve():
                 self.notice(f"Codex skill {source.name} is current")
             elif not target.exists() and not target.is_symlink():
+                self.add_change(f"link skill {source.name}", group="Codex", component="codex")
+            elif self._link_points_into(target, (*_CODEX_SKILL_ROOT, source.name)):
                 self.add_change(f"link skill {source.name}", group="Codex", component="codex")
             else:
                 self.warnings.append(f"refusing unmanaged Codex skill: {target}")
@@ -300,6 +348,8 @@ class Installer:
             self.notice("Qwen extension is current")
         elif not target.exists() and not target.is_symlink():
             self.add_change("link the github-workflows extension", group="Qwen", component="qwen")
+        elif self._qwen_extension_owned(target, current):
+            self.add_change("link the github-workflows extension", group="Qwen", component="qwen")
         else:
             self.warnings.append(f"refusing unmanaged Qwen extension: {target}")
 
@@ -308,12 +358,19 @@ class Installer:
         if client == "codex":
             configured: set[str] = set()
             for name in MCP_SERVERS:
-                result = subprocess.run(
-                    [executable, "mcp", "get", name, "--json"],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                )
+                try:
+                    result = subprocess.run(
+                        [executable, "mcp", "get", name, "--json"],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=MCP_INSPECTION_TIMEOUT,
+                    )
+                except subprocess.TimeoutExpired:
+                    self.warnings.append(
+                        f"could not inspect the Codex {name} MCP; installation will be skipped"
+                    )
+                    return None
                 if result.returncode == 0:
                     configured.add(name)
                 elif "No MCP server named" not in result.stderr:
@@ -366,7 +423,7 @@ class Installer:
                 continue
             try:
                 configured = self._inspect_mcp(client, executable)
-            except OSError:
+            except (OSError, subprocess.SubprocessError):
                 configured = None
                 self.warnings.append(
                     f"could not inspect {label} MCP servers; installation will be skipped"
@@ -394,6 +451,8 @@ class Installer:
             if current == source.resolve():
                 self.notice(f"{agent} Polars skill is current")
             elif not target.exists() and not target.is_symlink():
+                missing.append(agent.capitalize())
+            elif self._link_points_into(target, _POLARS_SKILL_SUFFIX):
                 missing.append(agent.capitalize())
             else:
                 self.warnings.append(f"refusing unmanaged Polars skill: {target}")
@@ -593,6 +652,9 @@ class Installer:
             if not target.exists() and not target.is_symlink():
                 self.apply_notice(f"link skill {source.name}")
                 self.replace_link(source, target)
+            elif self._link_points_into(target, (*_CODEX_SKILL_ROOT, source.name)):
+                self.apply_notice(f"re-link skill {source.name}")
+                self.replace_link(source, target)
 
     def apply_qwen(self) -> None:
         if "link the github-workflows extension" not in self.changes:
@@ -605,10 +667,12 @@ class Installer:
         source = self.root / "extensions" / "github-workflows"
         if current == source:
             return
-        if target.exists() or target.is_symlink():
-            return
-        self.apply_notice("link the github-workflows extension")
-        self.run(qwen, "extensions", "link", str(source), input_text="y\n")
+        if not target.exists() and not target.is_symlink():
+            self.apply_notice("link the github-workflows extension")
+            self.run(qwen, "extensions", "link", str(source), input_text="y\n")
+        elif self._qwen_extension_owned(target, current):
+            self.apply_notice("re-link the github-workflows extension")
+            self.run(qwen, "extensions", "link", str(source), input_text="y\n")
 
     def apply_mcp(self) -> None:
         """Register selected MCP servers through each client's native CLI."""
@@ -666,9 +730,11 @@ class Installer:
             raise RuntimeError("the Polars checkout does not contain the polars skill")
         for agent in ("codex", "qwen"):
             target = self.home / f".{agent}" / "skills" / "polars"
-            if resolved_link(target) != source.resolve() and (
-                not target.exists() and not target.is_symlink()
-            ):
+            if resolved_link(target) == source.resolve():
+                continue
+            if not target.exists() and not target.is_symlink():
+                self.replace_link(source, target)
+            elif self._link_points_into(target, _POLARS_SKILL_SUFFIX):
                 self.replace_link(source, target)
 
     def install(self) -> int:
