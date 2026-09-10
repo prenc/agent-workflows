@@ -189,7 +189,7 @@ def _parse_record_line(raw_line: bytes, line_number: int) -> dict[str, Any] | No
         return None
     try:
         value = json.loads(line)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         _quarantine_line(line_number, None, "is not valid feedback JSON")
         return None
     if not isinstance(value, dict):
@@ -731,7 +731,7 @@ def _hook_feedback_id(value: Any, *, depth: int = 0) -> str | None:
     elif isinstance(value, str) and len(value) <= MAX_RECORD_BYTES * 2:
         try:
             decoded = json.loads(value)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             return None
         return _hook_feedback_id(decoded, depth=depth + 1)
     return None
@@ -930,7 +930,7 @@ def _iter_transcript_windows(
                 continue
             try:
                 value = json.loads(line)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, RecursionError):
                 continue
             if not isinstance(value, dict):
                 continue
