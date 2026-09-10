@@ -524,6 +524,15 @@ def _public_input_schema(name: str, schema: dict[str, Any]) -> dict[str, Any]:
     if action_model is not None:
         _add_action_model_contract(result, action_model)
     if name == "history_manage":
+        properties["records"]["description"] = (
+            "At most 100 compact records per call. Send a JSON array value; do not "
+            "JSON-encode it as a string."
+        )
+        properties["artifacts"]["description"] = (
+            "Persisted result files whose combined issue and pull contents may expand to "
+            "at most 100 records per call. Send a JSON array value; do not JSON-encode it "
+            "as a string."
+        )
         conditions.append(
             {
                 "if": {
@@ -783,7 +792,7 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
             "integration_begin",
             "integration_end",
         ],
-        workflow: WorkflowName = "gh-audit-repo",
+        workflow: WorkflowName,
         task_id: NonBlankString | None = None,
         task: JsonObjectArgument[TaskPlan | None] = None,
         report: JsonObjectArgument[dict[str, Any] | None] = None,

@@ -57,7 +57,7 @@ def slug(area: str) -> str:
     return area.removeprefix("area/")
 
 
-def canonical_area(value: Any) -> dict[str, Any]:
+def canonical_area(value: Any, existing_title: str | None = None) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("each area must be a JSON object")
     area = value.get("area") or value.get("id")
@@ -70,7 +70,7 @@ def canonical_area(value: Any) -> dict[str, Any]:
     if title == area:
         title = None
     if title is None:
-        title = slug(area).replace("-", " ").replace("_", " ").capitalize()
+        title = existing_title or slug(area).replace("-", " ").replace("_", " ").capitalize()
     description = value.get("description")
     if not isinstance(title, str) or not title.strip():
         raise ValueError(f"{area} requires a title")
@@ -89,12 +89,19 @@ def canonical_area(value: Any) -> dict[str, Any]:
     return result
 
 
-def load_areas(path: Path) -> list[dict[str, Any]]:
+def load_areas(path: Path, existing_titles: dict[str, str] | None = None) -> list[dict[str, Any]]:
     value = json.loads(path.read_text(encoding="utf-8"))
     raw = value.get("areas") if isinstance(value, dict) else None
     if not isinstance(raw, list):
         raise ValueError("areas input must contain an areas list")
-    areas = [canonical_area(item) for item in raw]
+    titles = existing_titles or {}
+    areas = [
+        canonical_area(
+            item,
+            titles.get(str(item.get("area") or item.get("id"))) if isinstance(item, dict) else None,
+        )
+        for item in raw
+    ]
     ids = [item["id"] for item in areas]
     if len(ids) != len(set(ids)):
         raise ValueError("area IDs must be unique")
@@ -274,8 +281,11 @@ def status(args: argparse.Namespace) -> None:
 
 def reconcile(args: argparse.Namespace) -> None:
     root = knowledge_root(args)
-    areas = load_areas(args.areas)
     active = active_documents(root)
+    areas = load_areas(
+        args.areas,
+        {area_id: str(document["area"]["title"]) for area_id, (_, document) in active.items()},
+    )
     plan = plan_reconciliation(areas, active)
     invalidated_documents: list[dict[str, Any]] = []
     for area_id in plan["invalidated"]:

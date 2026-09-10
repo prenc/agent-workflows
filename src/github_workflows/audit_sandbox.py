@@ -55,9 +55,10 @@ _NAMESPACE_SCRIPT = (
     "(\n"
     '  worktree="$1"\n'
     '  scratch="$2"\n'
-    '  helper="$3"\n'
-    '  count="$4"\n'
-    "  shift 4\n"
+    '  working_directory="$3"\n'
+    '  helper="$4"\n'
+    '  count="$5"\n'
+    "  shift 5\n"
     '  while [ "$count" -gt 0 ]; do\n'
     '    root="$1"\n'
     "    shift\n"
@@ -74,7 +75,7 @@ _NAMESPACE_SCRIPT = (
     '    { /usr/bin/mount --bind "$root" "$root" '
     '      && /usr/bin/mount -o remount,bind,ro "$root"; } 2>/dev/null || true\n'
     "  done\n"
-    '  cd "$worktree"\n'
+    '  cd "$working_directory"\n'
     '  exec /usr/bin/python3 "$helper" --restrict-writes "$scratch" "$@"\n'
     ") &\n"
     "work=$!\n"
@@ -240,6 +241,7 @@ def namespace_command(
     scratch: Path,
     readonly_binds: tuple[Sequence[Path], Sequence[Path]],
     label: str,
+    working_directory: Path | None = None,
 ) -> list[str]:
     """Build the unshare launch for a probe.
 
@@ -250,6 +252,10 @@ def namespace_command(
     the pid namespace.
     """
     specific, mountpoints = readonly_binds
+    working_directory = worktree if working_directory is None else working_directory
+    resolved_working_directory = working_directory.resolve()
+    if resolved_working_directory not in {worktree.resolve(), scratch.resolve()}:
+        raise ValueError("sandbox working directory must be the worktree or scratch directory")
     # --fork is required: with --pid alone the unshare process itself becomes
     # the namespace init and the kernel kills it on this util-linux/kernel
     # line; with --fork the forked child is the init (the keeper shell) and
@@ -268,6 +274,7 @@ def namespace_command(
         label,
         str(worktree),
         str(scratch),
+        str(resolved_working_directory),
         str(Path(__file__).resolve()),
         str(len(specific)),
         *(str(root) for root in specific),

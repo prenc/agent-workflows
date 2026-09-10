@@ -306,7 +306,9 @@ re-transcribe those files for ingestion; the history server validates and
 reduces them to compact metadata without returning their contents. Use inline
 `records` only when the GitHub response itself remained inline. Each record
 carries its own `kind`, so an ingest call may contain both issues and pulls, with at most
-100 records per call. `records` and `artifacts` are mutually exclusive.
+100 records per call. For artifacts, this limit applies to the combined issue
+and pull record count after every supplied file is expanded, not to the number
+of artifact paths. `records` and `artifacts` are mutually exclusive.
 
 Commit with action `commit` after all pages are ingested, passing the full
 immutable default-branch SHA from the live repository read as `default_sha`.
@@ -354,7 +356,9 @@ unrelated stale/fixed/duplicate observations for closure reconciliation or the
 final report.
 
 The server supplies each audit worker with a bounded compact history view through
-`task_context`. Use canonical
+`task_context`. Its cache metadata includes `last_sync_at`, the successful cache
+watermark; it is a freshness hint rather than proof that an individual record
+still matches live GitHub. Use canonical
 `history_links: [{"kind": "issue"|"pull", "number": <positive integer>}]`
 in assignments so that view contains relevant open records and only the resolved
 records selected by the targeted gate. Without
@@ -378,7 +382,9 @@ private.
 
 Pass one canonical `area/<slug>` value, description, and owned paths for each area;
 title, entrypoints, and boundaries are optional. The server derives a missing title
-and the complete identity fingerprint. Never calculate or submit fingerprints.
+for a new area, retains the stored title when an existing area's title is omitted,
+and derives the complete identity fingerprint. Supply a different title explicitly
+only to rename the area. Never calculate or submit fingerprints.
 Ordinary source changes preserve the document; a boundary change,
 rename, split, merge, addition, or removal archives invalidated knowledge and
 bootstraps overlapping new areas with explicitly marked leads. The tool is
@@ -423,8 +429,10 @@ library.
 When planning a task whose conclusions depend on installed Python versions, list
 only those distribution names in `assignment.python_packages`. `task_context`
 returns the selected installed versions plus the total package count, rather than
-copying the complete environment into every worker context. A worker requests any
-unexpected missing package through `CONTEXT_REQUEST`.
+copying the complete environment into every worker context. When no names are
+listed, it returns a deterministic bounded default view and says whether that
+view contains the complete inventory. A worker requests any unexpected missing
+package through `CONTEXT_REQUEST`.
 The latest inventory revision is authoritative for audit-host package availability
 and installed versions; do not let speculative or stale assignment prose override
 it. Keep declared deployment constraints separate because they describe target
@@ -636,6 +644,31 @@ executions, including harness mistakes. After that, record it as inconclusive
 unless the failure is a reviewed-helper defect fixed and tested outside the
 audit in a separate workflow. Never edit the probe or inventory helper during
 the audit.
+
+For an MCP input-schema candidate, use this bounded inline-Python shape so the
+runtime receives an existing workspace and the asynchronous tool listing is
+awaited:
+
+```python
+import asyncio
+import json
+import tempfile
+from pathlib import Path
+
+from github_workflows.mcp_server import create_server
+from github_workflows.runtime import WorkflowRuntime
+
+with tempfile.TemporaryDirectory() as directory:
+    root = Path(directory)
+    workspace = root / "workspace"
+    project_state = root / "project-state"
+    workspace.mkdir()
+    project_state.mkdir()
+    server = create_server(WorkflowRuntime(workspace, project_state))
+    tools = asyncio.run(server.list_tools())
+    schema = next(tool.input_schema for tool in tools if tool.name == "audit_publish")
+    print(json.dumps(schema, sort_keys=True))
+```
 
 Before approving a probe, inspect every invoked test/module and ensure it does
 not read secrets, write repository files, contact a

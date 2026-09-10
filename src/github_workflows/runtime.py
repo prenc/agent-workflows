@@ -51,6 +51,8 @@ HISTORY_ARTIFACT_TOTAL_BYTES = 25 * 1024 * 1024
 TASK_HISTORY_LIMIT = 40
 TASK_VALIDATION_LIMIT = 40
 TASK_VALIDATION_EXCERPT_BYTES = 2 * 1024
+TASK_INVENTORY_DEFAULT_PACKAGE_LIMIT = 100
+TASK_INVENTORY_REQUESTED_PACKAGE_LIMIT = 50
 TASK_HISTORY_FIELDS = (
     "kind",
     "number",
@@ -342,7 +344,9 @@ class WorkflowRuntime:
                 raise ValueError("every history artifact record must be an object")
             records.extend(page)
             if len(records) > 100:
-                raise ValueError("history ingest accepts at most 100 records")
+                raise ValueError(
+                    "history ingest accepts at most 100 records per call after artifact expansion"
+                )
         return records
 
     @staticmethod
@@ -2123,6 +2127,7 @@ class WorkflowRuntime:
                 "generation": generation,
                 "record_count": history.get("record_count"),
                 "complete": True,
+                "last_sync_at": history.get("last_sync_at"),
             },
             "selection": {
                 "record_count": len(records),
@@ -2156,18 +2161,39 @@ class WorkflowRuntime:
         }
         requested = assignment.get("python_packages", [])
         requested_names = (
-            list(dict.fromkeys(item for item in requested if isinstance(item, str) and item))[:50]
+            list(dict.fromkeys(item for item in requested if isinstance(item, str) and item))[
+                :TASK_INVENTORY_REQUESTED_PACKAGE_LIMIT
+            ]
             if isinstance(requested, list)
             else []
         )
         selected: dict[str, Any] = {}
         missing: list[str] = []
-        for name in requested_names:
-            found = available.get(normalized(name))
-            if found is None:
-                missing.append(name)
-            else:
-                selected[found[0]] = found[1]
+        if requested_names:
+            for name in requested_names:
+                found = available.get(normalized(name))
+                if found is None:
+                    missing.append(name)
+                else:
+                    selected[found[0]] = found[1]
+            package_view = {
+                "mode": "requested",
+                "limit": TASK_INVENTORY_REQUESTED_PACKAGE_LIMIT,
+                "returned_count": len(selected),
+                "all_inventory_packages": len(selected) == len(packages),
+            }
+        else:
+            selected = dict(
+                sorted(packages.items(), key=lambda item: (normalized(str(item[0])), str(item[0])))[
+                    :TASK_INVENTORY_DEFAULT_PACKAGE_LIMIT
+                ]
+            )
+            package_view = {
+                "mode": "bounded-default",
+                "limit": TASK_INVENTORY_DEFAULT_PACKAGE_LIMIT,
+                "returned_count": len(selected),
+                "all_inventory_packages": len(selected) == len(packages),
+            }
         python_environment = {
             key: environment[key]
             for key in (
@@ -2184,6 +2210,7 @@ class WorkflowRuntime:
             {
                 "package_count": len(packages),
                 "packages": selected,
+                "package_view": package_view,
                 "missing_requested_packages": missing,
             }
         )
@@ -2521,6 +2548,12 @@ class WorkflowRuntime:
                         paths = [item.path for item in request.artifacts if item.kind == kind]
                         if paths:
                             grouped[kind].extend(self._history_artifact_records(paths, kind))
+                    expanded_count = sum(len(records) for records in grouped.values())
+                    if expanded_count > 100:
+                        raise ValueError(
+                            "history ingest accepts at most 100 records per call after "
+                            "artifact expansion"
+                        )
                 else:
                     for item in request.records:
                         grouped[item.kind].append(
@@ -2717,9 +2750,12 @@ class WorkflowRuntime:
                     area=getattr(request, "area", None),
                 )
             if request.action == "reconcile":
-                area_values = [
-                    item.model_dump(mode="json", exclude_none=True) for item in request.areas
-                ]
+                area_values = []
+                for item in request.areas:
+                    value = item.model_dump(mode="json", exclude_none=True)
+                    if not item.title_supplied:
+                        value.pop("title", None)
+                    area_values.append(value)
                 with self._json_file({"areas": area_values}) as areas:
                     return self._invoke(
                         audit_knowledge.reconcile,

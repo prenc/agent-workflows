@@ -187,7 +187,7 @@ class TestAuditInventory:
                 "#!/usr/bin/python3\n"
                 "from pathlib import Path\n"
                 "import socket\n"
-                "try:\n Path('forbidden-write').write_text('x')\n"
+                f"try:\n Path({str(self.worktree / 'forbidden-write')!r}).write_text('x')\n"
                 "except OSError:\n pass\n"
                 "else:\n raise SystemExit(8)\n"
                 "try:\n socket.create_connection(('1.1.1.1', 53), timeout=0.1)\n"
@@ -208,6 +208,31 @@ class TestAuditInventory:
         assert fact["available"]
         assert "isolated version" in fact["stdout"]
         assert not (self.worktree / "forbidden-write").exists()
+
+    def test_program_probe_ignores_repository_tool_manager_configuration(self) -> None:
+        self.call("initialize")
+        (self.worktree / ".mise.toml").write_text('[tools]\nrg = "latest"\n', encoding="utf-8")
+        with tempfile.TemporaryDirectory(prefix="audit-inventory-bin-") as binary_dir:
+            executable = Path(binary_dir) / "mise-sensitive"
+            executable.write_text(
+                "#!/usr/bin/python3\n"
+                "from pathlib import Path\n"
+                "if (Path.cwd() / '.mise.toml').exists():\n"
+                " raise SystemExit(7)\n"
+                "print('mise-neutral version')\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{binary_dir}:{environment['PATH']}"
+            source = self.program_input([{"name": "mise-sensitive", "arguments": ["--version"]}])
+            result = self.call(
+                "program", "--input", str(source), "--expected-revision", "1", env=environment
+            )
+        fact = json.loads(result.stdout)["facts"]["mise-sensitive"]
+        assert fact["available"]
+        assert fact["probe_status"] == "succeeded"
+        assert "mise-neutral version" in fact["stdout"]
 
     def test_failed_version_probe_keeps_executable_available(self) -> None:
         self.call("initialize")

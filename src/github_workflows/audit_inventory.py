@@ -391,6 +391,7 @@ def probe_program(
                     scratch=temporary_path,
                 ),
                 label="audit-inventory",
+                working_directory=temporary_path,
             )
             try:
                 with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:

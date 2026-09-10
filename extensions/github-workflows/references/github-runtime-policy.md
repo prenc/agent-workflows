@@ -35,6 +35,11 @@ supervisors and workers.
 - Send native JSON values that match the loaded tool schema. Omit optional
   arguments when unused; explicit `null` is not accepted. Correct a client-side
   schema rejection before retrying because no workflow call occurred.
+- Pass the exact `workflow` on every `run_manage`, `run_status`, and `task_manage`
+  call. Never infer it from the task ID or another current run.
+- After the parent session is restored, read `run_status` for the intended
+  workflow and call idempotent `run_manage` action `resume` before submitting
+  further task mutations for a resumable run.
 
 ## Interactive preflight and unattended execution
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -364,6 +365,7 @@ class TestExtensionMcp:
                     properties = tools[name].input_schema["properties"]
                     assert ("action" if name != "audit_probe" else "kind") in properties
                 assert "task" in tools["task_manage"].input_schema["properties"]
+                assert "workflow" in tools["task_manage"].input_schema["required"]
                 task_schema = json.dumps(tools["task_manage"].input_schema["properties"]["task"])
                 assert "snapshot and accepted_scope are non-empty compact strings" in task_schema
                 assert 'pull_request={\\"state\\":\\"none\\"}' in task_schema
@@ -380,6 +382,11 @@ class TestExtensionMcp:
                 history_properties = tools["history_manage"].input_schema["properties"]
                 assert "records" in history_properties
                 assert "artifacts" in history_properties
+                assert "At most 100 compact records" in history_properties["records"]["description"]
+                assert (
+                    "combined issue and pull contents"
+                    in history_properties["artifacts"]["description"]
+                )
                 inventory_properties = tools["audit_inventory"].input_schema["properties"]
                 assert "facts" in inventory_properties
                 assert "fact" in inventory_properties
@@ -844,7 +851,14 @@ class TestExtensionMcp:
                     "note": "Maintainer input is required",
                 },
             ),
-            ("task_manage", {"action": "plan", "task": {"logical_id": "task-1"}}),
+            (
+                "task_manage",
+                {
+                    "action": "plan",
+                    "workflow": "gh-audit-repo",
+                    "task": {"logical_id": "task-1"},
+                },
+            ),
             (
                 "history_manage",
                 {"action": "ingest", "records": [{"kind": "issue", "number": 1}]},
@@ -879,6 +893,8 @@ class TestExtensionMcp:
             assert not list(
                 Draft7Validator(tools[tool_name].input_schema).iter_errors(arguments)
             ), (tool_name, arguments)
+        with pytest.raises(ValidationError):
+            TaskManageRequest.model_validate({"action": "plan", "task": {"logical_id": "task-1"}})
 
     @pytest.mark.parametrize("targets", [[""], ["   "], ["#5", "\t"]])
     def test_run_manage_rejects_blank_target_references(self, targets: list[str]) -> None:
@@ -1889,6 +1905,57 @@ class TestExtensionMcp:
                 == "aborted"
             )
 
+    async def test_mcp_reconcile_preserves_an_omitted_existing_custom_title(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="github-workflows-knowledge-mcp-") as directory:
+            root = Path(directory)
+            workspace = root / "repo"
+            workspace.mkdir()
+            (workspace / ".gitignore").write_text(".worktrees/\n", encoding="utf-8")
+            (workspace / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+            self.git("init", "-b", "main", cwd=workspace)
+            self.git("config", "user.name", "MCP Test", cwd=workspace)
+            self.git("config", "user.email", "mcp-test@example.invalid", cwd=workspace)
+            self.git("add", ".gitignore", "module.py", cwd=workspace)
+            self.git("commit", "-m", "fixture", cwd=workspace)
+
+            runtime = WorkflowRuntime(workspace, root / "qwen-project")
+            async with Client(
+                create_server(runtime), raise_exceptions=True, read_timeout_seconds=0.1
+            ) as client:
+                started = await client.call_tool(
+                    "run_manage",
+                    {
+                        "action": "start",
+                        "workflow": "gh-audit-repo",
+                        "repository": "example/repo",
+                    },
+                )
+                assert not started.is_error
+                definition = {
+                    "area": "area/core",
+                    "title": "Custom Core",
+                    "description": "Core behavior.",
+                    "paths": ["module.py"],
+                }
+                created = await client.call_tool(
+                    "audit_knowledge", {"action": "reconcile", "areas": [definition]}
+                )
+                assert not created.is_error
+
+                definition.pop("title")
+                unchanged = await client.call_tool(
+                    "audit_knowledge", {"action": "reconcile", "areas": [definition]}
+                )
+                assert unchanged.structured_content == {
+                    "created": [],
+                    "invalidated": [],
+                    "unchanged": ["area/core"],
+                }
+                shown = await client.call_tool(
+                    "audit_knowledge", {"action": "show", "area": "area/core"}
+                )
+                assert shown.structured_content["area"]["title"] == "Custom Core"
+
     async def test_audit_adapter_derives_worktree_and_validation_artifact(self) -> None:
         with tempfile.TemporaryDirectory(prefix="github-workflows-audit-mcp-") as directory:
             root = Path(directory)
@@ -2140,6 +2207,7 @@ class TestExtensionMcp:
                     "task_manage",
                     {
                         "action": "plan",
+                        "workflow": "gh-audit-repo",
                         "task": {
                             "logical_id": "verify-mcp-1",
                             "assignment": {
@@ -2523,6 +2591,7 @@ class TestExtensionMcp:
             assert all(term in document for term in ("assigned worktree", "absolute"))
 
         assert all("uv run" not in document for document in workflow_documents)
+
         assert all("UV_NO_SYNC=1" in document for document in workflow_documents)
         assert all(
             re.search(r"known to invoke\s+nested uv", document) for document in workflow_documents
@@ -2555,6 +2624,33 @@ class TestExtensionMcp:
         assert runtime_policy.index("uv lock --check") < runtime_policy.index("unlink .venv")
         assert runtime_policy.index("unlink .venv") < runtime_policy.index(
             "\nuv lock --offline --no-python-downloads"
+        )
+
+    def test_isolated_environment_preflights_every_validation_executable(self) -> None:
+        supervisor = (EXTENSION / "skills/gh-implement-issue/SKILL.md").read_text(encoding="utf-8")
+
+        assert all(
+            term in supervisor
+            for term in (
+                "complete repository-owned validation plan",
+                "documented development",
+                "every environment-owned executable",
+                ".venv/bin/pre-commit",
+                "block the unit before worker launch",
+                "Never substitute",
+            )
+        )
+
+    def test_runtime_policy_requires_explicit_workflow_after_session_restore(self) -> None:
+        policy = (EXTENSION / "references/github-runtime-policy.md").read_text(encoding="utf-8")
+
+        assert all(
+            term in policy
+            for term in (
+                "exact `workflow`",
+                "parent session is restored",
+                "idempotent `run_manage` action `resume`",
+            )
         )
 
     def test_worktree_workers_expose_reliable_search_tools(self) -> None:
@@ -2663,8 +2759,9 @@ class TestExtensionMcp:
                     "Record and analyze feedback from the active",
                     "Only implementation work",
                     "requires a writable `agent-workflows` checkout",
-                    "make one read call that matches the request",
+                    "make the smallest set of bounded reads",
                     "skip that preliminary call",
+                    "batches of at most five records",
                     "Reuse the resulting records",
                     "agent-feedback summary",
                     "`agent-feedback show <ref>...`",
@@ -2689,3 +2786,16 @@ class TestExtensionMcp:
 
         assert "agent-feedback add" in codex
         assert "mcp__github_workflows__workflow_feedback" in qwen
+
+    def test_documented_schema_introspection_shape_is_executable(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="github-workflows-schema-recipe-") as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            project_state = root / "project-state"
+            workspace.mkdir()
+            project_state.mkdir()
+            server = create_server(WorkflowRuntime(workspace, project_state))
+            tools = asyncio.run(server.list_tools())
+        schema = next(tool.input_schema for tool in tools if tool.name == "audit_publish")
+        Draft7Validator.check_schema(schema)
+        assert "action" in schema["properties"]

@@ -87,7 +87,12 @@ This worker is read-only and must not create or execute any orchestration file.
   packages available on the audit host and their installed versions, even when
   older assignment prose speculates otherwise. Declared deployment constraints
   describe target environments and do not override current-host facts. An
-  inventory-provided interpreter prefix or standard-library root is an assigned
+  empty package request receives a bounded default version map; inspect
+  `python_environment.package_view.all_inventory_packages` before treating it
+  as complete. If a needed package is absent from an incomplete view, return a
+  `CONTEXT_REQUEST` naming that distribution instead of scanning package
+  metadata directly. An inventory-provided interpreter prefix or
+  standard-library root is an assigned
   version-matched local evidence path, but never publish its absolute host path.
   Never edit, write, commit, push, comment, label, create issues, install
   dependencies, execute shell commands other than that bounded search fallback,

@@ -67,11 +67,13 @@ PHI, or PII.
 
 ## Analyze the queue
 
-Preserve the current worktree and make one read call that matches the request.
+Preserve the current worktree and make the smallest set of bounded reads that
+matches the request.
 Use `agent-feedback summary` for an aggregate overview. When
 record-level analysis is required, skip that preliminary call and use
-`agent-feedback ls --all`, then fetch needed full records in one batched
-`agent-feedback show <ref>...` call (or use
+`agent-feedback ls --all`, then fetch full records only when their compact
+summaries are insufficient. Split `agent-feedback show <ref>...` calls into
+batches of at most five records (or use
 `--limit 1` for only the newest record). The agent interface always emits JSON; do not add
 `--json` or select a Python environment. If the command is unavailable, report
 that `agent-workflows install` must be run instead of falling back to `.venv`,
@@ -87,8 +89,8 @@ both views are genuinely needed, carry the same `--since` age on summary and
 list so their scopes agree. Use compact ages such as `24h`, `30d`, or `4w`.
 Reuse the resulting records throughout the contiguous task; refresh only when
 scope changes, the store may have changed, or resolution reports a conflict.
-Use one batched `agent-feedback show <ref>...` call only when
-direct ID lookup is needed. Do not load
+Use bounded `agent-feedback show <ref>...` calls only when direct ID lookup is
+needed, splitting more than five requested IDs across calls. Do not load
 closed feedback without a reason or change status during default analysis. Do
 not set a custom uv cache or synchronize the environment.
 

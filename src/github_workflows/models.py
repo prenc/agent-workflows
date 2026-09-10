@@ -284,13 +284,13 @@ class TaskPlan(StrictRequest):
 
 class TaskPlanRequest(StrictRequest):
     action: Literal["plan"]
-    workflow: WorkflowName = "gh-audit-repo"
+    workflow: WorkflowName
     task: TaskPlan
 
 
 class TaskRetryRequest(StrictRequest):
     action: Literal["retry"]
-    workflow: WorkflowName = "gh-audit-repo"
+    workflow: WorkflowName
     task_id: NonBlankString
     task: TaskPlan | None = None
     note: str | None = None
@@ -298,14 +298,14 @@ class TaskRetryRequest(StrictRequest):
 
 class TaskTransitionRequest(StrictRequest):
     action: Literal["mark_running", "fail", "abandon"]
-    workflow: WorkflowName = "gh-audit-repo"
+    workflow: WorkflowName
     task_id: NonBlankString
     note: str | None = None
 
 
 class TaskCheckpointRequest(StrictRequest):
     action: Literal["checkpoint"]
-    workflow: WorkflowName = "gh-audit-repo"
+    workflow: WorkflowName
     task_id: NonBlankString
     report: dict[str, Any] = Field(description="Compact continuation report to retain atomically.")
     note: str | None = None
@@ -313,7 +313,7 @@ class TaskCheckpointRequest(StrictRequest):
 
 class TaskReportRequest(StrictRequest):
     action: Literal["complete"]
-    workflow: WorkflowName = "gh-audit-repo"
+    workflow: WorkflowName
     task_id: NonBlankString
     report: dict[str, Any] = Field(
         description="Complete structured worker report to retain atomically."
@@ -323,7 +323,7 @@ class TaskReportRequest(StrictRequest):
 
 class TaskIntegrationRequest(StrictRequest):
     action: Literal["integration_begin", "integration_end"]
-    workflow: WorkflowName = "gh-audit-repo"
+    workflow: WorkflowName
     task_id: NonBlankString
     note: str | None = None
 
@@ -380,8 +380,19 @@ class HistoryStatusRequest(StrictRequest):
 class HistoryIngestRequest(StrictRequest):
     action: Literal["ingest"]
     workflow: WorkflowName = "gh-audit-repo"
-    records: list[HistoryRecord] = Field(default_factory=list, max_length=100)
-    artifacts: list[HistoryArtifact] = Field(default_factory=list, max_length=100)
+    records: list[HistoryRecord] = Field(
+        default_factory=list,
+        max_length=100,
+        description="At most 100 compact records per call.",
+    )
+    artifacts: list[HistoryArtifact] = Field(
+        default_factory=list,
+        max_length=100,
+        description=(
+            "Persisted result files whose combined contents may expand to at most 100 "
+            "records per call."
+        ),
+    )
     source: NonBlankString = "github-mcp"
     fetched_at: str | None = None
 
@@ -516,10 +527,16 @@ class AreaDefinition(StrictRequest):
     @model_validator(mode="after")
     def derive_title(self) -> AreaDefinition:
         if not self.title:
-            self.title = (
-                self.area.removeprefix("area/").replace("-", " ").replace("_", " ").capitalize()
+            object.__setattr__(
+                self,
+                "title",
+                self.area.removeprefix("area/").replace("-", " ").replace("_", " ").capitalize(),
             )
         return self
+
+    @property
+    def title_supplied(self) -> bool:
+        return "title" in self.model_fields_set
 
 
 class KnowledgeShowRequest(StrictRequest):

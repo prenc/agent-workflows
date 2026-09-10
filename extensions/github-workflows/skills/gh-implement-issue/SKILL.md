@@ -276,6 +276,8 @@ resolution requires new product, scientific, dependency, security, or data
 authority.
 
 Choose the worktree environment after the rebase and before worker assignment.
+First build the complete repository-owned validation plan so environment
+selection accounts for every executable it will invoke.
 Use `native` for a non-Python project. For Python, use `shared` only when the
 unit cannot affect dependency inputs, packaging, entry points, compiled
 extensions, or import layout and the repository establishes unambiguous
@@ -291,8 +293,16 @@ without following it. Unlink it only when it is a symlink resolving exactly to
 the verified main `.venv`; block on any other existing target. Create the now
 absent worktree `.venv` with the main environment's interpreter and populate it
 only with `UV_OFFLINE=1 uv sync --frozen --no-python-downloads` plus the
-documented groups or extras. Never run either command through a `.venv`
+documented groups or extras, including the repository's documented development
+group when the validation plan needs one of its tools. Never run either command through a `.venv`
 symlink. The supervisor alone runs these environment writers.
+
+After synchronization, verify every environment-owned executable in the
+validation plan under the assigned worktree environment. In particular, do not
+assign `<worktree>/.venv/bin/pre-commit` unless that exact executable exists.
+If an approved documented group cannot be populated offline or a required
+executable remains absent, block the unit before worker launch. Never substitute
+the main checkout's `.venv` for validation assigned to an isolated environment.
 
 Respect the repository's lock convention: preserve a tracked lock, keep an
 ignored lock local, or retain an otherwise unwanted generated lock in private
@@ -329,8 +339,9 @@ independent progress remains.
 
 ## Stage 4: run bounded implementation rounds
 
-Build the round's validation plan from inspected evidence before registering
-the assignment. Copy repository-owned validation commands exactly; do not add
+Use the round's validation plan built during environment selection and confirm
+it still matches inspected evidence before registering the assignment. Copy
+repository-owned validation commands exactly; do not add
 files to their argument lists. Derive any file-specific check from the file's
 actual shebang, language configuration, and syntax rather than its extension or
 name. Run a cheap supervisor-added syntax or static check against the recorded

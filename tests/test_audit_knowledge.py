@@ -117,6 +117,41 @@ class TestAuditKnowledge:
             (self.project_dir / "workflows/gh-audit-repo/knowledge/invalidated").glob("*.md")
         )
 
+    def test_omitted_existing_title_is_stable_but_explicit_rename_invalidates(self) -> None:
+        definition = {
+            "area": "area/core",
+            "title": "Custom Core",
+            "description": "Core behavior.",
+            "paths": ["src/core"],
+            "entrypoints": ["main"],
+            "boundaries": ["cli"],
+        }
+        self.areas.write_text(json.dumps({"areas": [definition]}), encoding="utf-8")
+        self.call("reconcile", "--areas", str(self.areas), "--repo-sha", "sha1")
+        document = self.project_dir / "workflows/gh-audit-repo/knowledge/areas/core.md"
+        original = document.read_text(encoding="utf-8")
+        original_marker = json.loads(original.split("\n-->", 1)[0].split("\n", 1)[1])
+
+        definition.pop("title")
+        self.areas.write_text(json.dumps({"areas": [definition]}), encoding="utf-8")
+        unchanged = json.loads(
+            self.call("reconcile", "--areas", str(self.areas), "--repo-sha", "sha2").stdout
+        )
+        assert unchanged == {"created": [], "invalidated": [], "unchanged": ["area/core"]}
+        assert document.read_text(encoding="utf-8") == original
+
+        definition["title"] = "Renamed Core"
+        self.areas.write_text(json.dumps({"areas": [definition]}), encoding="utf-8")
+        renamed = json.loads(
+            self.call("reconcile", "--areas", str(self.areas), "--repo-sha", "sha3").stdout
+        )
+        assert renamed["invalidated"] == ["area/core"]
+        replacement = json.loads(
+            document.read_text(encoding="utf-8").split("\n-->", 1)[0].split("\n", 1)[1]
+        )
+        assert replacement["area"]["title"] == "Renamed Core"
+        assert replacement["area"]["fingerprint"] != original_marker["area"]["fingerprint"]
+
     def test_repeated_invalidation_preserves_earlier_archives(self) -> None:
         def add_finding(payload_name: str, title: str, path: str) -> None:
             payload = self.root / payload_name
