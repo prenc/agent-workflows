@@ -22,11 +22,9 @@ allowedTools:
 # Propose a GitHub Enhancement
 
 Turn one concrete idea into one self-contained enhancement issue. Read
-`../../references/github-issue-conventions.md` and apply its taxonomy, sizing,
-duplicate, title, and body rules. Read
-`../../references/github-mcp-suspension.md` before starting. Read
-`../../references/github-runtime-policy.md` and apply
-its reviewed-execution boundary.
+[GitHub access](references/github-access.md),
+[issue conventions](references/github-issue-conventions.md), and the
+[runtime policy](references/github-runtime-policy.md) before starting.
 
 A normal invocation authorizes publication of one issue after all gates pass.
 `--dry-run` performs the same selection, search, and drafting but makes zero
@@ -54,9 +52,7 @@ that no publishable proposal was found.
 
 ## Operating boundaries
 
-Use the configured GitHub MCP server for GitHub records and mutations. Apply
-`../../references/github-mcp-suspension.md` when a required MCP operation cannot establish
-or retain availability.
+Follow the GitHub access policy.
 
 This is a single-proposal, supervisor-only workflow. Its execution surface is
 conversation context, duplicate-search GitHub reads, taxonomy resolution, and

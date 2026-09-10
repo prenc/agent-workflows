@@ -424,7 +424,7 @@ class WorkflowRuntime:
         worktree = Path(raw_worktree).resolve()
         managed_roots = {
             (self.workspace / ".worktrees").resolve(),
-            self._cache_worktree_root(),
+            self._cache_worktree_path().resolve(),
         }
         if worktree.parent not in managed_roots or not worktree.name.startswith("gh-audit-repo-"):
             raise ValueError("stale audit worktree is outside the managed location")
@@ -471,37 +471,109 @@ class WorkflowRuntime:
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         metadata = path.lstat()
         if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
-            raise PermissionError("worktree cache must be an owned directory")
+            raise PermissionError("managed worktree root must be an owned directory")
         path.chmod(0o700)
         return path.resolve()
 
-    def _cache_worktree_root(self) -> Path:
+    def _cache_worktree_path(self) -> Path:
         cache = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))).expanduser()
         if not cache.is_absolute():
             raise ValueError("XDG_CACHE_HOME must be an absolute path")
+        identity = hashlib.sha256(str(self.workspace).encode()).hexdigest()[:16]
+        return cache / "agent-workflows" / "worktrees" / identity
+
+    def _cache_worktree_root(self) -> Path:
+        cache_root = self._cache_worktree_path()
+        cache = cache_root.parents[2]
         application = self._ensure_private_directory(cache / "agent-workflows")
         worktrees = self._ensure_private_directory(application / "worktrees")
-        identity = hashlib.sha256(str(self.workspace).encode()).hexdigest()[:16]
-        return self._ensure_private_directory(worktrees / identity)
+        return self._ensure_private_directory(worktrees / cache_root.name)
 
-    def _worktree_root(self) -> Path:
+    def _ensure_local_worktree_ignored(self) -> None:
+        probe = ".worktrees/probe"
         ignored = subprocess.run(
+            ["git", "-C", str(self.workspace), "check-ignore", "-q", "--no-index", probe],
+            check=False,
+        )
+        if ignored.returncode == 0:
+            return
+        if ignored.returncode != 1:
+            raise ValueError("Git could not determine whether .worktrees is ignored")
+        exclude_result = subprocess.run(
             [
                 "git",
                 "-C",
                 str(self.workspace),
-                "check-ignore",
-                "-q",
-                "--no-index",
-                ".worktrees/probe",
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
             ],
             check=False,
+            capture_output=True,
+            text=True,
         )
-        return (
-            (self.workspace / ".worktrees").resolve()
-            if ignored.returncode == 0
-            else self._cache_worktree_root()
+        exclude_value = exclude_result.stdout.strip()
+        if exclude_result.returncode != 0 or not exclude_value:
+            raise ValueError("Git could not resolve its private info exclude file")
+        common = Path(exclude_value)
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            common_descriptor = os.open(common, directory_flags)
+        except OSError as error:
+            raise PermissionError("Git common directory must be an owned directory") from error
+        try:
+            common_metadata = os.fstat(common_descriptor)
+            if not stat.S_ISDIR(common_metadata.st_mode) or common_metadata.st_uid != os.geteuid():
+                raise PermissionError("Git common directory must be an owned directory")
+            try:
+                info_descriptor = os.open("info", directory_flags, dir_fd=common_descriptor)
+            except OSError as error:
+                raise PermissionError("Git info directory must be an owned directory") from error
+            try:
+                info_metadata = os.fstat(info_descriptor)
+                if not stat.S_ISDIR(info_metadata.st_mode) or info_metadata.st_uid != os.geteuid():
+                    raise PermissionError("Git info directory must be an owned directory")
+                try:
+                    exclude_descriptor = os.open(
+                        "exclude",
+                        os.O_APPEND | os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                        0o600,
+                        dir_fd=info_descriptor,
+                    )
+                except OSError as error:
+                    raise PermissionError(
+                        "Git info exclude must be an owned regular file"
+                    ) from error
+                try:
+                    exclude_metadata = os.fstat(exclude_descriptor)
+                    if (
+                        not stat.S_ISREG(exclude_metadata.st_mode)
+                        or exclude_metadata.st_uid != os.geteuid()
+                    ):
+                        raise PermissionError("Git info exclude must be an owned regular file")
+                    prefix = (
+                        b"\n"
+                        if exclude_metadata.st_size
+                        and os.pread(exclude_descriptor, 1, exclude_metadata.st_size - 1) != b"\n"
+                        else b""
+                    )
+                    os.write(exclude_descriptor, prefix + b".worktrees/\n")
+                finally:
+                    os.close(exclude_descriptor)
+            finally:
+                os.close(info_descriptor)
+        finally:
+            os.close(common_descriptor)
+        verified = subprocess.run(
+            ["git", "-C", str(self.workspace), "check-ignore", "-q", "--no-index", probe],
+            check=False,
         )
+        if verified.returncode != 0:
+            raise ValueError("Git info exclude did not ignore .worktrees")
+
+    def _worktree_root(self) -> Path:
+        self._ensure_local_worktree_ignored()
+        return self._ensure_private_directory(self.workspace / ".worktrees")
 
     def _source_and_worktree(self, confirmed_sha: str | None) -> dict[str, Any]:
         source = self._invoke(workflow_run.audit_source, project_root=self.workspace)

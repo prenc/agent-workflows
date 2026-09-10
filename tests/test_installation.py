@@ -292,6 +292,44 @@ def test_unmanaged_codex_skill_is_never_replaced(
     assert installer.warnings == [f"refusing unmanaged Codex skill: {target}"]
 
 
+def test_retired_managed_codex_skill_link_is_removed(
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(installation, "command_path", lambda _name: "/bin/tool")
+    home = repository / "home"
+    target = home / ".codex" / "skills" / "gh-reassess-work"
+    target.parent.mkdir(parents=True)
+    target.symlink_to(repository / "old-checkout" / "codex" / "skills" / "gh-reassess-work")
+
+    installer = installation.Installer(arguments(), repository)
+    installer.home = home
+    installer.plan_codex()
+
+    assert "remove retired skill gh-reassess-work" in installer.changes
+    installer.apply_codex()
+    assert not target.exists()
+    assert not target.is_symlink()
+
+
+def test_unmanaged_retired_codex_skill_is_preserved(
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(installation, "command_path", lambda _name: "/bin/tool")
+    home = repository / "home"
+    target = home / ".codex" / "skills" / "gh-reassess-work"
+    target.mkdir(parents=True)
+
+    installer = installation.Installer(arguments(), repository)
+    installer.home = home
+    installer.plan_codex()
+    installer.apply_codex()
+
+    assert target.is_dir()
+    assert f"refusing unmanaged retired Codex skill: {target}" in installer.warnings
+
+
 def test_matching_user_policy_files_are_adopted_as_managed_files(
     repository: Path,
 ) -> None:

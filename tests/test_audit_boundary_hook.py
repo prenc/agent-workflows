@@ -185,6 +185,61 @@ class TestAuditBoundaryHook:
             )
             assert result["permissionDecision"] == "allow", command
 
+    def test_assigned_worker_can_use_repository_bound_gh_api_reads(self) -> None:
+        context = {
+            "audit_worktree": "/tmp/audit",
+            "repository": "example/repo",
+            "references": {"rg_excludes": str(RG_EXCLUDES)},
+        }
+        commands = (
+            "gh api repos/example/repo",
+            "gh api repos/example/repo/issues/12/timeline --paginate",
+            "gh api repos/example/repo/issues?state=all --paginate",
+            "gh api repos/example/repo/pulls/9/files --paginate",
+            "gh api repos/example/repo/commits/abcdef1",
+            "gh api repos/example/repo/compare/main...topic",
+            "gh api repos/EXAMPLE/REPO/labels --paginate",
+        )
+
+        for command in commands:
+            result = self.invoke(
+                "run_shell_command",
+                {"command": command},
+                session="worker",
+                task_context=context,
+            )
+            assert result["permissionDecision"] == "allow", command
+
+    def test_worker_gh_api_rejects_writes_and_unassigned_reads(self) -> None:
+        context = {
+            "audit_worktree": "/tmp/audit",
+            "repository": "example/repo",
+            "references": {"rg_excludes": str(RG_EXCLUDES)},
+        }
+        commands = (
+            "gh api repos/other/repo/issues/1",
+            "gh api repos/example/repo/actions/runs",
+            "gh api repos/example/repo/contents/.env",
+            "gh api --method POST repos/example/repo/issues",
+            "gh api repos/example/repo/issues -f title=write",
+            "gh api repos/example/repo/issues --input body.json",
+            "gh api --hostname example.com repos/example/repo/issues",
+            "gh api https://api.github.com/repos/example/repo/issues",
+            "gh api repos/example/repo/issues | jq .",
+            "gh api repos/example/repo/issues > /tmp/issues.json",
+            "gh api repos/example/repo/issues --paginate --slurp",
+        )
+
+        for command in commands:
+            result = self.invoke(
+                "run_shell_command",
+                {"command": command},
+                session="worker",
+                task_context=context,
+            )
+            assert result["permissionDecision"] == "deny", command
+            assert "read-only gh api" in result["permissionDecisionReason"]
+
     def test_worker_direct_rg_rejects_unsafe_or_unbounded_commands(self) -> None:
         denied = (
             "grep needle /tmp/audit",

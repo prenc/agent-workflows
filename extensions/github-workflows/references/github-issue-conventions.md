@@ -97,8 +97,8 @@ the remote implementation is no longer usable. Local-only, uncommitted, and
 unpushed work does not qualify. Curation and reassessment may maintain the issue
 status from durable evidence.
 
-`ready-to-merge` is a PR-only status applied by Codex `$gh-pickup-work` or
-`$gh-reassess-work` when available evidence indicates it can be merged:
+`ready-to-merge` is a PR-only status applied by Codex `$gh-pickup-work`
+when available evidence indicates it can be merged:
 linked accepted scope is complete—or an unlinked PR has a coherent and fully
 delivered objective—the changes themselves make sense, required local
 validation passes, the remote PR points to the verified pushed SHA, and no

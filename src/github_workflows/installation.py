@@ -30,6 +30,7 @@ MCP_INSPECTION_TIMEOUT = 60.0
 # Trailing path components identifying the installer's own link targets, so a link
 # left behind by a moved checkout is re-linked rather than refused as unmanaged.
 _CODEX_SKILL_ROOT = ("codex", "skills")
+_RETIRED_CODEX_SKILLS = ("gh-reassess-work",)
 _QWEN_EXTENSION_SUFFIX = ("extensions", "github-workflows")
 _POLARS_SKILL_SUFFIX = ("agent-workflows", "upstream", "polars-skills", "polars")
 _AGENT_COMMAND_SUFFIX = (".venv", "bin", "agent-feedback")
@@ -289,6 +290,18 @@ class Installer:
                 self.add_change(f"link skill {source.name}", group="Codex", component="codex")
             else:
                 self.warnings.append(f"refusing unmanaged Codex skill: {target}")
+        for name in _RETIRED_CODEX_SKILLS:
+            target = destination / name
+            if not target.exists() and not target.is_symlink():
+                continue
+            if self._link_points_into(target, (*_CODEX_SKILL_ROOT, name)):
+                self.add_change(
+                    f"remove retired skill {name}",
+                    group="Codex",
+                    component="codex",
+                )
+            else:
+                self.warnings.append(f"refusing unmanaged retired Codex skill: {target}")
 
     def user_policy_targets(self) -> tuple[tuple[Path, Path, str], ...]:
         return (
@@ -665,6 +678,14 @@ class Installer:
             elif self._link_points_into(target, (*_CODEX_SKILL_ROOT, source.name)):
                 self.apply_notice(f"re-link skill {source.name}")
                 self.replace_link(source, target)
+        for name in _RETIRED_CODEX_SKILLS:
+            change = f"remove retired skill {name}"
+            if change not in self.changes:
+                continue
+            target = destination / name
+            if self._link_points_into(target, (*_CODEX_SKILL_ROOT, name)):
+                self.apply_notice(change)
+                target.unlink()
 
     def apply_qwen(self) -> None:
         if "link the github-workflows extension" not in self.changes:

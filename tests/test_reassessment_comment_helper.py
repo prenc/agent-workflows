@@ -10,7 +10,7 @@ from unittest import mock
 import pytest
 
 ROOT = Path(__file__).parents[1]
-HELPER = ROOT / "codex/skills/gh-reassess-work/scripts/update_managed_comment.py"
+HELPER = ROOT / "codex/skills/gh-pickup-work/scripts/update_managed_comment.py"
 
 
 def load_helper() -> ModuleType:

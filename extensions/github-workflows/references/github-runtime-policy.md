@@ -108,7 +108,7 @@ supervisors and workers.
   executable; run it directly from the visible invocation.
 
 - Audit workers use `grep_search` first. When it is empty, incomplete, or
-  unsuitable, they may use `run_shell_command` only for direct `rg`. The command
+  unsuitable, they may use `run_shell_command` for direct `rg`. The command
   must include `--hidden --no-config --no-ignore-parent --no-ignore-vcs`, the
   exact `--ignore-file` from `task_context.references.rg_excludes`, and `--`
   before operands. Every search path must be absolute and contained by the
@@ -117,8 +117,16 @@ supervisors and workers.
   Repository `data/` may be
   searched when relevant; secret files and private workflow/run storage may not.
   The pre-tool hook rejects relative paths, symlink escapes, stale or forged
-  context, unknown or dangerous options, shell operators, substitutions,
-  environment expansion, and every other executable. Native tool output may be
+  context, unknown or dangerous options, shell operators, substitutions, and
+  environment expansion.
+
+  When GitHub MCP is unavailable, the hook also permits
+  `gh api repos/OWNER/REPO/RESOURCE [--paginate]` for default-GET reads bound
+  to `task_context.repository`. Resources are limited to repository metadata,
+  issues, pull requests, commits, comparisons, branches, labels, and
+  milestones. HTTP methods, request fields or bodies, input files, alternate
+  hosts, foreign repositories, unrelated endpoints, and shell composition are
+  denied. Native tool output may be
   truncated, so narrow the path or pattern and retry instead of assuming
   completeness. Glob filters may only exclude paths; positive globs are denied
   because ripgrep lets them override secret ignore rules.
@@ -248,6 +256,30 @@ worktrees remain immutable: they use the existing read-only probe environment
 and never resolve locks or install dependencies.
 
 ## Runtime failures
+
+### Suspend and resume
+
+When neither GitHub access route can complete a required operation, checkpoint
+through the workflow's run state. A workflow without managed run state writes a
+private resume capsule in its temporary workflow directory. Preserve:
+
+- invocation, repository, targets, options, and completed stages;
+- last successful read, immutable SHAs, confirmed mutations, and ambiguous
+  mutation outcomes;
+- issue and PR lifecycle state;
+- branch, worktree, HEAD, pushed SHA, dirty state, and validation;
+- both access failures and the earliest safe resume step.
+
+Stop further analysis, edits, tests, publication, and worker launches after the
+checkpoint. Keep worktrees, branches, drafts, worker reports, and declarative
+artifacts needed for continuation. Report the retained state and exact resume
+invocation.
+
+On resume, load the matching run or capsule, refresh GitHub through MCP or the
+authenticated fallback, and reconcile live labels, relationships, assignments,
+reviews, and immutable SHAs. Preserve confirmed idempotent progress. Resolve an
+ambiguous mutation by reading current state before deciding whether it remains
+pending.
 
 If a reviewed helper lacks an operation, stop and report the missing interface
 instead of generating an executable workaround. Preserve declarative state so

@@ -1,7 +1,7 @@
 interface:
   display_name: "Pick Up GitHub Work"
-  short_description: "Continue one cohesive issue work unit"
-  default_prompt: "Use $gh-pickup-work for one issue, several compatible issues, a PR, or all open issues matching a label. Always produce one branch/worktree/PR, reuse existing work by default, and start fresh only when I explicitly request it."
+  short_description: "Assess or complete GitHub work"
+  default_prompt: "Use $gh-pickup-work to assess current issue and pull-request state before either completing one cohesive implementation unit or, with --assess-only, publishing only actionable managed evidence and lifecycle status."
 dependencies:
   tools:
     - type: "mcp"

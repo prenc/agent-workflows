@@ -59,7 +59,8 @@ WINDOWS_ABSOLUTE_PATH = re.compile(r"(?i)(?<![A-Za-z0-9_])[A-Z]:[\\/](?:[^\s`'\"
 PUBLIC_TEXT_FIELDS = {"title", "body", "comment"}
 WORKER_SHELL_DENIAL = (
     "The audit worker may use run_shell_command only for constrained direct rg searches "
-    "within roots from the latest task_context; all other shell execution is denied."
+    "or repository-bound read-only gh api requests authorized by the latest task_context; "
+    "all other shell execution is denied."
 )
 RG_REQUIRED_FLAGS = {"--hidden", "--no-config", "--no-ignore-parent", "--no-ignore-vcs"}
 RG_BOOLEAN_FLAGS = RG_REQUIRED_FLAGS | {
@@ -316,6 +317,67 @@ def allowed_worker_search(payload: dict[str, Any]) -> bool:
     )
 
 
+def allowed_worker_github_read(payload: dict[str, Any]) -> bool:
+    """Allow a default-GET gh API read bound to the assigned repository."""
+    tool_input = payload.get("tool_input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    if not isinstance(command, str) or any(
+        value in command for value in ("\n", "\0", "`", "$(", "${")
+    ):
+        return False
+    if re.search(r"\$[A-Za-z_]", command):
+        return False
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="();<>|&")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return False
+    if (
+        len(tokens) not in (3, 4)
+        or tokens[:2] != ["gh", "api"]
+        or any(token and all(character in "();<>|&" for character in token) for token in tokens[2:])
+    ):
+        return False
+    if len(tokens) == 4 and tokens[3] != "--paginate":
+        return False
+
+    context = assigned_task_context(payload)
+    repository = context.get("repository") if isinstance(context, dict) else None
+    if (
+        not isinstance(repository, str)
+        or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None
+    ):
+        return False
+
+    endpoint = tokens[2]
+    if re.fullmatch(r"[A-Za-z0-9._~/?=:+,-]+", endpoint) is None:
+        return False
+    prefix = f"repos/{repository}"
+    if endpoint.casefold() == prefix.casefold():
+        return True
+    if not endpoint.casefold().startswith(f"{prefix}/".casefold()):
+        return False
+    suffix = endpoint[len(prefix) :]
+    path = suffix.split("?", 1)[0]
+    return (
+        re.fullmatch(
+            r"/(?:"
+            r"issues(?:/\d+(?:/(?:comments|timeline|events))?)?"
+            r"|pulls(?:/\d+(?:/(?:files|commits|reviews|comments))?)?"
+            r"|commits(?:/[A-Fa-f0-9]{7,64}(?:/(?:comments|pulls|branches-where-head))?)?"
+            r"|compare/[A-Za-z0-9._/-]+\.\.\.[A-Za-z0-9._/-]+"
+            r"|branches(?:/[A-Za-z0-9._/-]+)?"
+            r"|labels(?:/[A-Za-z0-9_.-]+)?"
+            r"|milestones(?:/\d+)?"
+            r")",
+            path,
+        )
+        is not None
+    )
+
+
 def _bounded_integers(values: list[str | None], *, minimum: int, maximum: int) -> bool:
     if len(values) > 1:
         return False
@@ -462,7 +524,7 @@ def main() -> int:
                     _warn("subagent shell unverifiable against an audit task context; denying")
                     print(json.dumps(decision("deny", WORKER_SHELL_DENIAL)))
                 return 0
-            allowed = allowed_worker_search(payload)
+            allowed = allowed_worker_search(payload) or allowed_worker_github_read(payload)
             print(
                 json.dumps(
                     decision(

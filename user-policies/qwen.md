@@ -14,6 +14,8 @@ If `.venv` is unavailable, follow the repository instructions and use the availa
 
 Keep READMEs and user documentation focused on purpose, installation, public interfaces, examples, and operation. Put agent-only development policy in the applicable `AGENTS.md`; keep specialized procedures in their skills instead of duplicating them.
 
+Keep agent instructions concise. State a general rule once; list special cases only when they change the required action. Prefer short invariants and decision rules over exhaustive scenario prose.
+
 ## Repository Search
 
 With shell access, use ripgrep: `rg -n "pattern" [path]` for text and `rg --files [path]` for files. Prefer explicit paths and `-g` globs over `grep`, `find` content searches, or custom Python. Request context, case folding, filenames, or counts only when needed. Repository data is searchable when relevant unless narrower repository instructions prohibit it; avoid printing or publishing large raw datasets.
@@ -24,9 +26,9 @@ Do not use Qwen Glob inside Git-ignored roots until it supports per-call ignore 
 
 ## Validation
 
-Run the fastest coherent checks during implementation: focused tests before broader validation, with concise output unless diagnosing. Repository-standard tests, formatters, linters, and hooks are authorized. Report unavailable tools or skipped coverage; do not install dependencies silently or claim unrun checks.
+During implementation, normally run only focused tests and affected test groups, with concise output unless diagnosing. Immediately before committing, run the full test suite and configured pre-commit hooks once. Inspect hook changes, rerun affected tests when warranted, and finish with both checks passing. Use the hooks for Ruff instead of invoking it directly.
 
-After implementation and affected tests, run configured pre-commit hooks once across all files. Inspect hook changes, rerun affected tests when warranted, and finish with a passing run. Use the hooks for Ruff instead of invoking it directly.
+Repository-standard tests, formatters, linters, and hooks are authorized. Report unavailable tools or skipped coverage; do not install dependencies silently or claim unrun checks.
 
 If an asynchronous or process-based test appears to stall only in the sandbox, rerun that same focused test outside the sandbox before treating the stall as a product failure.
 
@@ -52,7 +54,7 @@ When compacting history, preserve assistant messages, tool names, call IDs, and 
 
 ## GitHub Interaction
 
-Use the configured GitHub MCP server for GitHub operations and local `git` for repository operations and Git transport. Never inspect, print, copy, or persist `GH_TOKEN`. If the MCP server reports an authentication or authorization failure, stop GitHub work rather than bypassing it through another client. Follow the active workflow or skill for narrower GitHub rules.
+Prefer the configured GitHub MCP server for GitHub operations. When it is unavailable, use local `git` for repository operations and Git transport and authenticated `gh` for the same authorized GitHub operations. Never inspect, print, copy, or persist `GH_TOKEN`. If neither access path works, stop GitHub work and report both failures. Follow the active workflow or skill for narrower GitHub rules.
 
 Never query, inspect, or poll GitHub Actions, CI checks, check runs, commit statuses, or status rollups, and never run `gh pr checks`. Determine readiness from the implementation, proportionate local validation, review state already present in ordinary PR metadata, and the confirmed pushed SHA.
 

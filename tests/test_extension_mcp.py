@@ -35,6 +35,22 @@ from github_workflows.models import (
 )
 from github_workflows.runtime import WorkflowRuntime
 
+
+def skill_text(path: Path) -> str:
+    """Return a skill's always-loaded instructions and local stage references."""
+    documents = [path]
+    references = path.parent / "references"
+    if references.is_dir():
+        documents.extend(
+            sorted(
+                candidate
+                for candidate in references.glob("*.md")
+                if candidate.is_file() and not candidate.is_symlink()
+            )
+        )
+    return "\n".join(document.read_text(encoding="utf-8") for document in documents)
+
+
 ROOT = Path(__file__).parents[1]
 EXTENSION = ROOT / "extensions/github-workflows"
 
@@ -2256,22 +2272,101 @@ class TestExtensionMcp:
                     "no-op"
                 )
 
-    def test_audit_worktree_uses_private_cache_when_local_root_is_not_ignored(self) -> None:
+    def test_audit_worktree_adds_private_exclude_and_uses_local_root(self) -> None:
         with tempfile.TemporaryDirectory(prefix="github-workflows-worktree-root-") as directory:
             root = Path(directory)
             workspace = root / "repo"
             workspace.mkdir()
             self.git("init", "-b", "main", cwd=workspace)
+            self.git("config", "core.excludesFile", "/dev/null", cwd=workspace)
+            exclude = workspace / ".git" / "info" / "exclude"
+            exclude.write_text("# existing local rules\n", encoding="utf-8")
 
             runtime = WorkflowRuntime(workspace, root / "qwen-project")
             cache = root / "cache"
 
             with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": str(cache)}):
                 worktree_root = runtime._worktree_root()
+                repeated = runtime._worktree_root()
 
-            assert worktree_root.parent == cache / "agent-workflows" / "worktrees"
+            assert worktree_root == (workspace / ".worktrees").resolve()
+            assert repeated == worktree_root
             assert stat.S_IMODE(worktree_root.stat().st_mode) == 0o700
-            assert stat.S_IMODE(worktree_root.parent.stat().st_mode) == 0o700
+            assert exclude.read_text(encoding="utf-8") == ("# existing local rules\n.worktrees/\n")
+            assert not cache.exists()
+            ignored = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(workspace),
+                    "check-ignore",
+                    "-q",
+                    "--no-index",
+                    ".worktrees/probe",
+                ],
+                check=False,
+            )
+            assert ignored.returncode == 0
+            status = subprocess.run(
+                ["git", "-C", str(workspace), "status", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            assert status.stdout == ""
+
+    def test_audit_worktree_rejects_symlinked_private_exclude(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="github-workflows-worktree-exclude-") as directory:
+            root = Path(directory)
+            workspace = root / "repo"
+            workspace.mkdir()
+            self.git("init", "-b", "main", cwd=workspace)
+            self.git("config", "core.excludesFile", "/dev/null", cwd=workspace)
+            exclude = workspace / ".git" / "info" / "exclude"
+            exclude.unlink()
+            target = root / "untrusted-exclude"
+            target.write_text("", encoding="utf-8")
+            exclude.symlink_to(target)
+            runtime = WorkflowRuntime(workspace, root / "qwen-project")
+
+            with pytest.raises(PermissionError, match="owned regular file"):
+                runtime._worktree_root()
+            assert target.read_text(encoding="utf-8") == ""
+
+    def test_audit_worktree_rejects_symlinked_git_info_directory(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="github-workflows-worktree-info-") as directory:
+            root = Path(directory)
+            workspace = root / "repo"
+            workspace.mkdir()
+            self.git("init", "-b", "main", cwd=workspace)
+            self.git("config", "core.excludesFile", "/dev/null", cwd=workspace)
+            info = workspace / ".git" / "info"
+            exclude = info / "exclude"
+            existing = exclude.read_bytes()
+            target = root / "untrusted-info"
+            target.mkdir()
+            info.rename(workspace / ".git" / "original-info")
+            info.symlink_to(target, target_is_directory=True)
+            runtime = WorkflowRuntime(workspace, root / "qwen-project")
+
+            with pytest.raises(PermissionError, match="info directory"):
+                runtime._worktree_root()
+            assert not (target / "exclude").exists()
+            assert (workspace / ".git" / "original-info" / "exclude").read_bytes() == existing
+
+    def test_audit_worktree_appends_to_non_utf8_private_exclude(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="github-workflows-worktree-bytes-") as directory:
+            root = Path(directory)
+            workspace = root / "repo"
+            workspace.mkdir()
+            self.git("init", "-b", "main", cwd=workspace)
+            self.git("config", "core.excludesFile", "/dev/null", cwd=workspace)
+            exclude = workspace / ".git" / "info" / "exclude"
+            exclude.write_bytes(b"# local \xffrule")
+            runtime = WorkflowRuntime(workspace, root / "qwen-project")
+
+            assert runtime._worktree_root() == (workspace / ".worktrees").resolve()
+            assert exclude.read_bytes() == b"# local \xffrule\n.worktrees/\n"
 
     def test_audit_worktree_rejects_symlinked_application_cache(self) -> None:
         with tempfile.TemporaryDirectory(prefix="github-workflows-worktree-cache-") as directory:
@@ -2310,10 +2405,15 @@ class TestExtensionMcp:
             manifest["mcpServers"]["github_workflows"]["command"]
             == "${extensionPath}${/}..${/}..${/}.venv${/}bin${/}agent-workflows"
         )
+        canonical_references = (EXTENSION / "references").resolve()
         for discovered in (EXTENSION / "skills", EXTENSION / "agents", EXTENSION / "references"):
             for path in discovered.rglob("*"):
                 if path.is_symlink():
-                    pytest.fail(f"extension resource must not be a symlink: {path}")
+                    resolved = path.resolve(strict=True)
+                    assert path.parent.name == "references"
+                    assert path.parent.parent.parent == EXTENSION / "skills"
+                    assert resolved.is_file()
+                    assert resolved.parent == canonical_references
 
     def test_shared_guidance_defines_github_pagination_and_pr_label_calls(self) -> None:
         runtime_policy = (EXTENSION / "references/github-runtime-policy.md").read_text(
@@ -2352,34 +2452,35 @@ class TestExtensionMcp:
             "curator worker": EXTENSION / "agents/gh-curate-issues-worker.md",
             "implementation": EXTENSION / "skills/gh-implement-issue/SKILL.md",
             "pickup": ROOT / "codex/skills/gh-pickup-work/SKILL.md",
-            "reassessment": ROOT / "codex/skills/gh-reassess-work/SKILL.md",
         }
 
         for name, path in documents.items():
-            content = path.read_text(encoding="utf-8")
+            content = skill_text(path)
             assert "highest" in content, name
             assert "area" in content, name
             assert "type" in content, name
             assert "priority" in content, name
 
     def test_codex_workflows_avoid_non_actionable_public_chatter(self) -> None:
-        pickup = (ROOT / "codex/skills/gh-pickup-work/SKILL.md").read_text(encoding="utf-8")
-        reassessment = (ROOT / "codex/skills/gh-reassess-work/SKILL.md").read_text(encoding="utf-8")
+        pickup = skill_text(ROOT / "codex/skills/gh-pickup-work/SKILL.md")
+        assessment = (ROOT / "codex/skills/gh-pickup-work/references/assessment.md").read_text(
+            encoding="utf-8"
+        )
         comment_format = (
-            ROOT / "codex/skills/gh-reassess-work/references/comment-format.md"
+            ROOT / "codex/skills/gh-pickup-work/references/comment-format.md"
         ).read_text(encoding="utf-8")
         pickup = " ".join(pickup.split())
-        reassessment = " ".join(reassessment.split())
+        assessment = " ".join(assessment.split())
         comment_format = " ".join(comment_format.split())
 
         assert all(
-            term in reassessment
+            term in assessment
             for term in (
                 "transactionally claim every open graph node",
                 "compare every non-lifecycle snapshot fact",
                 "This applies to linked and unlinked PRs",
                 "sole durable GitHub mutation in the ordinary clean case is adding a missing PR",
-                "Delete this workflow's existing managed PR comment",
+                "Delete this skill's existing managed PR comment",
                 "deletion of an obsolete owned managed comment",
                 "Finalize PRs before issues",
             )
@@ -2391,7 +2492,7 @@ class TestExtensionMcp:
         assert all(
             term in pickup
             for term in (
-                "Never add issue or PR conversation comments",
+                "Never publish a clean-result comment",
                 "do not manufacture an implementation change",
                 "apply only a missing `ready-to-merge` label",
                 "attempt a read-only verification fast path",
@@ -2401,12 +2502,68 @@ class TestExtensionMcp:
             )
         )
 
-    def test_qwen_workflows_skip_non_actionable_github_mutations(self) -> None:
-        implementation = (EXTENSION / "skills/gh-implement-issue/SKILL.md").read_text(
-            encoding="utf-8"
+    def test_pickup_owns_assessment_and_implementation_modes(self) -> None:
+        skill = ROOT / "codex/skills/gh-pickup-work"
+        source = (skill / "SKILL.md").read_text(encoding="utf-8")
+        source = " ".join(source.split())
+        assessment = (skill / "references/assessment.md").read_text(encoding="utf-8")
+
+        assert not (ROOT / "codex/skills/gh-reassess-work").exists()
+        assert all(
+            term in source
+            for term in (
+                "`--assess-only` ends after assessment",
+                "complete it before any implementation mutation",
+                "publish the managed finding",
+                "stop before implementation",
+                "may assess a non-cohesive",
+            )
         )
+        assert all(
+            term in assessment
+            for term in (
+                "transactionally claim every open graph node",
+                "Create or update an issue-specific managed reassessment comment",
+                "Delete this skill's existing managed PR comment",
+                "Apply PR `ready-to-merge`",
+            )
+        )
+        assert (skill / "scripts/update_managed_comment.py").is_file()
+
+    def test_large_skills_route_to_stage_references(self) -> None:
+        expected = {
+            ROOT / "codex/skills/gh-pickup-work/SKILL.md": (
+                "assessment.md",
+                "workspace-and-implementation.md",
+                "publication.md",
+            ),
+            EXTENSION / "skills/gh-audit-repo/SKILL.md": (
+                "run-and-context.md",
+                "discovery-and-verification.md",
+                "validation-and-publication.md",
+            ),
+            EXTENSION / "skills/gh-implement-issue/SKILL.md": (
+                "intake-and-worktrees.md",
+                "implementation-rounds.md",
+                "promotion-and-finalization.md",
+            ),
+            EXTENSION / "skills/gh-curate-issues/SKILL.md": (
+                "history-and-workers.md",
+                "reconciliation-and-publication.md",
+            ),
+        }
+
+        for source, reference_names in expected.items():
+            content = source.read_text(encoding="utf-8")
+            assert len(content.splitlines()) < 500
+            for name in reference_names:
+                assert f"references/{name}" in content
+                assert (source.parent / "references" / name).is_file()
+
+    def test_qwen_workflows_skip_non_actionable_github_mutations(self) -> None:
+        implementation = skill_text(EXTENSION / "skills/gh-implement-issue/SKILL.md")
         worker = (EXTENSION / "agents/gh-implement-issue-worker.md").read_text(encoding="utf-8")
-        curator = (EXTENSION / "skills/gh-curate-issues/SKILL.md").read_text(encoding="utf-8")
+        curator = skill_text(EXTENSION / "skills/gh-curate-issues/SKILL.md")
         implementation = " ".join(implementation.split())
         worker = " ".join(worker.split())
         curator = " ".join(curator.split())
@@ -2439,7 +2596,7 @@ class TestExtensionMcp:
             encoding="utf-8"
         )
         reassessment_comments = (
-            ROOT / "codex/skills/gh-reassess-work/references/comment-format.md"
+            ROOT / "codex/skills/gh-pickup-work/references/comment-format.md"
         ).read_text(encoding="utf-8")
         audit_worker = (EXTENSION / "agents/gh-audit-repo-worker.md").read_text(encoding="utf-8")
 
@@ -2452,7 +2609,7 @@ class TestExtensionMcp:
         assert "immutable SHAs in private workflow evidence" in issue_conventions
 
     def test_implementation_guidance_requires_evidence_based_validation_and_drafts(self) -> None:
-        supervisor = (EXTENSION / "skills/gh-implement-issue/SKILL.md").read_text(encoding="utf-8")
+        supervisor = skill_text(EXTENSION / "skills/gh-implement-issue/SKILL.md")
         worker = (EXTENSION / "agents/gh-implement-issue-worker.md").read_text(encoding="utf-8")
         runtime_policy = (EXTENSION / "references/github-runtime-policy.md").read_text(
             encoding="utf-8"
@@ -2480,7 +2637,7 @@ class TestExtensionMcp:
             term in supervisor
             for term in ("GIT_TERMINAL_PROMPT=0", "push --dry-run", "exact remote")
         )
-        codex_skill = (ROOT / "codex/skills/gh-pickup-work/SKILL.md").read_text(encoding="utf-8")
+        codex_skill = skill_text(ROOT / "codex/skills/gh-pickup-work/SKILL.md")
         assert all(
             term in codex_skill
             for term in ("GIT_TERMINAL_PROMPT=0", "push --dry-run", "exact remote")
@@ -2508,7 +2665,7 @@ class TestExtensionMcp:
         )
 
     def test_audit_guidance_handles_provider_and_assignment_failures(self) -> None:
-        supervisor = (EXTENSION / "skills/gh-audit-repo/SKILL.md").read_text(encoding="utf-8")
+        supervisor = skill_text(EXTENSION / "skills/gh-audit-repo/SKILL.md")
         worker = (EXTENSION / "agents/gh-audit-repo-worker.md").read_text(encoding="utf-8")
 
         for document in (supervisor, worker):
@@ -2517,21 +2674,135 @@ class TestExtensionMcp:
         discover_mode = worker.split("## Discover mode", 1)[1].split("## Verify mode", 1)[0]
         assert "check conclusions" in discover_mode
 
-    def test_mcp_suspension_handles_missing_restored_session_tools(self) -> None:
-        policy = (EXTENSION / "references/github-mcp-suspension.md").read_text(encoding="utf-8")
+    def test_github_access_falls_back_before_stopping(self) -> None:
+        policy = (EXTENSION / "references/github-access.md").read_text(encoding="utf-8")
+        normalized = " ".join(policy.split())
 
         assert all(
-            term in policy
+            term in normalized
             for term in (
+                "Prefer GitHub MCP as the primary interface",
                 "connected status badge",
-                "restored session",
-                "do not spawn",
-                "new session",
+                "authenticated `git`/`gh` fallback",
+                "neither route",
+                "both failures",
             )
         )
 
+    def test_github_skills_prefer_mcp_with_cli_fallback(self) -> None:
+        skills = (
+            ROOT / "codex/skills/gh-pickup-work/SKILL.md",
+            EXTENSION / "skills/gh-propose-enhancement/SKILL.md",
+            EXTENSION / "skills/gh-curate-issues/SKILL.md",
+            EXTENSION / "skills/gh-implement-issue/SKILL.md",
+            EXTENSION / "skills/gh-audit-repo/SKILL.md",
+        )
+
+        for path in skills:
+            document = skill_text(path) + (EXTENSION / "references/github-access.md").read_text(
+                encoding="utf-8"
+            )
+            normalized = " ".join(document.split())
+            assert "Prefer" in normalized
+            assert "GitHub MCP" in normalized
+            assert "authenticated `gh`" in normalized
+            assert any(
+                term in normalized
+                for term in ("neither route", "neither access path", "both routes")
+            )
+
+    def test_extension_skills_use_skill_local_references(self) -> None:
+        for path in (EXTENSION / "skills").glob("*/SKILL.md"):
+            assert "../../references/" not in path.read_text(encoding="utf-8")
+
+    def test_skills_route_directly_to_canonical_contracts(self) -> None:
+        for name in (
+            "gh-propose-enhancement",
+            "gh-curate-issues",
+            "gh-implement-issue",
+            "gh-audit-repo",
+        ):
+            skill = EXTENSION / "skills" / name
+            source = (skill / "SKILL.md").read_text(encoding="utf-8")
+            assert "references/github-access.md" in source
+            assert "references/github-runtime-policy.md" in source
+            assert "references/workflow-policy.md" not in source
+            assert not (skill / "references/workflow-policy.md").exists()
+
+    def test_skill_packages_follow_portable_structure(self) -> None:
+        roots = (ROOT / "codex/skills", EXTENSION / "skills")
+        name_pattern = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+        link_pattern = re.compile(r"\[[^]]+\]\(([^)#]+)(?:#[^)]+)?\)")
+
+        for root in roots:
+            for skill in (path for path in root.iterdir() if path.is_dir()):
+                source = skill / "SKILL.md"
+                assert source.is_file()
+                content = source.read_text(encoding="utf-8")
+                assert content.startswith("---\n")
+                frontmatter = content.split("---", 2)[1]
+                name = re.search(r"^name:\s*(\S+)\s*$", frontmatter, re.MULTILINE)
+                description = re.search(r"^description:\s*(?:>|>-)?", frontmatter, re.MULTILINE)
+                assert name is not None
+                assert description is not None
+                assert name.group(1) == skill.name
+                assert name_pattern.fullmatch(name.group(1))
+
+                resources = [source]
+                references = skill / "references"
+                if references.is_dir():
+                    resources.extend(
+                        path
+                        for path in references.iterdir()
+                        if path.is_file() and not path.is_symlink()
+                    )
+                for resource in resources:
+                    for raw_link in link_pattern.findall(resource.read_text(encoding="utf-8")):
+                        relative = Path(raw_link)
+                        assert not relative.is_absolute()
+                        assert ".." not in relative.parts
+                        target = (resource.parent / relative).resolve()
+                        assert target.exists()
+                        assert target.is_relative_to(ROOT.resolve())
+
+        manifest = json.loads((EXTENSION / "qwen-extension.json").read_text(encoding="utf-8"))
+        assert manifest["skills"] == "skills"
+
+    def test_skill_local_canonical_references_do_not_drift(self) -> None:
+        references = {
+            "gh-propose-enhancement": (
+                "github-access.md",
+                "github-issue-conventions.md",
+                "github-runtime-policy.md",
+            ),
+            "gh-curate-issues": (
+                "github-access.md",
+                "github-issue-conventions.md",
+                "github-runtime-policy.md",
+            ),
+            "gh-implement-issue": (
+                "github-access.md",
+                "github-issue-conventions.md",
+                "github-pr-template.md",
+                "github-runtime-policy.md",
+            ),
+            "gh-audit-repo": (
+                "github-access.md",
+                "github-issue-conventions.md",
+                "github-runtime-policy.md",
+            ),
+        }
+
+        for skill, names in references.items():
+            for name in names:
+                canonical = EXTENSION / "references" / name
+                local = EXTENSION / "skills" / skill / "references" / name
+                assert local.is_symlink()
+                assert local.resolve(strict=True) == canonical.resolve(strict=True)
+                assert local.read_bytes() == canonical.read_bytes()
+
     def test_audit_guidance_uses_server_owned_candidate_fingerprints(self) -> None:
-        supervisor = (EXTENSION / "skills/gh-audit-repo/SKILL.md").read_text(encoding="utf-8")
+        supervisor = skill_text(EXTENSION / "skills/gh-audit-repo/SKILL.md")
         worker = (EXTENSION / "agents/gh-audit-repo-worker.md").read_text(encoding="utf-8")
 
         for document in (supervisor, worker):
@@ -2540,7 +2811,7 @@ class TestExtensionMcp:
             assert "never calculate" in document
 
     def test_audit_guidance_makes_inventory_authoritative_for_host_facts(self) -> None:
-        supervisor = (EXTENSION / "skills/gh-audit-repo/SKILL.md").read_text(encoding="utf-8")
+        supervisor = skill_text(EXTENSION / "skills/gh-audit-repo/SKILL.md")
         worker = (EXTENSION / "agents/gh-audit-repo-worker.md").read_text(encoding="utf-8")
 
         for document in (supervisor, worker):
@@ -2550,7 +2821,7 @@ class TestExtensionMcp:
             assert "standard-library root" in document
 
     def test_audit_guidance_handles_notebooks_and_full_issue_reads_explicitly(self) -> None:
-        supervisor = (EXTENSION / "skills/gh-audit-repo/SKILL.md").read_text(encoding="utf-8")
+        supervisor = skill_text(EXTENSION / "skills/gh-audit-repo/SKILL.md")
         worker = (EXTENSION / "agents/gh-audit-repo-worker.md").read_text(encoding="utf-8")
         policy = (EXTENSION / "references/github-runtime-policy.md").read_text(encoding="utf-8")
 
@@ -2568,9 +2839,9 @@ class TestExtensionMcp:
 
     def test_worktree_environment_contract_is_consistent_across_agents(self) -> None:
         workflow_documents = [
-            (ROOT / "codex/skills/gh-pickup-work/SKILL.md").read_text(encoding="utf-8"),
+            skill_text(ROOT / "codex/skills/gh-pickup-work/SKILL.md"),
             (EXTENSION / "references/github-runtime-policy.md").read_text(encoding="utf-8"),
-            (EXTENSION / "skills/gh-implement-issue/SKILL.md").read_text(encoding="utf-8"),
+            skill_text(EXTENSION / "skills/gh-implement-issue/SKILL.md"),
             (EXTENSION / "agents/gh-implement-issue-worker.md").read_text(encoding="utf-8"),
         ]
 
@@ -2626,8 +2897,25 @@ class TestExtensionMcp:
             "\nuv lock --offline --no-python-downloads"
         )
 
+    def test_worktree_workflows_use_repository_private_excludes(self) -> None:
+        documents = (
+            skill_text(ROOT / "codex/skills/gh-pickup-work/SKILL.md"),
+            skill_text(EXTENSION / "skills/gh-implement-issue/SKILL.md"),
+            skill_text(EXTENSION / "skills/gh-audit-repo/SKILL.md"),
+        )
+
+        for document in documents:
+            document = " ".join(document.split())
+            assert ".git/info/exclude" in document
+            assert any(
+                phrase in document
+                for phrase in ("repository-private `.git/info/exclude`", "local rule only")
+            )
+            assert "<project>/.worktrees" in document
+            assert "fallback root:" not in document
+
     def test_isolated_environment_preflights_every_validation_executable(self) -> None:
-        supervisor = (EXTENSION / "skills/gh-implement-issue/SKILL.md").read_text(encoding="utf-8")
+        supervisor = skill_text(EXTENSION / "skills/gh-implement-issue/SKILL.md")
 
         assert all(
             term in supervisor
@@ -2694,7 +2982,7 @@ class TestExtensionMcp:
     def test_audit_context_guidance_uses_server_evidence_and_candidate_verdict_identity(
         self,
     ) -> None:
-        supervisor = (EXTENSION / "skills/gh-audit-repo/SKILL.md").read_text(encoding="utf-8")
+        supervisor = skill_text(EXTENSION / "skills/gh-audit-repo/SKILL.md")
         worker = (EXTENSION / "agents/gh-audit-repo-worker.md").read_text(encoding="utf-8")
 
         assert "`candidate_id` as its sole identity" in supervisor
@@ -2735,10 +3023,30 @@ class TestExtensionMcp:
 
         assert all("approvalMode: yolo" in value for value in frontmatters.values())
         assert "  - run_shell_command" in frontmatters["gh-audit-repo-worker.md"]
-        assert "  - run_shell_command" not in frontmatters["gh-curate-issues-worker.md"]
+        assert "  - run_shell_command" in frontmatters["gh-curate-issues-worker.md"]
         assert "EXECUTION_BLOCKED" in (EXTENSION / "references/github-runtime-policy.md").read_text(
             encoding="utf-8"
         )
+
+    def test_github_workers_fallback_without_changing_ownership(self) -> None:
+        workers = tuple(
+            (EXTENSION / "agents" / name).read_text(encoding="utf-8")
+            for name in (
+                "gh-audit-repo-worker.md",
+                "gh-curate-issues-worker.md",
+                "gh-implement-issue-worker.md",
+            )
+        )
+
+        normalized_workers = tuple(" ".join(worker.split()) for worker in workers)
+        for worker in normalized_workers:
+            assert "authenticated `gh" in worker
+            assert "both" in worker
+            assert "fail" in worker
+            assert "Never inspect or inject tokens" in worker
+        implementation = normalized_workers[2]
+        assert "worker-owned draft PR" in implementation
+        assert "Keep all writes within" in implementation
 
     def test_feedback_skill_contract_is_consistent_across_clients(self) -> None:
         codex = (ROOT / "codex/skills/workflow-feedback/SKILL.md").read_text(encoding="utf-8")

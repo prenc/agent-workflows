@@ -1,1 +1,0 @@
-../../../../extensions/github-workflows/references/github-issue-conventions.md
