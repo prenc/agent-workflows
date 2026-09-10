@@ -614,34 +614,46 @@ class WorkflowRuntime:
         sha = source_sha
         worktree = self._worktree_root() / f"gh-audit-repo-{sha[:7]}"
         if worktree.exists():
-            actual = subprocess.run(
-                ["git", "-C", str(worktree), "rev-parse", "HEAD"],
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
+            try:
+                actual = subprocess.run(
+                    ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=GIT_TIMEOUT_SECONDS,
+                ).stdout.strip()
+            except subprocess.TimeoutExpired as error:
+                raise ValueError(
+                    f"retained worktree HEAD verification timed out after {GIT_TIMEOUT_SECONDS} s"
+                ) from error
             if actual != sha:
                 raise ValueError("the retained audit worktree points to a different commit")
         else:
             worktree.parent.mkdir(parents=True, exist_ok=True)
-            subprocess.run(
-                [
-                    "git",
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                    "-C",
-                    str(self.workspace),
-                    "worktree",
-                    "add",
-                    "--detach",
-                    str(worktree),
-                    sha,
-                ],
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
+            try:
+                subprocess.run(
+                    [
+                        "git",
+                        "-c",
+                        "core.hooksPath=/dev/null",
+                        "-C",
+                        str(self.workspace),
+                        "worktree",
+                        "add",
+                        "--detach",
+                        str(worktree),
+                        sha,
+                    ],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=GIT_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired as error:
+                raise ValueError(
+                    f"audit worktree creation timed out after {GIT_TIMEOUT_SECONDS} s"
+                ) from error
         project_venv = self.workspace / ".venv"
         worktree_venv = worktree / ".venv"
         if project_venv.is_dir() and not worktree_venv.exists():
@@ -1408,20 +1420,26 @@ class WorkflowRuntime:
                     previous, Path(str(inputs["audit_worktree"])).resolve()
                 )
                 if stale is not None:
-                    subprocess.run(
-                        [
-                            "git",
-                            "-C",
-                            str(self.workspace),
-                            "worktree",
-                            "remove",
-                            "--force",
-                            str(stale),
-                        ],
-                        check=True,
-                        capture_output=True,
-                        text=True,
-                    )
+                    try:
+                        subprocess.run(
+                            [
+                                "git",
+                                "-C",
+                                str(self.workspace),
+                                "worktree",
+                                "remove",
+                                "--force",
+                                str(stale),
+                            ],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                            timeout=GIT_TIMEOUT_SECONDS,
+                        )
+                    except subprocess.TimeoutExpired as error:
+                        raise ValueError(
+                            f"stale worktree removal timed out after {GIT_TIMEOUT_SECONDS} s"
+                        ) from error
         else:
             limit = request.invocation()["n"]
             inputs["tasks"] = {}
@@ -1432,17 +1450,23 @@ class WorkflowRuntime:
             }
             inputs["pending"] = []
         with self.lock():
-            if previous is not None:
-                current = self.current(workflow)
-                fresh = workflow_run.load_state(current) if current.is_dir() else None
-                if (
+            current = self.current(workflow)
+            fresh = workflow_run.load_state(current) if current.is_dir() else None
+            # The cold case re-validates too: a run that appeared while the
+            # source-and-worktree phase ran unlocked was initialized by a
+            # concurrent start and must not be discarded and reinitialized.
+            if previous is None:
+                changed = fresh is not None
+            else:
+                changed = (
                     fresh is None
                     or fresh.get("run_id") != previous["run_id"]
                     or fresh.get("revision") != expected_revision
-                ):
-                    raise RuntimeError(
-                        "workflow state changed while the run start was in flight; retry"
-                    )
+                )
+            if changed:
+                raise RuntimeError(
+                    "workflow state changed while the run start was in flight; retry"
+                )
             self._discard_stale_run(
                 workflow, acknowledged_publication=request.acknowledge_pending_publication
             )

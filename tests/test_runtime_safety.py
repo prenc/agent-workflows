@@ -4077,6 +4077,67 @@ class TestRuntimeSafety:
             assert state["status"] == "in-progress"
             assert state["phases"]["structure"]["status"] == "in-progress"
 
+    def test_run_start_cold_concurrency_raises_in_flight_conflict(self, monkeypatch) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-start-cold-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            monkeypatch.setenv("XDG_CACHE_HOME", str(Path(directory) / "xdg-cache"))
+            started = threading.Event()
+            first_slow = threading.Event()
+            confirmed_source_sha = subprocess.run(
+                ["git", "-C", str(runtime.workspace), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            real = WorkflowRuntime._source_and_worktree
+
+            def slow(self: WorkflowRuntime, confirmed_sha: str | None) -> dict[str, Any]:
+                if not first_slow.is_set():
+                    first_slow.set()
+                    started.set()
+                    time.sleep(2.0)
+                return real(self, confirmed_sha)
+
+            errors: list[Exception] = []
+            receipts: dict[str, Any] = {}
+
+            def audit_start() -> None:
+                try:
+                    receipts["thread"] = runtime.run_manage(
+                        RunManageRequest(
+                            action="start",
+                            workflow="gh-audit-repo",
+                            repository="example/repo",
+                            confirmed_source_sha=confirmed_source_sha,
+                        )
+                    )
+                except Exception as error:  # noqa: BLE001 - cross-thread error capture
+                    errors.append(error)
+
+            with mock.patch.object(WorkflowRuntime, "_source_and_worktree", slow):
+                thread = threading.Thread(target=audit_start)
+                thread.start()
+                assert started.wait(10)
+                time.sleep(0.3)
+                receipts["main"] = runtime.run_manage(
+                    RunManageRequest(
+                        action="start",
+                        workflow="gh-audit-repo",
+                        repository="example/repo",
+                        confirmed_source_sha=confirmed_source_sha,
+                    )
+                )
+                thread.join(timeout=60)
+
+            assert not thread.is_alive()
+            assert "thread" not in receipts
+            assert len(errors) == 1
+            assert isinstance(errors[0], RuntimeError)
+            assert "workflow state changed while the run start was in flight" in str(errors[0])
+            state = runtime.state("gh-audit-repo")
+            assert state["status"] == "in-progress"
+            assert receipts["main"]["run_id"] == state["run_id"]
+
     def test_probe_git_timeout_is_bounded_and_refused(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-probe-git-") as directory:
             runtime = self.make_runtime(Path(directory))
@@ -4112,3 +4173,32 @@ class TestRuntimeSafety:
                 WorkflowRuntime._verified_audit_worktree_head(
                     {"audit_worktree": "/missing", "sha": "a" * 40}
                 )
+
+    def test_worktree_root_check_ignore_times_out(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-check-ignore-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            blocked = subprocess.TimeoutExpired(cmd=["git"], timeout=10)
+            with mock.patch("github_workflows.runtime.subprocess.run", side_effect=blocked):
+                with pytest.raises(ValueError, match="check-ignore timed out"):
+                    runtime._worktree_root()
+
+    def test_audit_worktree_add_times_out(self, monkeypatch) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-worktree-add-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            monkeypatch.setenv("XDG_CACHE_HOME", str(Path(directory) / "xdg-cache"))
+            confirmed_source_sha = subprocess.run(
+                ["git", "-C", str(runtime.workspace), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            real_run = subprocess.run
+
+            def stalled_add(cmd, *args, **kwargs):
+                if "worktree" in cmd and "add" in cmd:
+                    raise subprocess.TimeoutExpired(cmd=cmd, timeout=10)
+                return real_run(cmd, *args, **kwargs)
+
+            with mock.patch("github_workflows.runtime.subprocess.run", side_effect=stalled_add):
+                with pytest.raises(ValueError, match="worktree creation timed out"):
+                    runtime._source_and_worktree(confirmed_source_sha)
