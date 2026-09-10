@@ -863,6 +863,22 @@ class TestExtensionMcp:
                 "history_manage",
                 {"action": "ingest", "records": [{"kind": "issue", "number": 1}]},
             ),
+            (
+                "history_manage",
+                {
+                    "action": "ingest",
+                    "records": [{"kind": "issue", "number": 1}],
+                    "artifacts": [],
+                },
+            ),
+            (
+                "history_manage",
+                {
+                    "action": "ingest",
+                    "artifacts": [{"kind": "issue", "path": "issue.json"}],
+                    "records": [],
+                },
+            ),
             ("history_manage", {"action": "commit", "default_sha": "a" * 40}),
             ("history_query", {"state": "open", "limit": 100}),
             ("audit_inventory", {"action": "program", "programs": [{"name": "python"}]}),
