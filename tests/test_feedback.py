@@ -2001,6 +2001,67 @@ def test_feedback_reader_quarantines_malformed_and_torn_lines(cache: Path) -> No
     assert stored_ids == ["fb-123456789abc", appended["feedback_id"]]
 
 
+def test_feedback_reader_quarantines_store_line_when_json_decoder_recurses(
+    cache: Path,
+) -> None:
+    path = feedback.storage_path()
+    path.parent.mkdir(parents=True)
+    valid = {
+        "feedback_id": "fb-123456789abc",
+        "timestamp": "2026-09-02T12:00:00Z",
+        "status": "open",
+        "message": "Surviving record",
+    }
+    path.write_bytes((json.dumps(valid) + "\n" + "deeply nested store line\n").encode())
+    real_loads = json.loads
+
+    def loads(value: str, *args: object, **kwargs: object) -> object:
+        if value.strip() == "deeply nested store line":
+            raise RecursionError
+        return real_loads(value, *args, **kwargs)
+
+    with mock.patch.object(feedback.json, "loads", side_effect=loads):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            records = feedback.read_records()
+
+    assert [record["feedback_id"] for record in records] == ["fb-123456789abc"]
+    messages = [str(warning.message) for warning in caught]
+    assert "line 2" in messages[0]
+    assert "feedback JSON" in messages[0]
+
+    # Subsequent operations complete without manual file editing.
+    assert len(feedback.read_records()) == 1
+    appended = append_feedback(message="Recorded after the deep line")
+    stored_ids = [record["feedback_id"] for record in feedback.read_records()]
+    assert stored_ids == ["fb-123456789abc", appended["feedback_id"]]
+
+
+def test_feedback_transcript_windows_skip_row_when_json_decoder_recurses(
+    tmp_path: Path,
+) -> None:
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text('{"a": 1}\ndeeply nested transcript row\n{"b": 2}\n', encoding="utf-8")
+    real_loads = json.loads
+
+    def loads(value: str, *args: object, **kwargs: object) -> object:
+        if value.strip() == "deeply nested transcript row":
+            raise RecursionError
+        return real_loads(value, *args, **kwargs)
+
+    with mock.patch.object(feedback.json, "loads", side_effect=loads):
+        windows = list(feedback._iter_transcript_windows(transcript))
+
+    assert [value for _window, value in windows] == [{"a": 1}, {"b": 2}]
+    assert [len(window) for window, _value in windows] == [0, 1]
+
+
+def test_feedback_hook_id_returns_none_when_string_decode_recurses() -> None:
+    payload = json.dumps({"recorded": True, "feedback_id": "fb-0123456789ab"})
+    with mock.patch.object(feedback.json, "loads", side_effect=RecursionError):
+        assert feedback._hook_feedback_id(payload) is None
+
+
 def test_feedback_append_recovers_torn_trailing_line(cache: Path) -> None:
     first = append_feedback(message="Surviving record")
     path = feedback.storage_path()
