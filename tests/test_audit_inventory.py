@@ -275,6 +275,31 @@ class TestAuditInventory:
         assert fact["returncode"] == 1
         assert len(fact["stdout"]) == inventory_module.OUTPUT_BYTES
 
+    def test_program_probe_scratch_fill_bounded_by_tmpfs(self, monkeypatch) -> None:
+        monkeypatch.setattr(inventory_module.audit_sandbox, "SCRATCH_BYTES", 512 * 1024)
+        with tempfile.TemporaryDirectory(prefix="audit-inventory-bin-") as binary_dir:
+            executable = Path(binary_dir) / "scratch-filler"
+            executable.write_text(
+                "#!/usr/bin/python3\n"
+                "i = 0\n"
+                "while True:\n"
+                "    with open(f'fill-{i}', 'wb') as handle:\n"
+                "        handle.write(b'x' * (64 * 1024))\n"
+                "    i += 1\n"
+            )
+            executable.chmod(0o755)
+            monkeypatch.setenv("PATH", f"{binary_dir}:{os.environ['PATH']}")
+            fact = inventory_module.probe_program(
+                self.project, self.worktree, self.run_dir, "scratch-filler", ["--version"]
+            )
+        assert fact["available"]
+        # the child's fill loop (cwd is the scratch root) ends in ENOSPC at the
+        # configured scratch bound: the bound holds on the inventory path too,
+        # and exhaustion is a typed failed fact with no new exception path
+        assert fact["probe_status"] == "failed"
+        assert fact["returncode"] == 1
+        assert "No space left on device" in fact["stderr"]
+
     def test_program_probe_timeout_kills_sandboxed_descendants(self, monkeypatch) -> None:
         monkeypatch.setattr(inventory_module, "WALL_SECONDS", 2)
         sentinel = f"orphan-sentinel-{uuid.uuid4().hex}"
