@@ -343,6 +343,31 @@ def move_invalid_live_to_backup(directory: Path, live: Path) -> None:
     secure_file(backup)
 
 
+def guarded_committed_generation(directory: Path, live: Path, repo: str, kind: str) -> int:
+    """Read a committed cache's generation, quarantining a cache that fails it.
+
+    Rebuilds and commits anchor the generation-conflict check to the committed
+    cache, so a cache that fails the generation read (zeroed magic, zero
+    length, integrity or identity mismatch) must not abort with a raw SQLite
+    error: it is moved to a .invalid-* backup preserving the data and treated
+    as absent with generation 0, mirroring the plain-prepare live recovery.
+    An unsafe filesystem entry is refused with an actionable error instead.
+    """
+    try:
+        return committed_generation(live, repo, kind)
+    except (ValueError, sqlite3.DatabaseError):
+        classified = database_state(live, repo, kind)
+        state = classified["staging_state"]
+        if state == "absent":
+            return 0
+        if state in {"empty", "invalid"} and classified.get("safe_to_abort"):
+            move_invalid_live_to_backup(directory, live)
+            return 0
+        raise ValueError(
+            f"committed cache is an unsafe filesystem entry and requires inspection: {live}"
+        ) from None
+
+
 def prepare_database(args: argparse.Namespace, kind: str) -> None:
     run_id = validated_run_id(args.run_id)
     directory = repo_dir(args.cache_root, args.repo)
@@ -393,8 +418,10 @@ def prepare_database(args: argparse.Namespace, kind: str) -> None:
     reuse_live = live.exists() and not args.rebuild
     if args.rebuild and live.exists():
         # A rebuild replaces the committed cache; anchor the commit's
-        # generation-conflict check to the cache being replaced.
-        base_generation = committed_generation(live, args.repo, kind)
+        # generation-conflict check to the cache being replaced. A cache that
+        # fails the read is quarantined and anchored at base 0 instead of
+        # aborting the rebuild with a raw SQLite error.
+        base_generation = guarded_committed_generation(directory, live, args.repo, kind)
     if reuse_live:
         stored_repo = None
         stored_generation = 0
@@ -708,6 +735,21 @@ def safe_match_query(text: str) -> str | None:
 
 
 def query_records(args: argparse.Namespace) -> None:
+    # Classify before reading so an existing-but-invalid committed cache
+    # (zero length, non-SQLite bytes, integrity or identity failure) reports
+    # its state as a clean structured error instead of a raw SQLite traceback.
+    classified = database_state(args.db, args.repo, "records")
+    state = classified["staging_state"]
+    if state != "valid":
+        if state == "absent":
+            raise ValueError(f"cache database does not exist: {args.db}")
+        if state == "empty":
+            raise ValueError(f"cache database is empty: {args.db}")
+        if not classified.get("safe_to_abort"):
+            raise ValueError(
+                f"cache database is an unsafe filesystem entry and requires inspection: {args.db}"
+            )
+        raise ValueError(f"cache database is invalid: {args.db}")
     cutoff = parse_time(args.cutoff) if args.cutoff else None
     if args.cutoff and cutoff is None:
         raise ValueError("cutoff must be an ISO-8601 timestamp")
@@ -815,7 +857,10 @@ def commit_database(args: argparse.Namespace, kind: str) -> None:
         live = live_path(directory, kind)
         live_generation = 0
         if live.exists():
-            live_generation = committed_generation(live, args.repo, kind)
+            # A live file corrupted between prepare and commit hits the same
+            # unguarded-read failure mode: quarantine it and let the
+            # generation-conflict check run against the recovered base.
+            live_generation = guarded_committed_generation(directory, live, args.repo, kind)
         if live_generation != args.base_generation:
             raise RuntimeError(
                 f"cache generation conflict: expected {args.base_generation}, found {live_generation}"

@@ -456,6 +456,61 @@ class TestGithubCache:
         stale = self.parsed("query-records", *self.common(), "--db", str(live), "--terms", "Scoped")
         assert stale["records"] == []
 
+    def test_rebuild_recovers_corrupted_committed_cache_with_backup(self) -> None:
+        for corrupted in (b"not sqlite", b""):
+            shutil.rmtree(self.project_dir / "github", ignore_errors=True)
+            first = self.parsed("prepare-records", *self.common(), "--run-id", "first")
+            self.parsed(*self.ingest_args(first["work_db"]))
+            self.parsed(*self.commit_args(first["work_db"], "first", "0"))
+            live = self.live_db()
+            assert live.is_file()
+            live.write_bytes(corrupted)
+            rebuilt = self.parsed(
+                "prepare-records", *self.common(), "--run-id", "second", "--rebuild"
+            )
+            assert rebuilt["mode"] == "rebuild"
+            assert rebuilt["base_generation"] == 0
+            assert not live.exists()
+            backups = list(self.project_dir.glob("github/**/*.invalid-*"))
+            assert len(backups) == 1
+            assert backups[0].read_bytes() == corrupted
+            # The rebuild completes against the recovered base generation.
+            self.parsed(*self.ingest_args(rebuilt["work_db"], "second"))
+            committed = self.parsed(*self.commit_args(rebuilt["work_db"], "second", "0"))
+            assert committed["generation"] == 1
+            queried = self.parsed(
+                "query-records", *self.common(), "--db", committed["committed"], "--terms", "Scoped"
+            )
+            assert [record["number"] for record in queried["records"]] == [1]
+
+    def test_commit_quarantines_cache_corrupted_after_prepare_and_reports_conflict(self) -> None:
+        first = self.parsed("prepare-records", *self.common(), "--run-id", "first")
+        self.parsed(*self.ingest_args(first["work_db"]))
+        self.parsed(*self.commit_args(first["work_db"], "first", "0"))
+        live = self.live_db()
+        second = self.parsed("prepare-records", *self.common(), "--run-id", "second")
+        assert second["mode"] == "reuse"
+        assert second["base_generation"] == 1
+        live.write_bytes(b"not sqlite")
+        failed = self.failed_call(*self.commit_args(second["work_db"], "second", "1"))
+        assert failed.returncode == 2
+        assert "generation conflict" in failed.stderr
+        assert "Traceback" not in failed.stderr
+        assert not live.exists()
+        backups = list(self.project_dir.glob("github/**/*.invalid-*"))
+        assert len(backups) == 1
+        assert backups[0].read_bytes() == b"not sqlite"
+        # A fresh base-0 transaction recovers the quarantined state.
+        third = self.parsed("prepare-records", *self.common(), "--run-id", "third")
+        assert third["base_generation"] == 0
+        self.parsed(*self.ingest_args(third["work_db"], "third"))
+        committed = self.parsed(*self.commit_args(third["work_db"], "third", "0"))
+        assert committed["generation"] == 1
+        queried = self.parsed(
+            "query-records", *self.common(), "--db", committed["committed"], "--terms", "Scoped"
+        )
+        assert [record["number"] for record in queried["records"]] == [1]
+
     def test_invalid_staging_requires_abort_and_abort_does_not_follow_symlink(self) -> None:
         prepared = self.parsed("prepare-records", *self.common(), "--run-id", "first")
         work_db = Path(prepared["work_db"])
@@ -923,3 +978,15 @@ class TestQueryBounds:
         live = self.seed_records([(n, f"Record {n}", "open") for n in range(1, 4)])
         result, _ = self.query(live)
         assert [record["number"] for record in result["records"]] == [1, 2, 3]
+
+    def test_query_records_rejects_invalid_committed_cache_with_classified_state(self) -> None:
+        live = self.seed_records([(1, "Record one", "open")])
+        for payload, state in ((b"not a sqlite database", "invalid"), (b"", "empty")):
+            live.write_bytes(payload)
+            # database_state classifies the identical file state (the contrast
+            # against which query_records must fail cleanly, not raw).
+            assert (
+                github_cache_module.database_state(live, REPO, "records")["staging_state"] == state
+            )
+            with pytest.raises(ValueError, match=state):
+                self.query(live, terms="Record")
