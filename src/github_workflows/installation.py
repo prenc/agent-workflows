@@ -161,11 +161,17 @@ class Installer:
         """Announce one selected mutation before it begins."""
         print(f"[APPLY] {self.change_groups.get(description, 'Shared')}: {description}")
 
-    def run(self, *command: str, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    def run(
+        self,
+        *command: str,
+        input_text: str | None = None,
+        cwd: Path | str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             command,
             check=True,
             input=input_text,
+            cwd=cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -592,6 +598,13 @@ class Installer:
             self.run(uv, "venv", "--python", ">=3.12", str(self.root / ".venv"))
         requirement = f"{self.root}[dev]" if self.args.dev else str(self.root)
         self.run(uv, "pip", "install", "--python", str(python), "-e", requirement)
+        if self.args.dev:
+            # pre-commit resolves its target repository from the subprocess cwd, so
+            # pin the call to the checkout root regardless of where install was run.
+            pre_commit = self.root / ".venv" / "bin" / "pre-commit"
+            self.run(str(pre_commit), "install", cwd=self.root)
+        # Record the state only after every step has succeeded, so a failed hook
+        # install leaves the runtime unmarked and is retried on the next run.
         state = {
             "dev": self.args.dev,
             "pyproject_sha256": hashlib.sha256(
@@ -600,9 +613,6 @@ class Installer:
         }
         state_path = self.root / ".venv" / ".agent-workflows-install.json"
         state_path.write_text(json.dumps(state, sort_keys=True) + "\n", encoding="utf-8")
-        if self.args.dev:
-            pre_commit = self.root / ".venv" / "bin" / "pre-commit"
-            self.run(str(pre_commit), "install")
 
     def apply_agent_command(self) -> None:
         description = "link the agent-feedback command"

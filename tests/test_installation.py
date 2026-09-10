@@ -711,6 +711,77 @@ def test_installer_run_timeout_raises_typed_error(
     assert list(excinfo.value.cmd) == ["uv", "venv", "/checkout/.venv"]
 
 
+def test_apply_runtime_pins_dev_hook_install_to_checkout_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "checkout"
+    (root / ".venv" / "bin").mkdir(parents=True)
+    (root / "pyproject.toml").write_text("[project]\nname = 'fixture'\n")
+    (root / ".venv" / "bin" / "python").touch()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    monkeypatch.setattr(installation, "command_path", lambda _name: "/bin/uv")
+
+    calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append((tuple(command), dict(kwargs)))
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(installation.subprocess, "run", fake_run)
+
+    installer = installation.Installer(arguments(dev=True), root)
+    installer.changes.append("install the Python environment")
+    installer.apply_runtime()
+
+    hook_calls = [
+        kwargs
+        for command, kwargs in calls
+        if command[0] == str(root / ".venv" / "bin" / "pre-commit") and command[1:] == ("install",)
+    ]
+    assert len(hook_calls) == 1
+    assert hook_calls[0]["cwd"] == installer.root
+    state = json.loads((root / ".venv" / ".agent-workflows-install.json").read_text())
+    assert state["dev"] is True
+
+
+def test_apply_runtime_does_not_mark_runtime_current_when_hook_install_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "checkout"
+    (root / ".venv" / "bin").mkdir(parents=True)
+    (root / "pyproject.toml").write_text("[project]\nname = 'fixture'\n")
+    (root / ".venv" / "bin" / "python").touch()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    monkeypatch.setattr(installation, "command_path", lambda _name: "/bin/uv")
+
+    hook_kwargs: list[dict[str, object]] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if command[0].endswith("pre-commit") and command[1:] == ("install",):
+            hook_kwargs.append(dict(kwargs))
+            raise subprocess.CalledProcessError(
+                1, command, output="", stderr="fatal: not a git repository"
+            )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(installation.subprocess, "run", fake_run)
+
+    installer = installation.Installer(arguments(dev=True), root)
+    installer.changes.append("install the Python environment")
+    with pytest.raises(subprocess.CalledProcessError):
+        installer.apply_runtime()
+
+    assert len(hook_kwargs) == 1
+    assert hook_kwargs[0]["cwd"] == installer.root
+    assert not (root / ".venv" / ".agent-workflows-install.json").exists()
+
+
 def test_codex_mcp_inspection_timeout_degrades_to_skip_warning(
     repository: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
