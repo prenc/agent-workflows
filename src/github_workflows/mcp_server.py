@@ -556,12 +556,18 @@ def _public_input_schema(name: str, schema: dict[str, Any]) -> dict[str, Any]:
                         {
                             "required": ["records"],
                             "properties": {"records": {"type": "array", "minItems": 1}},
-                            "not": {"required": ["artifacts"]},
+                            "not": {
+                                "required": ["artifacts"],
+                                "properties": {"artifacts": {"type": "array", "minItems": 1}},
+                            },
                         },
                         {
                             "required": ["artifacts"],
                             "properties": {"artifacts": {"type": "array", "minItems": 1}},
-                            "not": {"required": ["records"]},
+                            "not": {
+                                "required": ["records"],
+                                "properties": {"records": {"type": "array", "minItems": 1}},
+                            },
                         },
                     ]
                 },
