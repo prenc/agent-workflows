@@ -1252,7 +1252,7 @@ def test_feedback_relative_cutoff_accepts_compact_ages(age: str, expected: str) 
     assert feedback.relative_cutoff(age, now=now) == expected
 
 
-@pytest.mark.parametrize("age", ["", "0d", "-1d", "1month", "yesterday"])
+@pytest.mark.parametrize("age", ["", "0d", "-1d", "1month", "yesterday", "1000000000d"])
 def test_feedback_relative_cutoff_rejects_ambiguous_ages(age: str) -> None:
     with pytest.raises(ValueError, match="positive age"):
         feedback.relative_cutoff(age)
