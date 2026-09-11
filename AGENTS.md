@@ -19,8 +19,10 @@ provision isolation only under its own documented safeguards.
 
 The public CLI is `agent-workflows`. Its `install` subcommand owns Qwen, Codex,
 and third-party skill integration; `workflow` is the recovery interface; `mcp`
-is reserved for the Qwen extension. Keep these as native CLI interfaces rather
-than adding shell launchers.
+is reserved for the Qwen extension; `feedback` records and inspects local
+agent feedback. The standalone `agent-feedback` console script exposes the
+same feedback queue with JSON-only output. Keep these as native CLI interfaces
+rather than adding shell launchers.
 
 ## Workflow Invariants
 
