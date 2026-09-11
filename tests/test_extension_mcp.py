@@ -746,6 +746,61 @@ class TestExtensionMcp:
                 )
                 assert not finished.is_error
 
+    async def test_public_audit_completion_preserves_large_nested_report(self, tmp_path) -> None:
+        workspace = tmp_path / "repo"
+        workspace.mkdir()
+        self.git("init", "-b", "main", cwd=workspace)
+        self.git("config", "user.name", "MCP Test", cwd=workspace)
+        self.git("config", "user.email", "mcp-test@example.invalid", cwd=workspace)
+        self.git("commit", "--allow-empty", "-m", "fixture", cwd=workspace)
+        runtime = WorkflowRuntime(workspace, tmp_path / "state")
+        report = {
+            "status": "complete",
+            "findings": [
+                {
+                    "id": f"finding-{index}",
+                    "evidence": "Synthetic Unicode evidence é\\n" * 1024,
+                    "details": {"confirmed": True, "optional": None, "values": [1, "two"]},
+                }
+                for index in range(8)
+            ],
+        }
+        assert len(json.dumps(report).encode("utf-8")) > 200_000
+        async with Client(create_server(runtime), raise_exceptions=False) as client:
+            started = await client.call_tool(
+                "run_manage",
+                {"action": "start", "workflow": "gh-audit-repo", "repository": "example/repo"},
+            )
+            assert not started.is_error
+            planned = await client.call_tool(
+                "task_manage",
+                {
+                    "action": "plan",
+                    "workflow": "gh-audit-repo",
+                    "task": {"logical_id": "large-report", "assignment": {"mode": "discover"}},
+                },
+            )
+            assert not planned.is_error
+            task_id = planned.structured_content["task_id"]
+            arguments = {
+                "action": "complete",
+                "workflow": "gh-audit-repo",
+                "task_id": task_id,
+                "report": report,
+            }
+            listed = await client.list_tools()
+            schema = next(tool.input_schema for tool in listed.tools if tool.name == "task_manage")
+            Draft7Validator(schema).validate(arguments)
+            assert list(
+                Draft7Validator(schema).iter_errors({**arguments, "report": json.dumps(report)})
+            )
+            completed = await client.call_tool("task_manage", arguments)
+            assert not completed.is_error
+            state = runtime.state("gh-audit-repo")
+            assert state["tasks"][task_id]["status"] == "completed"
+            result_path = runtime.current("gh-audit-repo") / state["tasks"][task_id]["result"]
+            assert json.loads(result_path.read_text(encoding="utf-8")) == report
+
     async def test_public_schemas_reject_static_argument_mistakes(self) -> None:
         with tempfile.TemporaryDirectory(prefix="github-workflows-schema-") as directory:
             root = Path(directory)
@@ -1635,6 +1690,70 @@ class TestExtensionMcp:
             )
             finished = runtime.run_manage(RunManageRequest(action="finish", workflow=workflow))
             assert finished["status"] == "complete"
+
+    @pytest.mark.parametrize(
+        "lease",
+        [
+            {"state": "absent"},
+            {"state": "present", "sha": "b" * 40},
+            {"state": "present", "sha": "b" * 64},
+        ],
+    )
+    def test_implementation_remote_lease_round_trip(self, tmp_path, lease) -> None:
+        runtime = WorkflowRuntime(tmp_path, tmp_path / "state")
+        runtime.run_manage(
+            RunManageRequest(
+                action="start",
+                workflow="gh-implement-issue",
+                repository="example/repo",
+                targets=["#1"],
+            )
+        )
+        assignment = self.implementation_assignment(1)
+        assignment["remote_lease"] = lease
+        planned = runtime.task_manage(
+            TaskManageRequest(
+                action="plan",
+                workflow="gh-implement-issue",
+                task={"logical_id": "lease", "assignment": assignment},
+            )
+        )
+        assert runtime.task_context(planned["task_ref"])["assignment"]["remote_lease"] == lease
+
+    @pytest.mark.parametrize(
+        "lease",
+        [
+            {"state": "none"},
+            {"state": []},
+            {"state": "present"},
+            {"state": "present", "sha": "abc"},
+            {"state": "present", "sha": "z" * 40},
+            {"state": "present", "sha": "b" * 40, "ref": "refs/heads/other"},
+            {"state": "absent", "sha": "b" * 40},
+        ],
+    )
+    def test_implementation_remote_lease_rejected_before_creation(self, tmp_path, lease) -> None:
+        runtime = WorkflowRuntime(tmp_path, tmp_path / "state")
+        runtime.run_manage(
+            RunManageRequest(
+                action="start",
+                workflow="gh-implement-issue",
+                repository="example/repo",
+                targets=["#1"],
+            )
+        )
+        assignment = self.implementation_assignment(1)
+        assignment["remote_lease"] = lease
+        before = runtime.state("gh-implement-issue")
+        with pytest.raises(ValueError, match="remote_lease"):
+            runtime.task_manage(
+                TaskManageRequest(
+                    action="plan",
+                    workflow="gh-implement-issue",
+                    task={"logical_id": "lease", "assignment": assignment},
+                )
+            )
+        assert runtime.state("gh-implement-issue") == before
 
     def test_generic_assignments_are_validated_before_attempt_creation(self) -> None:
         with tempfile.TemporaryDirectory(prefix="github-workflows-assignment-") as directory:

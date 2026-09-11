@@ -53,6 +53,8 @@ TASK_VALIDATION_LIMIT = 40
 TASK_VALIDATION_EXCERPT_BYTES = 2 * 1024
 TASK_INVENTORY_DEFAULT_PACKAGE_LIMIT = 100
 TASK_INVENTORY_REQUESTED_PACKAGE_LIMIT = 50
+TASK_PROGRAM_OUTPUT_BYTES = 8 * 1024
+TASK_CONTEXT_SECTION_BYTES = 8 * 1024
 TASK_HISTORY_FIELDS = (
     "kind",
     "number",
@@ -1130,7 +1132,24 @@ class WorkflowRuntime:
                     "verification-only PR rounds require initial_draft=false, "
                     "required_worker_draft=false, and pr_expected_end_state=unchanged"
                 )
-        self._non_blank(assignment["remote_lease"].get("state"), "remote_lease.state")
+        lease = assignment["remote_lease"]
+        if lease.get("state") not in ("absent", "present"):
+            raise ValueError(
+                'assignment.remote_lease must be {"state":"absent"} or '
+                '{"state":"present","sha":"<full remote head SHA>"}; '
+                "refresh the remote branch before assigning a lease"
+            )
+        if lease["state"] == "absent":
+            if set(lease) != {"state"}:
+                raise ValueError("assignment.remote_lease absent state must contain only state")
+        else:
+            lease_sha = lease.get("sha")
+            if not isinstance(lease_sha, str) or not re.fullmatch(
+                r"[0-9a-f]{40}|[0-9a-f]{64}", lease_sha
+            ):
+                raise ValueError("assignment.remote_lease.sha must be a full hexadecimal SHA")
+            if "ref" in lease and lease["ref"] != f"refs/heads/{assignment['branch']}":
+                raise ValueError("assignment.remote_lease.ref must match the assigned branch")
         environment = assignment["execution_environment"]
         if environment.get("mode") not in {"native", "shared", "isolated"}:
             raise ValueError(
@@ -2389,6 +2408,21 @@ class WorkflowRuntime:
         }
 
     @staticmethod
+    def _bounded_context_items(items: list[Any]) -> tuple[list[Any], dict[str, Any]]:
+        selected: list[Any] = []
+        remaining = TASK_CONTEXT_SECTION_BYTES
+        for item in items:
+            size = len(json.dumps(item, ensure_ascii=False).encode("utf-8"))
+            if size <= remaining:
+                selected.append(item)
+                remaining -= size
+        return selected, {
+            "total_count": len(items),
+            "returned_count": len(selected),
+            "complete": len(selected) == len(items),
+        }
+
+    @staticmethod
     def _worker_inventory(inventory: Any, assignment: dict[str, Any]) -> dict[str, Any] | None:
         """Return task-relevant environment facts without the full package inventory."""
         if not isinstance(inventory, dict):
@@ -2464,14 +2498,42 @@ class WorkflowRuntime:
                 "missing_requested_packages": missing,
             }
         )
+        programs = sources.get("programs", {})
+        projected_programs = {}
+        remaining = TASK_PROGRAM_OUTPUT_BYTES
+        if isinstance(programs, dict):
+            for name, fact in sorted(programs.items()):
+                if not isinstance(fact, dict):
+                    continue
+                projected = dict(fact)
+                for stream in ("stdout", "stderr"):
+                    output = fact.get(stream)
+                    if not isinstance(output, str):
+                        continue
+                    encoded = output.encode("utf-8")
+                    excerpt = encoded[:remaining].decode("utf-8", errors="ignore")
+                    remaining -= len(excerpt.encode("utf-8"))
+                    projected[stream] = excerpt
+                    projected[f"{stream}_bytes"] = len(encoded)
+                    projected[f"{stream}_truncated"] = bool(
+                        fact.get("truncated")
+                        or fact.get(f"{stream}_truncated")
+                        or len(encoded) > len(excerpt.encode("utf-8"))
+                    )
+                projected_programs[name] = projected
+        context_facts = sources.get("context", {})
+        context_items, context_view = WorkflowRuntime._bounded_context_items(
+            sorted(context_facts.items()) if isinstance(context_facts, dict) else []
+        )
         return {
             "revision": inventory.get("revision"),
             "updated_at": inventory.get("updated_at"),
             "python_environment": python_environment,
             "repository_manifests": sources.get("repository_manifests", {}),
-            "programs": sources.get("programs", {}),
+            "programs": projected_programs,
             "declared": sources.get("declared", {}),
-            "context": sources.get("context", {}),
+            "context": dict(context_items),
+            "context_view": context_view,
             "requests": inventory.get("requests", {}),
         }
 
@@ -2495,10 +2557,12 @@ class WorkflowRuntime:
             if isinstance(validation, dict)
             and (validation.get("candidate_id") == candidate_id or validation_id in requested_ids)
         ]
+        records, view = WorkflowRuntime._bounded_context_items(records)
         return {
             "candidate_id": candidate_id,
             "record_count": len(records),
             "records": records,
+            "view": view,
         }
 
     def _audit_task_knowledge(
@@ -2560,6 +2624,10 @@ class WorkflowRuntime:
             bootstrap_leads = document.get("bootstrap_leads", [])
             if not isinstance(findings, list) or not isinstance(bootstrap_leads, list):
                 raise ValueError(f"knowledge document for {requested_area} has invalid content")
+            items, content_view = self._bounded_context_items(
+                [("findings", item) for item in findings]
+                + [("bootstrap_leads", item) for item in bootstrap_leads]
+            )
             documents.append(
                 {
                     "area": requested_area,
@@ -2568,9 +2636,12 @@ class WorkflowRuntime:
                     "matches_audit_sha": source_sha == state.get("sha"),
                     "content": {
                         "area": document_area,
-                        "findings": findings,
-                        "bootstrap_leads": bootstrap_leads,
+                        "findings": [item for kind, item in items if kind == "findings"],
+                        "bootstrap_leads": [
+                            item for kind, item in items if kind == "bootstrap_leads"
+                        ],
                     },
+                    "content_view": content_view,
                 }
             )
         return {
@@ -2664,6 +2735,12 @@ class WorkflowRuntime:
         )
         result = {
             "task_ref": task_ref,
+            "inventory_revision": (
+                state["inventory"].get("revision")
+                if isinstance(state.get("inventory"), dict)
+                else None
+            ),
+            "audit_worktree_head": audit_worktree_head,
             "task_id": task_id,
             "workflow": workflow,
             "run_id": state.get("run_id"),

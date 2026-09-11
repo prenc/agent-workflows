@@ -52,8 +52,10 @@ reachability and impact.
 Workers reread the inventory before every version-dependent conclusion. They
 may request missing context or propose structured runtime validation but remain unable to execute
 commands. A proposal states a hypothesis, small synthetic setup, observable
-assertion, confirming/disproving outcomes, and focused pytest selectors or a
-Python-probe design rather than a general shell command.
+assertion, confirming/disproving outcomes, and focused test IDs or a repo-native
+probe design with its required runner. Execute only designs that fit the existing
+`pytest` or sandboxed `python` interface and safety limits; otherwise record a
+validation limitation. Native proposals do not expand worker execution permissions.
 
 Workers have 56 working turns and eight reserved reporting turns within their
 64-turn limit. Return a compact structured result containing status
@@ -98,6 +100,19 @@ Put the complete canonical candidate object in `assignment.candidate`. The
 server derives `assignment.candidate_fingerprint`; never calculate or submit a
 fingerprint. New verify assignments without one canonical candidate are
 rejected before launch.
+When recording a completed verify report, copy `assignment.candidate_fingerprint`
+to the top-level `report.candidate_fingerprint`, alongside `report.status`.
+Keep execution in the supervisor: verifier guidance requests source inspection
+and validation proposals, while supplied probe results carry completed execution
+evidence. Never assign workers a direct `audit_probe` or test invocation.
+Ground candidate focus in current symbols and production callers. Treat proposed
+fixes and inherited issue evidence as hypotheses until their current-version
+support is checked. A probe that bypasses a caller invariant must establish that
+its synthetic state is reachable before it can support a production finding.
+Discovery reports return `update-existing` evidence for supervisor synthesis;
+only the supervisor edits the issue. Compact history rows are discovery indexes,
+not full issue evidence: follow every cursor, then read plausible matches and
+their relevant comments live before deciding scope or duplication.
 The verifier must independently confirm
 the current-SHA code path, reachability, impact, confidence, taxonomy, one-PR sizing, required outcomes,
 duplicate status, and the proposed existing/new disposition. Reject

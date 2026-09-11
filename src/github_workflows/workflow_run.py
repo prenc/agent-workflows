@@ -869,6 +869,11 @@ def audit_event(args: argparse.Namespace) -> None:
         detail = {"task_id": task_id, "previous_task_status": previous, "task_status": status}
     elif event_type == "integration-start":
         task_id = require_string(payload.get("task_id"), "task_id")
+        task = state["tasks"].get(task_id)
+        if not isinstance(task, dict):
+            raise ValueError("integration requires an existing task")
+        if not task.get("requires_integration") or task.get("integrated"):
+            raise ValueError("no integration is pending for this task")
         if scheduler.get("supervisor_activity") is not None:
             raise ValueError("supervisor already has material work in progress")
         if not scheduler["integration_queue"] or scheduler["integration_queue"][0] != task_id:
@@ -1368,8 +1373,9 @@ def audit_finish_blockers(current: Path, state: dict[str, Any]) -> list[dict[str
     if registered != artifacts:
         add(
             "validation-registration-mismatch",
-            "registered validation artifacts do not match validation result files",
-            allowed_action="audit_probe",
+            "registered validation artifacts do not match validation result files; "
+            "evidence integrity is lost: abort this run and start a fresh audit",
+            allowed_action="abort",
         )
     return blockers
 

@@ -7,6 +7,9 @@ Partition that snapshot into connected issue/PR graphs. Plan one `reconcile`
 worker task per graph, include every member as a canonical `history_links`
 entry, and account for every snapshot record exactly once. The same `-n`
 material-work limit and result-first integration rules apply.
+Reconcile tasks have `requires_integration: false`: consume their completed
+reports directly. Open an integration window only for tasks in the returned
+`scheduler.integration_queue`.
 
 Workers fully read each graph, inspect the immutable default-branch source and
 the exact PR changes, and return per-record classifications plus candidates for
@@ -28,11 +31,12 @@ For pull requests:
 - close-invalid when current code disproves the premise or the change no longer applies;
 - close-duplicate when another canonical PR covers the same outcome;
 - close-wontfix only from an explicit maintainer decision;
-- keep-partial when usable pushed work exists but accepted scope remains incomplete;
-- clear-partial when scope is complete or the remote implementation is unusable;
+- partial when usable pushed work exists but accepted scope remains incomplete;
 - retain-open for valid complete or actionable work.
 
-Propagate `partial` to the PR and each incompletely covered open issue. Remove
+Use the same `partial` classification for issues and PRs; label removal is a
+separate action, not a record disposition. Propagate `partial` to the PR and
+each incompletely covered open issue. Remove
 stale `partial` from affected artifacts and remove `ready-to-merge` whenever a
 PR is partial or being closed. Never apply `ready-to-merge`. Preserve unrelated
 labels and leave an issue open when its work remains necessary after its PR is
@@ -45,7 +49,9 @@ mutation and skip the graph if an issue lock, PR head change, relationship
 change, or conflicting implementation appears. Use `audit_probe` when a
 bounded side-effect-free probe could materially confirm the premise or
 implementation. Default-branch candidates run at the audit SHA. A PR candidate
-uses `artifact_kind: pull`, `pull_number`, and its captured full `head_sha`; the
+stores `artifact_kind: pull`, `pull_number`, and its captured full `head_sha`
+on the candidate registered with `audit_record`, not on the `audit_probe` call.
+Pass that candidate's ID to `audit_probe`; the
 runtime verifies and fetches that GitHub pull ref into a detached managed
 worktree and records the probe source SHA. Install nothing and do not query CI.
 
@@ -65,3 +71,32 @@ all tasks and verifications are integrated, and mutations are reconciled.
 Store issue/PR totals, classifications, skips, probes, mutations, snapshot
 watermark, and a coverage digest in the phase summary. Then continue the normal
 audit against the refreshed history view.
+
+Send this shape as `phase.summary` to `audit_record(action="phase")` with
+`phase.name="reconciliation"` and `phase.status="complete"`:
+
+```json
+{
+  "snapshot_open_issues": 0,
+  "snapshot_open_pulls": 0,
+  "classified_issues": 0,
+  "classified_pulls": 0,
+  "skipped_issues": 0,
+  "skipped_pulls": 0,
+  "probes": 0,
+  "mutations": 0,
+  "snapshot_watermark": "<captured snapshot timestamp>",
+  "coverage_digest": "<64 lowercase hexadecimal SHA-256 characters>"
+}
+```
+
+Classified plus skipped must equal the corresponding snapshot total. Compute
+the digest over UTF-8 JSON of per-record `{kind, number, disposition}` objects,
+sorted by kind then number, using sorted object keys and compact separators
+(`,` and `:`). Retain that disposition list as evidence. `probes` and `mutations`
+are summary counts; they do not substitute for publication read-backs.
+
+An unknown PR mergeability value is inconclusive. Compare changed regions and
+current source for substantive obsolescence; overlap alone is not proof that a
+PR cannot apply. Skip a disposition when a mechanical apply result is essential
+and unavailable rather than inferring it from static comparison.

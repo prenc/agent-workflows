@@ -357,6 +357,7 @@ class TestRuntimeSafety:
             assert context["validation"] == {
                 "candidate_id": "candidate-timeout",
                 "record_count": 1,
+                "view": {"total_count": 1, "returned_count": 1, "complete": True},
                 "records": [
                     {
                         "id": "probe-timeout",
@@ -974,6 +975,56 @@ class TestRuntimeSafety:
                 "id": "candidate-race",
                 "status": "verification-pending",
             }
+
+    def test_reconcile_task_has_no_integration_window(self, tmp_path) -> None:
+        runtime = self.make_runtime(tmp_path)
+        self.initialize_audit(runtime)
+        planned = runtime.task_manage(
+            TaskManageRequest(
+                action="plan",
+                workflow="gh-audit-repo",
+                task={
+                    "logical_id": "reconcile",
+                    "assignment": {
+                        "mode": "reconcile",
+                        "history_links": [{"kind": "issue", "number": 1}],
+                    },
+                },
+            )
+        )
+        runtime.task_manage(
+            TaskManageRequest(
+                action="complete",
+                workflow="gh-audit-repo",
+                task_id=planned["task_id"],
+                report={"status": "complete"},
+            )
+        )
+        before = runtime.state("gh-audit-repo")
+        with pytest.raises(ValueError, match="no integration is pending"):
+            runtime.task_manage(
+                TaskManageRequest(
+                    action="integration_begin",
+                    workflow="gh-audit-repo",
+                    task_id=planned["task_id"],
+                )
+            )
+        assert runtime.state("gh-audit-repo") == before
+
+    def test_missing_terminal_probe_reports_safe_abort_recovery(self, tmp_path) -> None:
+        runtime = self.make_runtime(tmp_path)
+        self.initialize_audit(runtime)
+        state = runtime.state("gh-audit-repo")
+        state["candidates"]["rejected"] = {"id": "rejected", "status": "rejected"}
+        state["validations"]["missing"] = {
+            "candidate_id": "rejected",
+            "artifact": "validation/missing/result.json",
+        }
+        blockers = workflow_run.audit_finish_blockers(runtime.current("gh-audit-repo"), state)
+        mismatch = next(
+            item for item in blockers if item["kind"] == "validation-registration-mismatch"
+        )
+        assert mismatch["allowed_action"] == "abort"
 
     def test_public_audit_record_completes_reconciliation_with_flattened_summary(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-reconciliation-phase-") as directory:
@@ -3213,6 +3264,34 @@ class TestRuntimeSafety:
             }
             assert by_area["area/shared-core"]["matches_audit_sha"] is True
 
+            small = {
+                "id": "core-boundary",
+                "title": "Core boundary remains isolated",
+                "question": "Does core preserve its boundary?",
+                "kind": "source-review",
+                "method": "Inspect core source",
+                "observed_result": "No cross-area access",
+                "conclusion": "Boundary is preserved",
+                "disposition": "confirmed",
+                "validated_sha": core["source_sha"],
+                "evidence_paths": ["src/core"],
+                "dependencies": {},
+            }
+            core["findings"] = [
+                {**small, "id": "oversized-finding", "title": "x" * 20000},
+                small,
+            ]
+            audit_knowledge.write_document(core_path, core)
+            persisted = core_path.read_bytes()
+            compact = runtime.task_context(planned["task_ref"])["knowledge"]["documents"][0]
+            assert compact["content"]["findings"] == [small]
+            assert compact["content_view"] == {
+                "total_count": 2,
+                "returned_count": 1,
+                "complete": False,
+            }
+            assert core_path.read_bytes() == persisted
+
             verifier = runtime.task_manage(
                 TaskManageRequest(
                     workflow="gh-audit-repo",
@@ -3605,6 +3684,41 @@ class TestRuntimeSafety:
             )
             with pytest.raises(ValueError, match="generation has changed"):
                 runtime.task_context(planned["task_ref"], selection["next_cursor"])
+
+    def test_worker_inventory_bounds_program_output_without_mutating_evidence(self) -> None:
+        from github_workflows.runtime import TASK_PROGRAM_OUTPUT_BYTES
+
+        output = "é" * TASK_PROGRAM_OUTPUT_BYTES
+        inventory = {
+            "revision": 7,
+            "sources": {
+                "programs": {
+                    "z": {"stdout": "version 1", "stderr": "warning", "truncated": True},
+                    "a": {"stdout": output, "stderr": "error", "returncode": 0},
+                },
+            },
+        }
+        before = json.dumps(inventory, sort_keys=True)
+        result = WorkflowRuntime._worker_inventory(inventory, {})
+        assert result["revision"] == 7
+        programs = result["programs"]
+        assert (
+            sum(
+                len(fact[stream].encode("utf-8"))
+                for fact in programs.values()
+                for stream in ("stdout", "stderr")
+            )
+            <= TASK_PROGRAM_OUTPUT_BYTES
+        )
+        assert programs["a"]["stdout_truncated"]
+        assert programs["a"]["stdout_bytes"] == len(output.encode("utf-8"))
+        assert programs["a"]["returncode"] == 0
+        assert programs["z"]["stdout_truncated"]
+        assert json.dumps(inventory, sort_keys=True) == before
+        inventory["sources"]["programs"] = dict(
+            reversed(list(inventory["sources"]["programs"].items()))
+        )
+        assert WorkflowRuntime._worker_inventory(inventory, {}) == result
 
     def test_audit_task_context_selects_only_requested_python_packages(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-audit-inventory-context-") as directory:

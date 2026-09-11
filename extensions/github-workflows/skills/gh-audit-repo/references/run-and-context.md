@@ -38,12 +38,21 @@ The server owns the run record and initializes canonical phases, shards, tasks,
 candidates, validations, verdicts, mutations, limitations, pending work,
 scheduler state, and metrics.
 Register and transition tasks through `mcp__github_workflows__task_manage`.
+At preflight, check availability of the chosen search and documentation tools;
+share unavailable-provider facts so workers do not repeat failed probes. Use
+bundled help, official documentation, or installed source when Context7 is absent
+or rejects authentication. A broken `rg` installation is a host prerequisite to
+repair, not permission to broaden the worker shell boundary.
 Record phases, shards, candidates, verdicts, limitations, pending work, drift,
 and supervisor activity through `mcp__github_workflows__audit_record`. Probe
 validation and metrics are persisted by their respective tools. Call
 `mcp__github_workflows__run_status` before launching work and after every task
 result; its scheduler is authoritative. The server owns revisions, artifacts,
 atomic writes, and lifecycle validation.
+Treat completion notifications as hints: refresh the exact task and process only
+unconsumed results. If delivery is missing, use the client's agent status/result
+interface and checkpoint the returned report once; a notification does not prove
+integration is pending. Integration occupies one material-work slot until it ends.
 Each verdict uses its required `candidate_id` as its sole identity. Do not send
 a separate verdict `id`; the runtime stores at most one current verdict per
 candidate while preserving its evidence fields.
@@ -57,7 +66,8 @@ and synthesizes available output, runs any material probe, and completes
 integration before launching more work.
 The normal worker sequence is `plan`, launch, immediately `mark_running` after
 the launch is accepted and before waiting, record the returned result, then
-`integration_begin`, integrate, and `integration_end`. If launch is rejected,
+`integration_begin`, integrate, and `integration_end`. Reconcile-role tasks skip
+integration calls when `requires_integration` is false. If launch is rejected,
 record `abandon` while the task is still queued. These lifecycle calls are safe
 to repeat with the same task and report after an uncertain response.
 `mcp__github_workflows__run_manage` with action `finish` enforces that tasks and candidates

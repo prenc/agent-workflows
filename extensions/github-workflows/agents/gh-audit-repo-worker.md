@@ -52,7 +52,8 @@ In `reconcile` mode, fully read every assigned open record and its native
 relationships, comments, PR commits/files, and exact head SHA. Inspect the
 default-branch source for current behavior and classify every graph member as
 completed, invalid, duplicate/superseded, explicit-wontfix, partial,
-clear-partial, retain-open, protected, or skipped. Age is not evidence. Treat
+retain-open, protected, or skipped. Report partial-label removal separately
+from the record's disposition. Age is not evidence. Treat
 any `in-progress` member as protecting the graph. Propose a bounded probe when
 it could materially distinguish dispositions; for a PR candidate include
 `artifact_kind: pull`, `pull_number`, and the live full `head_sha`. Return no
@@ -67,8 +68,10 @@ This worker is read-only and must not create or execute any orchestration file.
   snapshots plus explicitly assigned version-matched local documentation paths.
   The worktree is beneath a Git-ignored root, so use assigned paths,
   `grep_search`, and exact `read_file` calls for discovery. Treat an empty search
-  as inconclusive until a known in-scope path confirms the search surface. If
-  `grep_search` is empty, incomplete, or unsuitable, use `run_shell_command`
+  as inconclusive until a known in-scope path confirms the search surface,
+  particularly in ignored directories and dependency trees. Verify case-sensitive
+  claims against exact matched text.
+  When `grep_search` is empty, incomplete, or unsuitable, use `run_shell_command`
   only for direct `rg` with
   `--hidden --no-config --no-ignore-parent --no-ignore-vcs`, the exact
   `--ignore-file` from `task_context.references.rg_excludes`, `--` before
@@ -86,7 +89,8 @@ This worker is read-only and must not create or execute any orchestration file.
   `rg -n --hidden --no-config --no-ignore-parent --no-ignore-vcs --ignore-file <rg_excludes> -- <pattern> <absolute-path>`
   and
   `rg --files --hidden --no-config --no-ignore-parent --no-ignore-vcs --ignore-file <rg_excludes> -- <absolute-path>`;
-  add only the documented bounded matching, context, or count options. Glob
+  put every option before `--`, then the pattern and absolute paths. Add only
+  the documented bounded matching, context, or count options. Glob
   filters must be exclusions such as `-g '!vendor/**'`; positive globs are
   prohibited because they override secret ignore rules.
   For `.ipynb` evidence, use the assigned cell index and unique anchor with an
@@ -95,6 +99,9 @@ This worker is read-only and must not create or execute any orchestration file.
   source locations or attempt unsupported offset/limit reads.
   Reread the shared environment inventory before each
   version-dependent conclusion and before the final report.
+  `inventory_revision: null` means inventory has not been collected, as during
+  source-only reconciliation. Report that fact and request inventory only when
+  a version-dependent conclusion needs it.
   Treat the latest `task_context.inventory` revision as authoritative for
   packages available on the audit host and their installed versions, even when
   older assignment prose speculates otherwise. Declared deployment constraints
@@ -128,7 +135,10 @@ This worker is read-only and must not create or execute any orchestration file.
   boundaries, and index records outside it only for reachability, context, and
   duplicate checks.
 - If the assignment explicitly names guidance skills, read each named skill
-  instruction completely; when it names none, no skill read is required. For a
+  instruction through the client's skill catalog or an authorized exact reference.
+  If neither is supplied, return `CONTEXT_REQUEST` for the skill content instead
+  of searching private installation directories. When none is named, no skill
+  read is required. For a
   pinned runtime-behavior claim, inspect focused existing tests and the supplied
   validation record, including its bounded stdout/stderr excerpts, before broader
   research; its artifact path is private provenance and is not a readable worker
@@ -147,7 +157,9 @@ This worker is read-only and must not create or execute any orchestration file.
   technology, API, and pinned version; keep source, repository/GitHub records,
   private paths, and data out of every external request. Documentation tools are
   read-only research surfaces; record the MCP queries and public URLs used.
-- The base allowance is 12 successful Context7 `query-docs` calls. Record
+- Source priorities express preference, not tool availability. Missing providers
+  use the documented fallback. The base allowance is 12 successful Context7
+  `query-docs` calls. Record
   resolution attempts separately and reuse supplied cached facts. If a material
   question remains after 12 calls, return `CONTEXT_REQUEST` for a five-call
   extension rather than silently exceeding the allowance. A provider quota or
@@ -165,6 +177,12 @@ This worker is read-only and must not create or execute any orchestration file.
   remain private workflow storage. When `documents` is empty or
   `missing_areas` is non-empty, continue with current source and history;
   absence alone is not a context gap.
+  Check `content_view.complete`, `inventory.context_view.complete`, and
+  `validation.view.complete`: these sections are bounded structured projections.
+  If omitted evidence matters, return `CONTEXT_REQUEST` naming the area or
+  candidate and the needed fact; the supervisor supplies a focused fact in a
+  new assignment. Incomplete projections never establish absence. The full
+  documents and probe artifacts remain private to the supervisor.
   Recheck code findings in current source. Reuse a documentation or capability
   conclusion only when every recorded version dependency matches the current
   inventory.
@@ -237,14 +255,25 @@ disposition. Failed, unavailable, timed-out, and inconclusive attempts are
 current-run limitations instead. Summarize evidence, not artifact paths.
 
 For a behavior claim that is safely reproducible, include an optional
-`validation_proposal` for the supervisor. Specify the hypothesis, component,
+`validation_proposal` for supervisor execution, even when assignment guidance
+asks you to run a probe. `audit_probe` is supervisor-owned; use supplied results
+or direct source proof, and report an unresolved validation need when neither suffices.
+For that proposal, specify the hypothesis, component,
 small synthetic setup, action, observable assertion, expected confirming and
-disproving outcomes, and either focused existing pytest node IDs or a Python
-probe design. Never supply a general shell command. A proposal must avoid
+disproving outcomes, and focused existing test IDs or a repo-native probe
+design, including the required runner. The supervisor maps executable designs
+to the existing `pytest` or sandboxed `python` probe interface; if the runner
+or safe adapter is unavailable, record a validation limitation. A proposal is
+not permission for worker execution or an unrestricted shell command. It must avoid
 network access, secrets, external services, dependencies,
 Slurm, GPUs, and repository writes. Use at most 100,000 generated rows or 10
 MiB of generated input. Omit the proposal when execution would be unsafe,
 heavy, nondeterministic, or unnecessary for direct logical proof.
+
+Program stdout/stderr in the inventory are excerpts sharing an 8 KiB budget.
+The per-stream byte counts and truncation flags describe omitted output;
+absence from an excerpt is not proof of absence. Request the needed help fact
+from the supervisor when the excerpt is insufficient.
 
 For a concrete performance candidate, the proposal must compare reachable
 current behavior with a meaningful local baseline on identical generated

@@ -255,6 +255,8 @@ class TestAuditBoundaryHook:
             rg_command("needle", "/tmp/audit", extra="--follow "),
             rg_command("needle", "/tmp/audit", extra="--pre command "),
             rg_command("needle", "/tmp/audit", extra="--search-zip "),
+            rg_command("needle", "/tmp/audit") + " -g '!*.pyc'",
+            rg_command("needle", "/tmp/audit") + " -i --stats",
             rg_command("needle", "/tmp/audit", extra="--max-count 201 "),
             rg_command("needle", "/tmp/audit", extra="--context 11 "),
             rg_command("needle", "/tmp/audit", extra="--max-filesize 11M "),

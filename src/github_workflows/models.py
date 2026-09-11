@@ -293,7 +293,10 @@ class TaskPlan(StrictRequest):
             "pr_round_mode set to implementation or verification-only, and "
             "pr_expected_end_state set to draft or unchanged inside pull_request, plus "
             "worktree, branch, rebased_base_sha, "
-            "remote_lease, round_objective, acceptance_condition, repository_instructions, "
+            'remote_lease ({"state":"absent"} for a verified absent remote branch or '
+            '{"state":"present","sha":"<full remote head SHA>"} for an existing branch; '
+            "optional ref must equal refs/heads/<branch>), round_objective, "
+            "acceptance_condition, repository_instructions, "
             "validation_plan, and execution_environment. Audit assignments use canonical "
             "history_links objects with kind issue/pull and a positive number; history_issues "
             "and history_pulls remain compatibility aliases. Audit verify assignments may "

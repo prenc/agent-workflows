@@ -32,16 +32,32 @@ nested uv. In shared mode, the worker expands each assigned project-relative
 root against the verified assigned worktree and sets the resulting absolute
 `PYTHONPATH`; isolated mode has no `PYTHONPATH` override.
 
+Before dispatch, confirm the exact worktree is present in `git worktree list`,
+its branch matches the assignment, its HEAD contains the recorded base, and its
+selected environment is usable. Repair missing preparation as supervisor work;
+workers return `CORRECTION_NEEDED` instead of reconstructing missing worktrees.
+
 Register the complete round assignment with
 `mcp__github_workflows__task_manage` using action `plan` and a typed `task`.
 Include non-empty `issues` entries with `number`, non-empty compact string
 `snapshot`, and `accepted_scope`. For new work use
-`pull_request: {"state": "none"}`; for an existing PR use an extensible object
+`pull_request: {"state": "none"}` (create a draft); for an existing PR use an extensible object
 whose `state` is `open`, whose four round fields follow the Stage 3 contract,
 and which contains the available PR evidence. Also include `worktree`,
 `branch`, full
 `rebased_base_sha`, `remote_lease`, `round_objective`, `acceptance_condition`,
 `repository_instructions`, `validation_plan`, and `execution_environment`.
+For each round, refresh the assigned remote branch and record `remote_lease`
+as `{"state":"absent"}` or `{"state":"present","sha":"<full remote head SHA>"}`.
+An optional `ref` on a present lease must equal `refs/heads/<branch>`.
+An unknown remote state blocks assignment; a previous round's lease is not
+evidence of the current remote head.
+Round objectives describe the remaining implementation, not replacement publication
+rules. Use the shared PR template for body requirements and keep validation in reports.
+Keep PR assignees and labels in supervisor finalization, outside worker acceptance
+conditions. Validate commands and paths against the selected base and environment;
+record known environmental failures separately from implementation requirements.
+Issue `snapshot` is compact inline evidence, not a path requiring a guessed run root.
 Use an empty `validation_plan` only when preflight found no safe repository-owned
 test, formatter, interpreter, or compiler command, and record that limitation;
 never invent a command merely to make the list non-empty.
