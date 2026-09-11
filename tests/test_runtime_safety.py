@@ -3957,6 +3957,84 @@ class TestRuntimeSafety:
             assert state["inventory"]["sources"]["programs"] == {}
             assert state["inventory"]["revision"] == 1
 
+    def test_in_flight_audit_context_returns_concurrent_mutation_promptly(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-context-lock-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.history_manage(HistoryManageRequest(action="prepare"))
+            runtime.history_manage(
+                HistoryManageRequest(
+                    action="commit",
+                    full_history_complete=True,
+                    default_sha=runtime.state("gh-audit-repo")["sha"],
+                )
+            )
+            planned = runtime.task_manage(
+                TaskManageRequest(
+                    workflow="gh-audit-repo",
+                    action="plan",
+                    task={"logical_id": "context-lock", "assignment": {"mode": "discover"}},
+                )
+            )
+            expected_head = (
+                subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=runtime.workspace,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                .stdout.strip()
+                .lower()
+            )
+            baseline = runtime.task_context(planned["task_ref"])
+            assert baseline["audit_worktree_head"] == expected_head
+
+            started = threading.Event()
+            release = threading.Event()
+            errors: list[Exception] = []
+            real_run = subprocess.run
+
+            def blocked_git_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+                command = args[0] if args else kwargs.get("args")
+                if isinstance(command, (list, tuple)) and "rev-parse" in command:
+                    started.set()
+                    if not release.wait(10):
+                        raise RuntimeError("test did not release the blocked git call")
+                return real_run(*args, **kwargs)
+
+            def read_context() -> None:
+                try:
+                    runtime.task_context(planned["task_ref"])
+                except Exception as error:  # noqa: BLE001 - cross-thread error capture
+                    errors.append(error)
+
+            with mock.patch("github_workflows.runtime.subprocess.run", side_effect=blocked_git_run):
+                thread = threading.Thread(target=read_context)
+                thread.start()
+                assert started.wait(10)
+                time.sleep(0.3)
+                started_at = time.monotonic()
+                runtime.audit_record(
+                    AuditRecordRequest(
+                        action="phase",
+                        phase={"name": "structure", "status": "in-progress"},
+                    )
+                )
+                elapsed = time.monotonic() - started_at
+                release.set()
+                thread.join(timeout=30)
+
+            assert not thread.is_alive()
+            assert elapsed < 0.8
+            assert len(errors) == 1
+            assert "while the context was in flight" in str(errors[0])
+            retried = runtime.task_context(planned["task_ref"])
+            assert retried["run_id"] == baseline["run_id"]
+            assert retried["audit_worktree_head"] == expected_head
+            state = runtime.state("gh-audit-repo")
+            assert state["phases"]["structure"]["status"] == "in-progress"
+
     def test_run_start_keeps_lock_free_for_concurrent_start(self, monkeypatch) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-start-lock-") as directory:
             runtime = self.make_runtime(Path(directory))

@@ -2581,12 +2581,41 @@ class WorkflowRuntime:
 
     def task_context(self, task_ref: str, history_cursor: str | None = None) -> dict[str, Any]:
         workflow, _, _ = self._parse_task_ref(task_ref)
-        if workflow in {"gh-audit-repo", "gh-curate-issues"}:
+        if workflow == "gh-audit-repo":
+            return self._audit_task_context(task_ref, history_cursor)
+        if workflow == "gh-curate-issues":
             with self.lock():
                 return self._task_context(task_ref, history_cursor)
         return self._task_context(task_ref, history_cursor)
 
-    def _task_context(self, task_ref: str, history_cursor: str | None = None) -> dict[str, Any]:
+    def _audit_task_context(
+        self, task_ref: str, history_cursor: str | None = None
+    ) -> dict[str, Any]:
+        # The HEAD verification spawns a bounded git subprocess that can stall
+        # on a stalled worktree filesystem. Run it outside the runtime lock
+        # against the already-read state snapshot so a slow context call only
+        # delays itself, not every mutation surface. State is re-read and
+        # revision-checked under the lock before reporting, mirroring the
+        # audit_probe and audit_inventory out-of-lock pattern.
+        with self.lock():
+            state = self.state("gh-audit-repo")
+            expected_revision = state["revision"]
+        head = self._verified_audit_worktree_head(state)
+        with self.lock():
+            state = self.state("gh-audit-repo")
+            if state["revision"] != expected_revision:
+                raise RuntimeError(
+                    "audit state changed while the context was in flight; "
+                    f"expected revision {expected_revision}, found {state['revision']}"
+                )
+            return self._task_context(task_ref, history_cursor, audit_worktree_head=head)
+
+    def _task_context(
+        self,
+        task_ref: str,
+        history_cursor: str | None = None,
+        audit_worktree_head: str | None = None,
+    ) -> dict[str, Any]:
         workflow, run_ref, task_id = self._parse_task_ref(task_ref)
         state = self.state(workflow)
         if not self._task_ref_matches(state, run_ref):
@@ -2671,7 +2700,9 @@ class WorkflowRuntime:
         if continuation is not None:
             result["continuation"] = continuation
         if workflow == "gh-audit-repo":
-            result["audit_worktree_head"] = self._verified_audit_worktree_head(state)
+            if audit_worktree_head is None:
+                audit_worktree_head = self._verified_audit_worktree_head(state)
+            result["audit_worktree_head"] = audit_worktree_head
             result["knowledge"] = self._audit_task_knowledge(state, assignment)
             result["history"] = self._audit_task_history(
                 state, assignment, task_ref, history_cursor
