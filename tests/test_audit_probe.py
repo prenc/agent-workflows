@@ -513,6 +513,48 @@ print("isolated")
         assert "isolated" in artifact["stdout_excerpt"]
         assert not host_path.exists()
 
+    def test_sandbox_drops_capabilities_and_refuses_bind_mounts(self) -> None:
+        host_path = self.project.parent / "unrelated-host-source"
+        host_path.write_text("host data\n", encoding="utf-8")
+        try:
+            code = f"""
+import ctypes, errno, os
+from pathlib import Path
+
+caps = dict(
+    (line.split(":")[0].strip(), line.split(":")[1].strip())
+    for line in Path("/proc/self/status").read_text().splitlines()
+    if line.startswith(("CapEff", "CapPrm", "CapInh"))
+)
+if any(int(value, 16) for value in caps.values()):
+    raise AssertionError("capability sets were not dropped: %r" % caps)
+
+target = Path(os.environ["TMPDIR"]) / "bind-alias"
+target.mkdir()
+libc = ctypes.CDLL(None, use_errno=True)
+# mount(2) with the raw MS_BIND flag 4096: os.MS_BIND is absent in CPython 3.12
+rc = libc.mount(
+    {str(host_path)!r}.encode(),
+    str(target).encode(),
+    None,
+    4096,
+    None,
+)
+if rc == 0:
+    raise AssertionError("bind mount into scratch succeeded")
+if ctypes.get_errno() not in (errno.EPERM, errno.EACCES):
+    raise AssertionError("bind mount was not refused: %d" % ctypes.get_errno())
+print("mounts-refused")
+"""
+            result = self.invoke("--code", code)
+            assert result.returncode == 0, result.stdout + result.stderr
+            artifact = json.loads(Path(json.loads(result.stdout)["result"]).read_text())
+            assert artifact["probe_status"] == "succeeded"
+            assert "mounts-refused" in artifact["stdout_excerpt"]
+            assert host_path.read_text() == "host data\n"
+        finally:
+            host_path.unlink(missing_ok=True)
+
 
 class TestAuditSandboxKills:
     def test_kill_process_group_ignores_missing_group(self) -> None:
@@ -547,3 +589,23 @@ class TestAuditSandboxKills:
         returncode, timed_out = audit_sandbox.wait_bounded(process, 0.3, grace_seconds=2)
         assert timed_out is True
         assert returncode != 0
+
+    def test_wait_bounded_gives_up_on_unreapable_child(self) -> None:
+        # A stubbed Popen whose wait keeps timing out models a SIGKILLed
+        # child stuck in uninterruptible D state (for example on a stalled
+        # network-filesystem write): the bounded reap wait must return the
+        # typed timeout outcome instead of wedging the caller.
+        process = subprocess.Popen(["true"], start_new_session=True)
+        process.wait()
+
+        def always_times_out(timeout=None):
+            raise subprocess.TimeoutExpired(cmd=["unreapable"], timeout=timeout)
+
+        process.wait = always_times_out
+        started = time.monotonic()
+        returncode, timed_out = audit_sandbox.wait_bounded(
+            process, 0.1, grace_seconds=0.1, reap_seconds=0.1
+        )
+        assert timed_out is True
+        assert returncode is None
+        assert time.monotonic() - started < 5

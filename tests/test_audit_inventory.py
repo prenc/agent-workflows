@@ -209,6 +209,47 @@ class TestAuditInventory:
         assert "isolated version" in fact["stdout"]
         assert not (self.worktree / "forbidden-write").exists()
 
+    def test_program_probe_refuses_bind_mounts_into_scratch(self) -> None:
+        self.call("initialize")
+        host_path = self.project.parent / "unrelated-host-source"
+        host_path.write_text("host data\n", encoding="utf-8")
+        try:
+            with tempfile.TemporaryDirectory(prefix="audit-inventory-bin-") as binary_dir:
+                executable = Path(binary_dir) / "mount-refusal"
+                executable.write_text(
+                    "#!/usr/bin/python3\n"
+                    "import ctypes, errno, os\n"
+                    "from pathlib import Path\n"
+                    "caps = dict((line.split(':')[0].strip(), line.split(':')[1].strip())\n"
+                    "            for line in Path('/proc/self/status').read_text().splitlines()\n"
+                    "            if line.startswith(('CapEff', 'CapPrm', 'CapInh')))\n"
+                    "if any(int(value, 16) for value in caps.values()):\n"
+                    "    raise SystemExit(4)\n"
+                    "target = Path(os.environ['TMPDIR']) / 'bind-alias'\n"
+                    "target.mkdir()\n"
+                    "libc = ctypes.CDLL(None, use_errno=True)\n"
+                    f"rc = libc.mount({str(host_path)!r}.encode(), str(target).encode(), None, 4096, None)\n"
+                    "if rc == 0:\n"
+                    "    raise SystemExit(5)\n"
+                    "if ctypes.get_errno() not in (errno.EPERM, errno.EACCES):\n"
+                    "    raise SystemExit(6)\n"
+                    "print('mounts-refused version')\n"
+                )
+                executable.chmod(0o755)
+                environment = os.environ.copy()
+                environment["PATH"] = f"{binary_dir}:{environment['PATH']}"
+                source = self.program_input([{"name": "mount-refusal", "arguments": ["--version"]}])
+                result = self.call(
+                    "program", "--input", str(source), "--expected-revision", "1", env=environment
+                )
+            fact = json.loads(result.stdout)["facts"]["mount-refusal"]
+            assert fact["available"]
+            assert fact["probe_status"] == "succeeded", json.dumps(fact, sort_keys=True)
+            assert "mounts-refused version" in fact["stdout"]
+            assert host_path.read_text() == "host data\n"
+        finally:
+            host_path.unlink(missing_ok=True)
+
     def test_program_probe_ignores_repository_tool_manager_configuration(self) -> None:
         self.call("initialize")
         (self.worktree / ".mise.toml").write_text('[tools]\nrg = "latest"\n', encoding="utf-8")

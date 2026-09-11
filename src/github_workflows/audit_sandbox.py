@@ -30,6 +30,12 @@ SCRATCH_BYTES = 2 * 1024 * 1024 * 1024
 NPROC_MARGIN = 64
 NPROC_FLOOR = 256
 KILL_GRACE_SECONDS = 5
+# Bounded reap wait after the unconditional SIGKILL: a SIGKILLed child stuck
+# in uninterruptible D state (for example on a stalled network-filesystem
+# write) cannot be reaped, so the final wait in wait_bounded is bounded;
+# past the bound it returns a typed timeout outcome instead of wedging the
+# in-process audit call.
+REAP_WAIT_SECONDS = 5
 _NICE_ADJUSTMENT = 10
 
 _LANDLOCK_CREATE_RULESET = 444
@@ -37,6 +43,13 @@ _LANDLOCK_ADD_RULE = 445
 _LANDLOCK_RESTRICT_SELF = 446
 _LANDLOCK_RULE_PATH_BENEATH = 1
 _PR_SET_NO_NEW_PRIVS = 38
+# capset(2) clears the in-namespace capability sets before exec; 126 is the
+# capset number on every supported Linux syscall table (x86_64, aarch64, and
+# the 32-bit x86/arm tables). Version 3 carries two words per set
+# (capabilities 0-31, then 32-40): the kernel reads both words, so the
+# struct must provide both zeroed words or it would read adjacent memory.
+_CAP_SET = 126
+_LINUX_CAPABILITY_VERSION_3 = 0x20080522
 _LANDLOCK_WRITE_ACCESS = sum(1 << bit for bit in (1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14))
 
 
@@ -46,6 +59,18 @@ class _LandlockRulesetAttr(ctypes.Structure):
 
 class _LandlockPathBeneathAttr(ctypes.Structure):
     _fields_ = [("allowed_access", ctypes.c_uint64), ("parent_fd", ctypes.c_int)]
+
+
+class _CapUserData(ctypes.Structure):
+    """capset(2) user payload: version, target pid (0 = self), then two
+    zeroed (effective, permitted, inheritable) words covering all
+    capabilities through cap_last_cap."""
+
+    _fields_ = [
+        ("version", ctypes.c_int),
+        ("pid", ctypes.c_int),
+        ("data", ctypes.c_uint32 * 6),
+    ]
 
 
 _MOUNT_ESCAPE_RE = re.compile(r"\\([0-7]{3})")
@@ -425,10 +450,32 @@ def restrict_writes_to(root: Path) -> None:
         os.close(ruleset_fd)
 
 
+def drop_capabilities() -> None:
+    """Clear the in-namespace capability sets before exec.
+
+    A ``--map-root-user`` namespace child starts with the full in-namespace
+    capability set, and neither NO_NEW_PRIVS nor Landlock removes it.
+    Retaining CAP_SYS_ADMIN would let the child create bind mounts (no
+    Landlock access in any documented ABI governs mount(2)) and write
+    through the alias, defeating the write boundary. Zeroing the effective,
+    permitted, and inheritable sets after Landlock is applied and before
+    execvpe makes the mount refusal a code-level guarantee. This task has
+    already run the namespace script's own bind mounts (they require the
+    capabilities), so the drop must stay after them and before the probe
+    exec.
+    """
+    libc = ctypes.CDLL(None, use_errno=True)
+    header = _CapUserData(_LINUX_CAPABILITY_VERSION_3, 0)
+    if libc.syscall(_CAP_SET, ctypes.byref(header), ctypes.byref(header.data)) < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
 def _main() -> int:
     if len(sys.argv) < 4 or sys.argv[1] != "--restrict-writes":
         raise SystemExit("usage: audit_sandbox.py --restrict-writes ROOT COMMAND [ARG ...]")
     restrict_writes_to(Path(sys.argv[2]))
+    drop_capabilities()
     # The command was constructed from validated probe inputs by the parent;
     # exec is required so the Landlock policy applies to the actual probe.
     os.execvpe(sys.argv[3], sys.argv[3:], os.environ)  # noqa: S606
@@ -456,13 +503,20 @@ def wait_bounded(
     process: subprocess.Popen,
     wall_seconds: float,
     grace_seconds: float = KILL_GRACE_SECONDS,
-) -> tuple[int, bool]:
+    reap_seconds: float = REAP_WAIT_SECONDS,
+) -> tuple[int | None, bool]:
     """Wait for the child, escalating to a group kill on wall timeout.
 
     The SIGKILL escalation is unconditional: it runs after the grace wait
     times out and also when the child exits early in the grace window,
     because namespace-init death does not mass-kill descendants and
-    SIGTERM-ignoring descendants would otherwise survive. Returns
+    SIGTERM-ignoring descendants would otherwise survive. The final reap
+    wait is bounded by ``reap_seconds``: a SIGKILLed child stuck in
+    uninterruptible D state (for example on a stalled network-filesystem
+    write) cannot be reaped, so the wait gives up after the bound and
+    returns ``(None, True)`` — the typed timeout outcome with no
+    returncode, which the probe and inventory callers surface as their
+    timed-out/failed status — instead of wedging the caller. Returns
     ``(returncode, timed_out)``.
     """
     try:
@@ -473,7 +527,10 @@ def wait_bounded(
             returncode = process.wait(timeout=grace_seconds)
         except subprocess.TimeoutExpired:
             kill_process_group(process, signal.SIGKILL)
-            returncode = process.wait()
+            try:
+                returncode = process.wait(timeout=reap_seconds)
+            except subprocess.TimeoutExpired:
+                return None, True
         else:
             kill_process_group(process, signal.SIGKILL)
         return returncode, True
