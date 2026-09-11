@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -16,7 +17,7 @@ import pytest
 from mcp import Client
 from pydantic import ValidationError
 
-from github_workflows import audit_knowledge, github_cache, workflow_run
+from github_workflows import audit_knowledge, cli, github_cache, workflow_run
 from github_workflows.mcp_server import create_server
 from github_workflows.models import (
     AuditRecordRequest,
@@ -2416,6 +2417,84 @@ class TestRuntimeSafety:
                 runtime.history_query(HistoryQueryRequest(workflow=workflow))
             assert not database.exists()
 
+    def test_history_query_invalid_cache_is_a_structured_error(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-history-invalid-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            workflow = "gh-curate-issues"
+            runtime.run_manage(
+                RunManageRequest(
+                    action="start",
+                    workflow=workflow,
+                    repository="example/repo",
+                )
+            )
+            runtime.history_manage(HistoryManageRequest(action="prepare", workflow=workflow))
+            runtime.history_manage(
+                HistoryManageRequest(
+                    action="commit",
+                    workflow=workflow,
+                    full_history_complete=True,
+                    default_sha="a" * 40,
+                )
+            )
+            database = github_cache.live_path(
+                github_cache.repo_dir(runtime.project_dir, "example/repo"),
+                "records",
+            )
+            for payload, message in (
+                (b"not a sqlite database", "cache database is invalid"),
+                (b"", "cache database is empty"),
+            ):
+                database.write_bytes(payload)
+                with pytest.raises(ValueError, match=message):
+                    runtime.history_query(HistoryQueryRequest(workflow=workflow, state="open"))
+
+    def test_history_query_cli_invalid_cache_exits_cleanly(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-history-cli-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            workflow = "gh-curate-issues"
+            runtime.run_manage(
+                RunManageRequest(
+                    action="start",
+                    workflow=workflow,
+                    repository="example/repo",
+                )
+            )
+            runtime.history_manage(HistoryManageRequest(action="prepare", workflow=workflow))
+            runtime.history_manage(
+                HistoryManageRequest(
+                    action="commit",
+                    workflow=workflow,
+                    full_history_complete=True,
+                    default_sha="a" * 40,
+                )
+            )
+            database = github_cache.live_path(
+                github_cache.repo_dir(runtime.project_dir, "example/repo"),
+                "records",
+            )
+            database.write_bytes(b"not a sqlite database")
+            monkeypatch.setattr(
+                sys,
+                "argv",
+                [
+                    "agent-workflows",
+                    "workflow",
+                    "--workspace",
+                    str(runtime.workspace),
+                    "--project-dir",
+                    str(runtime.project_dir),
+                    "history-query",
+                    json.dumps({"workflow": workflow, "state": "open"}),
+                ],
+            )
+            assert cli.main() == 2
+            captured = capsys.readouterr()
+            assert "Traceback" not in captured.err
+            assert "cache database is invalid" in captured.err
+
     def test_audit_mode_owns_integration_and_shard_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-audit-shard-") as directory:
             runtime = self.make_runtime(Path(directory))
@@ -3277,6 +3356,54 @@ class TestRuntimeSafety:
                 set(record) <= {"kind", "number", "url", "title", "state", "state_reason", "labels"}
                 for record in context["history"]["selection"]["records"]
             )
+
+    def test_audit_task_context_invalid_cache_is_a_structured_error(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-audit-context-invalid-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            runtime.history_manage(HistoryManageRequest(action="prepare"))
+            runtime.history_manage(
+                HistoryManageRequest(
+                    action="ingest",
+                    records=[
+                        {
+                            "kind": "issue",
+                            "number": 1,
+                            "state": "open",
+                            "title": "Shared core cache grows",
+                            "labels": ["area/shared-core"],
+                        }
+                    ],
+                )
+            )
+            runtime.history_manage(
+                HistoryManageRequest(
+                    action="commit",
+                    full_history_complete=True,
+                    default_sha=runtime.state("gh-audit-repo")["sha"],
+                )
+            )
+            planned = runtime.task_manage(
+                TaskManageRequest(
+                    workflow="gh-audit-repo",
+                    action="plan",
+                    task={
+                        "logical_id": "discover-core",
+                        "assignment": {
+                            "mode": "discover",
+                            "area": "area/shared-core",
+                            "focus": "cache behavior",
+                        },
+                    },
+                )
+            )
+            database = github_cache.live_path(
+                github_cache.repo_dir(runtime.project_dir, "example/repo"),
+                "records",
+            )
+            database.write_bytes(b"not a sqlite database")
+            with pytest.raises(ValueError, match="cache database is invalid"):
+                runtime.task_context(planned["task_ref"])
 
     def test_audit_history_links_are_typed_deduplicated_and_bounded(self) -> None:
         assert WorkflowRuntime._audit_history_links(
