@@ -17,6 +17,12 @@ from pathlib import Path
 # exhausting it fails with a normal non-zero exit instead of threatening the
 # host with an out-of-memory event.
 ADDRESS_SPACE_BYTES = 8 * 1024 * 1024 * 1024
+# Deliberate GiB-scale scratch ceiling for sandbox children: a size-bounded
+# tmpfs over the scratch root makes a child that keeps creating FSIZE-capped
+# files fail with ENOSPC and a normal non-zero exit instead of exhausting the
+# host volume (Linux has no disk rlimit). tmpfs is demand-allocated, so the
+# ceiling also bounds the host RAM a child can pin.
+SCRATCH_BYTES = 2 * 1024 * 1024 * 1024
 # Host-relative RLIMIT_NPROC policy: the live task count for our real UID
 # plus a margin, floored so a small audit host keeps a sane spawn budget.
 # Enforced per user namespace, so the bound is a safe superset inside the
@@ -49,16 +55,20 @@ _MOUNT_ESCAPE_RE = re.compile(r"\\([0-7]{3})")
 # died, so the keeper shell (PID 1) forks exactly once and then only waits.
 # The work subshell execs the probe, so the probe itself is never PID 1 and
 # keeps ordinary signal semantics. Read-only binds protect known audit state;
-# Landlock independently denies filesystem writes outside probe scratch.
+# Landlock independently denies filesystem writes outside probe scratch; a
+# size-bounded tmpfs over the scratch root caps the total bytes the child can
+# persist under scratch, so exhaustion is a child ENOSPC, not host-volume
+# exhaustion.
 _NAMESPACE_SCRIPT = (
     "set -eu\n"
     "(\n"
     '  worktree="$1"\n'
     '  scratch="$2"\n'
-    '  working_directory="$3"\n'
-    '  helper="$4"\n'
-    '  count="$5"\n'
-    "  shift 5\n"
+    '  scratch_bytes="$3"\n'
+    '  working_directory="$4"\n'
+    '  helper="$5"\n'
+    '  count="$6"\n'
+    "  shift 6\n"
     '  while [ "$count" -gt 0 ]; do\n'
     '    root="$1"\n'
     "    shift\n"
@@ -74,6 +84,18 @@ _NAMESPACE_SCRIPT = (
     "    count=$((count - 1))\n"
     '    { /usr/bin/mount --bind "$root" "$root" '
     '      && /usr/bin/mount -o remount,bind,ro "$root"; } 2>/dev/null || true\n'
+    "  done\n"
+    "  # The parent-created environment subdirectories (home/cache/tmp) must\n"
+    "  # exist inside the fresh tmpfs; the parent-opened stdout/stderr inodes\n"
+    "  # stay on the host volume, so both capture paths keep working.\n"
+    "  subdirs=\n"
+    '  for entry in "$scratch"/*; do\n'
+    '    [ -d "$entry" ] || continue\n'
+    '    subdirs="$subdirs ${entry##*/}"\n'
+    "  done\n"
+    '  /usr/bin/mount -t tmpfs -o size="$scratch_bytes",mode=0700 tmpfs "$scratch"\n'
+    "  for name in $subdirs; do\n"
+    '    mkdir -p "$scratch/$name"\n'
     "  done\n"
     '  cd "$working_directory"\n'
     '  exec /usr/bin/python3 "$helper" --restrict-writes "$scratch" "$@"\n'
@@ -239,6 +261,7 @@ def namespace_command(
     *,
     worktree: Path,
     scratch: Path,
+    scratch_bytes: int,
     readonly_binds: tuple[Sequence[Path], Sequence[Path]],
     label: str,
     working_directory: Path | None = None,
@@ -248,14 +271,17 @@ def namespace_command(
     The probe runs in new user, mount, network, and pid namespaces. Strict
     read-only binds of the specific audit-state roots plus best-effort
     read-only binds of their mount points make the host filesystem read-only
-    for the probe, and a keeper shell keeps the probe from becoming PID 1 of
-    the pid namespace.
+    for the probe, a size-bounded tmpfs over scratch caps the total bytes the
+    child can persist under scratch, and a keeper shell keeps the probe from
+    becoming PID 1 of the pid namespace.
     """
     specific, mountpoints = readonly_binds
     working_directory = worktree if working_directory is None else working_directory
     resolved_working_directory = working_directory.resolve()
     if resolved_working_directory not in {worktree.resolve(), scratch.resolve()}:
         raise ValueError("sandbox working directory must be the worktree or scratch directory")
+    if scratch_bytes <= 0:
+        raise ValueError("scratch size bound must be positive")
     # --fork is required: with --pid alone the unshare process itself becomes
     # the namespace init and the kernel kills it on this util-linux/kernel
     # line; with --fork the forked child is the init (the keeper shell) and
@@ -274,6 +300,7 @@ def namespace_command(
         label,
         str(worktree),
         str(scratch),
+        str(scratch_bytes),
         str(resolved_working_directory),
         str(Path(__file__).resolve()),
         str(len(specific)),

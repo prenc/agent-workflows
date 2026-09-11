@@ -319,6 +319,7 @@ def run_probe(args: argparse.Namespace) -> int:
     before = git_output(worktree, "status", "--porcelain=v1", "--untracked-files=all")
     started = time.monotonic()
     address_space, nproc = audit_sandbox.current_resource_bounds()
+    scratch_bytes = audit_sandbox.SCRATCH_BYTES
     with tempfile.TemporaryDirectory(prefix="qwen-audit-probe-") as temporary:
         temporary_path = Path(temporary)
         environment = sanitized_environment(temporary_path, pythonpath)
@@ -328,6 +329,7 @@ def run_probe(args: argparse.Namespace) -> int:
             inner_command,
             worktree=worktree,
             scratch=temporary_path,
+            scratch_bytes=scratch_bytes,
             readonly_binds=audit_sandbox.readonly_binds(
                 worktree,
                 probe_readonly_roots(worktree, python.parent.parent, python, run_dir),
@@ -375,6 +377,7 @@ def run_probe(args: argparse.Namespace) -> int:
                 "wall_seconds": WALL_SECONDS,
                 "cpu_seconds": CPU_SECONDS,
                 "output_bytes_per_stream": OUTPUT_BYTES,
+                "scratch_bytes": scratch_bytes,
                 "address_space_bytes": address_space,
                 "nproc": nproc,
                 "threads": 1,

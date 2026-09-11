@@ -4,6 +4,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -331,6 +332,7 @@ print("isolated")
         assert artifact["limits"]["address_space_bytes"] == audit_sandbox.ADDRESS_SPACE_BYTES
         assert artifact["limits"]["address_space_bytes"] >= 1024 * 1024 * 1024
         assert artifact["limits"]["nproc"] >= audit_sandbox.NPROC_FLOOR
+        assert artifact["limits"]["scratch_bytes"] == audit_sandbox.SCRATCH_BYTES
 
     def test_address_space_exhaustion_maps_to_failed_probe(self) -> None:
         # exhausting the RLIMIT_AS ceiling is a child MemoryError: it exits
@@ -341,6 +343,58 @@ print("isolated")
         artifact = json.loads(Path(json.loads(result.stdout)["result"]).read_text())
         assert artifact["probe_status"] == "failed"
         assert artifact["returncode"] == 1
+
+    def test_scratch_fill_bounded_by_tmpfs_maps_to_failed_probe(self, monkeypatch) -> None:
+        # Filling the size-bounded scratch tmpfs is a child ENOSPC: the probe
+        # fails cleanly at the configured total instead of exhausting the host
+        # volume, with no new exception path (exact precedent: address-space
+        # exhaustion).
+        from github_workflows import audit_probe as audit_probe_module
+
+        bound = 512 * 1024
+        monkeypatch.setattr(audit_probe_module.audit_sandbox, "SCRATCH_BYTES", bound)
+        code = (
+            "import os\n"
+            "total = 0\n"
+            "tmp = os.environ['TMPDIR']\n"
+            "try:\n"
+            "    i = 0\n"
+            "    while True:\n"
+            "        with open(os.path.join(tmp, f'fill-{i}'), 'wb') as handle:\n"
+            "            handle.write(b'x' * (64 * 1024))\n"
+            "        total += 64 * 1024\n"
+            "        i += 1\n"
+            "except OSError:\n"
+            "    print(f'scratch bounded at {total} bytes', flush=True)\n"
+            "    raise\n"
+        )
+        args = argparse.Namespace(
+            project_root=self.project,
+            project_dir=self.project_dir,
+            audit_worktree=self.project,
+            run_dir=self.run_dir,
+            probe_id="probe-scratch-bound",
+            pythonpath=None,
+            kind="python",
+            code=code,
+            selector=[],
+        )
+        returncode = audit_probe_module.run_probe(args)
+        assert returncode == 1, "scratch exhaustion must surface as the child's non-zero exit"
+        artifact = json.loads(
+            (self.run_dir / "validation" / "probe-scratch-bound" / "result.json").read_text()
+        )
+        assert artifact["probe_status"] == "failed"
+        assert artifact["returncode"] == 1
+        assert artifact["timed_out"] is False
+        assert artifact["worktree_unchanged"] is True
+        assert artifact["limits"]["scratch_bytes"] == bound
+        match = re.search(r"scratch bounded at (\d+) bytes", artifact["stdout_excerpt"])
+        assert match, artifact["stdout_excerpt"] + artifact["stderr_excerpt"]
+        # The tmpfs bound, not the host volume, is what stopped the child: the
+        # reported total holds at or below the configured scratch ceiling.
+        assert 0 < int(match.group(1)) <= bound
+        assert "No space left on device" in artifact["stderr_excerpt"]
 
     def test_sandbox_isolates_pid_namespace_and_primary_gitdir(self) -> None:
         linked = self.project / "linked-worktree"
