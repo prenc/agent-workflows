@@ -202,6 +202,23 @@ class TestRuntimeSafety:
             assert contexts[0]["run_id"] == started["run_id"]
             assert receipts[0]["run_id"] != started["run_id"]
 
+    def test_curation_bundle_decode_recursion_fails_typed(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="curation-bundle-recursion-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            runtime.run_manage(
+                RunManageRequest(
+                    action="start",
+                    workflow="gh-curate-issues",
+                    repository="example/repo",
+                )
+            )
+            assignment = self.curation_assignment(runtime, 1)
+            with mock.patch("github_workflows.runtime.json.loads", side_effect=RecursionError):
+                with pytest.raises(
+                    ValueError, match="candidate_bundle must contain valid UTF-8 JSON"
+                ):
+                    runtime._curation_bundle(assignment)
+
     def test_legacy_existing_pull_task_requires_corrected_retry_assignment(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-legacy-pr-round-") as directory:
             runtime = self.make_runtime(Path(directory))
@@ -1832,6 +1849,20 @@ class TestRuntimeSafety:
                 linked.symlink_to(issue_page)
                 with pytest.raises(ValueError, match="non-symlink"):
                     WorkflowRuntime._history_artifact_records([str(linked)], "issue")
+
+    def test_history_artifact_decode_recursion_fails_typed(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="history-artifact-recursion-") as directory:
+            root = Path(directory)
+            qwen_home = root / "qwen-home"
+            tool_results = qwen_home / "tmp" / "session" / "tool-results"
+            tool_results.mkdir(parents=True)
+            deep = tool_results / "deeply-nested.txt"
+            deep.write_text('[{"number": 1}]', encoding="utf-8")
+            deep.chmod(0o600)
+            with mock.patch.dict("os.environ", {"QWEN_HOME": str(qwen_home)}):
+                with mock.patch("github_workflows.runtime.json.loads", side_effect=RecursionError):
+                    with pytest.raises(ValueError, match="valid UTF-8 JSON"):
+                        WorkflowRuntime._history_artifact_records([str(deep)], "issue")
 
     def test_history_artifact_cap_counts_combined_expanded_records_before_ingest(self) -> None:
         with tempfile.TemporaryDirectory(prefix="history-expanded-cap-") as directory:

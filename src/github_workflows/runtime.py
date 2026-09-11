@@ -323,7 +323,7 @@ class WorkflowRuntime:
                 )
             try:
                 payload = json.loads(resolved.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as error:
                 raise ValueError("history artifact must contain valid UTF-8 JSON") from error
             if isinstance(payload, list):
                 page = payload
@@ -959,7 +959,7 @@ class WorkflowRuntime:
         resolved = self._curation_assigned_artifacts(assignment)["candidate_bundle"]
         try:
             bundle = json.loads(resolved.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as error:
             raise ValueError("assignment.candidate_bundle must contain valid UTF-8 JSON") from error
         if not isinstance(bundle, dict):
             raise ValueError("candidate bundle must be a JSON object")
