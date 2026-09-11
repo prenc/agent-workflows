@@ -456,6 +456,33 @@ class WorkflowRuntime:
                 )
             run_id = str(state.get("run_id", ""))
             if SAFE_ID.fullmatch(run_id):
+                prefix = f"gh-audit-pr-{self._run_ref(run_id)}-"
+                for root in (
+                    self.workspace / ".worktrees",
+                    self._cache_worktree_path(),
+                ):
+                    if root.is_dir():
+                        for worktree in root.iterdir():
+                            if (
+                                worktree.name.startswith(prefix)
+                                and not worktree.is_symlink()
+                                and worktree.is_dir()
+                            ):
+                                subprocess.run(
+                                    [
+                                        "git",
+                                        "-C",
+                                        str(self.workspace),
+                                        "worktree",
+                                        "remove",
+                                        "--force",
+                                        str(worktree),
+                                    ],
+                                    check=True,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                    text=True,
+                                )
                 repo = state.get("repository")
                 if isinstance(repo, str) and repo:
                     try:
@@ -600,6 +627,8 @@ class WorkflowRuntime:
             subprocess.run(
                 [
                     "git",
+                    "-c",
+                    "core.hooksPath=/dev/null",
                     "-C",
                     str(self.workspace),
                     "worktree",
@@ -622,6 +651,104 @@ class WorkflowRuntime:
             "audit_worktree": str(worktree),
             "source_confirmed": confirmed_sha is not None,
         }
+
+    def _pull_probe_worktree(self, state: dict[str, Any], candidate: dict[str, Any]) -> Path:
+        number = candidate.get("pull_number")
+        expected = candidate.get("head_sha")
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, int)
+            or number < 1
+            or not isinstance(expected, str)
+            or not re.fullmatch(r"[0-9a-fA-F]{40}", expected)
+        ):
+            raise ValueError("pull-request probe candidate requires pull_number and full head_sha")
+        try:
+            remote = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(self.workspace),
+                    "ls-remote",
+                    "origin",
+                    f"refs/pull/{number}/head",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=GIT_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise ValueError("pull-request head verification timed out") from error
+        live = remote.stdout.split(maxsplit=1)[0].lower() if remote.stdout.strip() else ""
+        if remote.returncode != 0 or live != expected.lower():
+            raise ValueError("pull-request head changed or could not be verified")
+        try:
+            fetched = subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-C",
+                    str(self.workspace),
+                    "fetch",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    "--no-recurse-submodules",
+                    "origin",
+                    f"refs/pull/{number}/head",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=GIT_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise ValueError("pull-request head fetch timed out") from error
+        if fetched.returncode != 0:
+            raise ValueError("pull-request head could not be fetched for a probe")
+        run_ref = self._run_ref(str(state["run_id"]))
+        worktree = self._worktree_root() / (
+            f"gh-audit-pr-{run_ref}-{number}-{expected[:7].lower()}"
+        )
+        if worktree.is_symlink():
+            raise ValueError("pull-request probe worktree must not be a symlink")
+        if not worktree.exists():
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-C",
+                    str(self.workspace),
+                    "worktree",
+                    "add",
+                    "--detach",
+                    str(worktree),
+                    expected,
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=GIT_TIMEOUT_SECONDS,
+            )
+        metadata = worktree.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            raise PermissionError("pull-request probe worktree must be an owned directory")
+        actual = subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", "--verify", "HEAD^{commit}"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=GIT_TIMEOUT_SECONDS,
+        ).stdout.strip()
+        if actual.lower() != expected.lower():
+            raise ValueError("pull-request probe worktree does not match its captured head")
+        project_venv = self.workspace / ".venv"
+        if project_venv.is_dir() and not (worktree / ".venv").exists():
+            (worktree / ".venv").symlink_to(project_venv, target_is_directory=True)
+        return worktree
 
     @staticmethod
     def _receipt(
@@ -683,7 +810,7 @@ class WorkflowRuntime:
         assignment = plan.assignment if plan is not None else {}
         mode = assignment.get("mode") if isinstance(assignment, dict) else None
         supplied = plan.role if plan is not None else None
-        if mode in {"discover", "verify"}:
+        if mode in {"discover", "reconcile", "verify"}:
             if supplied is not None and supplied != mode:
                 raise ValueError("task role must match assignment.mode")
             return str(mode)
@@ -757,7 +884,9 @@ class WorkflowRuntime:
         *,
         caller_supplied: bool,
     ) -> dict[str, Any]:
-        cls._audit_history_links(assignment)
+        links = cls._audit_history_links(assignment)
+        if assignment.get("mode") == "reconcile" and not links:
+            raise ValueError("reconcile assignment requires at least one history link")
         if assignment.get("mode") != "verify":
             return assignment
         candidate = assignment.get("candidate")
@@ -1072,7 +1201,7 @@ class WorkflowRuntime:
     ) -> str | None:
         assignment = self._audit_task_assignment(task.get("assignment", {}), caller_supplied=False)
         mode = assignment.get("mode")
-        if mode not in {"discover", "verify"}:
+        if mode not in {"discover", "reconcile", "verify"}:
             return str(report["status"]) if isinstance(report.get("status"), str) else None
         status = report.get("status")
         allowed = (
@@ -2873,6 +3002,8 @@ class WorkflowRuntime:
                     f"candidate {request.candidate_id} is in terminal status "
                     f"{candidate_status}; probe refused before execution"
                 )
+            candidate = dict(candidate)
+            probe_sha = state.get("sha")
             artifact_dir = run_dir / "validation" / request.probe_id
             values = {
                 "project_root": self.workspace,
@@ -2885,6 +3016,10 @@ class WorkflowRuntime:
                 "selector": getattr(request, "selectors", None),
                 "code": getattr(request, "code", None),
             }
+        if candidate.get("artifact_kind") == "pull":
+            worktree = self._pull_probe_worktree(state, candidate)
+            probe_sha = candidate.get("head_sha")
+            values["audit_worktree"] = worktree
         # The probe subprocess runs outside the exclusive lock; state is re-read
         # and revision-checked under the lock before the result is persisted.
         try:
@@ -2905,6 +3040,11 @@ class WorkflowRuntime:
                     raise ValueError("probe did not produce a valid result artifact") from error
                 if not isinstance(artifact, dict) or artifact.get("probe_id") != request.probe_id:
                     raise ValueError("probe result artifact has an invalid identity")
+                if (
+                    candidate.get("artifact_kind") == "pull"
+                    and artifact.get("repo_sha") != probe_sha
+                ):
+                    raise ValueError("probe result does not match its immutable source SHA")
                 status = self._probe_validation_status(artifact)
 
                 def bounded(name: str, limit: int) -> tuple[str, bool]:
@@ -2941,6 +3081,10 @@ class WorkflowRuntime:
                             "returncode": artifact.get("returncode"),
                             "timed_out": bool(artifact.get("timed_out")),
                             "worktree_unchanged": bool(artifact.get("worktree_unchanged")),
+                            "source_kind": (
+                                "pull" if candidate.get("artifact_kind") == "pull" else "default"
+                            ),
+                            "source_sha": probe_sha,
                             "stdout_excerpt": persisted_stdout,
                             "stderr_excerpt": persisted_stderr,
                             "stdout_truncated": persisted_stdout_truncated,

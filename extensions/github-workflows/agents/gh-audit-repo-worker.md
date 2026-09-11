@@ -35,7 +35,9 @@ Call
 `mcp__github_workflows__task_context` before any other operation and treat its
 assignment, immutable source, scope, inventory, documentation strategy, and
 budget as authoritative. Verify mode additionally requires one canonical
-candidate and its fingerprint in that context. Return `CONTEXT_UNAVAILABLE`
+candidate and its fingerprint in that context. Reconcile mode requires one
+complete connected open issue/PR graph and returns a classification for every
+assigned record. Return `CONTEXT_UNAVAILABLE`
 when the tool fails or the stored assignment is incomplete.
 Treat `assignment.candidate_fingerprint` as the server-owned identity of the
 exact candidate snapshot. Copy it unchanged into every completed verify report;
@@ -45,6 +47,16 @@ Treat matching `audit_sha` and `audit_worktree_head` values as the server's
 authoritative immutable-source check; never run Git or another shell command to
 recheck HEAD yourself. Return `CONTEXT_UNAVAILABLE` if they differ or either is
 missing.
+
+In `reconcile` mode, fully read every assigned open record and its native
+relationships, comments, PR commits/files, and exact head SHA. Inspect the
+default-branch source for current behavior and classify every graph member as
+completed, invalid, duplicate/superseded, explicit-wontfix, partial,
+clear-partial, retain-open, protected, or skipped. Age is not evidence. Treat
+any `in-progress` member as protecting the graph. Propose a bounded probe when
+it could materially distinguish dispositions; for a PR candidate include
+`artifact_kind: pull`, `pull_number`, and the live full `head_sha`. Return no
+mutation candidate when evidence or relationships remain uncertain.
 
 Read the `runtime_policy` path returned in task context completely.
 This worker is read-only and must not create or execute any orchestration file.

@@ -509,6 +509,14 @@ def _public_input_schema(name: str, schema: dict[str, Any]) -> dict[str, Any]:
     if request_model is not None:
         _merge_model_constraints(properties, request_model)
     if name == "run_manage":
+        properties["implement"]["description"] = (
+            "After a successful audit, implement its new and open partial issues with the "
+            "same concurrency. Accepted only for audit starts."
+        )
+        properties["reconcile_open"]["description"] = (
+            "Before audit discovery, reconcile every issue and pull request open at the "
+            "post-sync snapshot. Accepted only for audit starts."
+        )
         properties["targets"]["description"] = (
             "Requested issue or pull-request references; required and non-empty when starting "
             "gh-implement-issue. Send a JSON array value; do not JSON-encode it as a string."
@@ -518,6 +526,10 @@ def _public_input_schema(name: str, schema: dict[str, Any]) -> dict[str, Any]:
             "External mutations awaiting read-back, rollback, or reconciliation; accepted only "
             "by generic workflow checkpoints. Send a JSON array value; do not JSON-encode it "
             "as a string."
+        )
+        properties["implement"]["description"] = (
+            "After a successful audit, implement its newly created issues and open partial "
+            "issues with the same concurrency. Accepted only for audit starts."
         )
     conditions = result.setdefault("allOf", [])
     action_model = ACTION_REQUEST_MODELS.get(name)
@@ -764,6 +776,8 @@ def create_server(runtime: WorkflowRuntime) -> MCPServer:
         refresh_history: bool | None = None,
         regression_sweep: bool | None = None,
         dry_run: bool | None = None,
+        implement: bool | None = None,
+        reconcile_open: bool | None = None,
         separate: bool | None = None,
         pending: JsonArrayArgument[list[str] | None] = None,
         confirmed_source_sha: FullSha | None = None,

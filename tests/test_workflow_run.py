@@ -76,9 +76,58 @@ class TestWorkflowRun:
         assert state["scheduler"]["limit"] == 3
         assert state["tasks"] == {}
         assert state["candidates"] == {}
+        assert state["phases"]["reconciliation"]["status"] == "skipped"
         assert (current / "journal.jsonl").is_file()
         for name in ("areas", "candidates", "validation"):
             assert (current / name).is_dir()
+
+    def test_reconcile_open_phase_precedes_structure(self) -> None:
+        source = self.project / "reconcile-input.json"
+        source.write_text('{"repository":"example/repo","inputs":{"reconcile_open":true}}\n')
+        self.call("initialize", "gh-audit-repo", "--input", str(source))
+        state = json.loads(
+            (self.project_dir / "workflows/gh-audit-repo/current/state.json").read_text()
+        )
+        assert state["phases"]["reconciliation"]["status"] == "pending"
+        revision = state["revision"]
+        for phase in ("source", "history"):
+            result = self.audit_event(
+                revision,
+                {"type": "phase-set", "phase": phase, "value": {"status": "complete"}},
+            )
+            revision = json.loads(result.stdout)["revision"]
+        status = json.loads(self.call("audit-status", "gh-audit-repo").stdout)
+        assert status["next_action"] == "reconcile-open"
+        incomplete = self.audit_event(
+            revision,
+            {
+                "type": "phase-set",
+                "phase": "reconciliation",
+                "value": {"status": "complete", "summary": {}},
+            },
+            check=False,
+        )
+        assert incomplete.returncode == 2
+        assert "snapshot_open_issues" in incomplete.stderr
+        completed = self.audit_event(
+            revision,
+            {
+                "type": "phase-set",
+                "phase": "reconciliation",
+                "value": {
+                    "status": "complete",
+                    "snapshot_open_issues": 2,
+                    "snapshot_open_pulls": 1,
+                    "classified_issues": 1,
+                    "classified_pulls": 1,
+                    "skipped_issues": 1,
+                    "skipped_pulls": 0,
+                    "coverage_digest": "a" * 64,
+                    "snapshot_watermark": "2026-09-10T00:00:00Z",
+                },
+            },
+        )
+        assert json.loads(completed.stdout)["scheduler"]["next_action"] == "prepare-structure"
 
     def test_resume_needs_no_run_id_and_fresh_initialize_replaces_it(self) -> None:
         first = self.initialize("gh-curate-issues")

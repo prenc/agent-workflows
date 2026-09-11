@@ -167,6 +167,10 @@ label definitions, while `update_pull_request` does not mutate labels.
   completed, invalid, or duplicate issue that has neither a lock nor an open
   implementation pull request. Dry-run reports those operations without
   applying them.
+  With `--reconcile-open`, it may also close independently verified obsolete
+  pull requests after one evidence comment and maintain `partial` on the PR and
+  its incompletely covered open issues. It never infers `wontfix`, applies
+  `ready-to-merge`, or mutates an `in-progress` graph.
 - The `gh-propose-enhancement` workflow may create one new proposal-derived
   enhancement issue and any missing exact canonical label it requires. It does
   not edit existing issues or apply status labels; existing label-definition

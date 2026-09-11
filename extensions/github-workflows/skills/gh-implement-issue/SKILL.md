@@ -80,6 +80,12 @@ state after any user delay and before the first mutation. The successful start
 or resume closes the question window; apply conservative runtime-policy
 defaults rather than asking during execution.
 
+When an audit `--implement` handoff supplies the targets, its preflight and
+authorization carry into this workflow. Do not repeat the interactive
+preflight. Skip targets or units that cannot proceed under existing authority
+or conservative defaults, clean up workflow-owned claims, and continue the
+independent work.
+
 ## Operating model
 
 Follow the GitHub access policy. `get_me`, or the fallback's

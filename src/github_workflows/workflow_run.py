@@ -7,6 +7,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -56,7 +57,15 @@ AUDIT_CANDIDATE_STATUSES = AUDIT_CANDIDATE_TERMINAL | {
     "verification-pending",
     "verified",
 }
-AUDIT_PHASES = ("source", "history", "structure", "discovery", "verification", "publication")
+AUDIT_PHASES = (
+    "source",
+    "history",
+    "reconciliation",
+    "structure",
+    "discovery",
+    "verification",
+    "publication",
+)
 AUDIT_PHASE_STATUSES = {"pending", "in-progress", "complete", "skipped", "partial", "failed"}
 AUDIT_SHARD_STATUSES = {"pending", "running", "partial", "complete", "skipped", "failed"}
 AUDIT_INTERNAL = {
@@ -142,6 +151,12 @@ def load_state(current: Path) -> dict[str, Any]:
     compatible = schema == 1 or (workflow == "gh-audit-repo" and schema == 2)
     if not compatible or value.get("status") not in STATUSES:
         raise ValueError("current workflow state is incompatible")
+    if workflow == "gh-audit-repo" and schema == 2:
+        phases = value.get("phases")
+        inputs = value.get("inputs")
+        if isinstance(phases, dict) and "reconciliation" not in phases:
+            enabled = isinstance(inputs, dict) and bool(inputs.get("reconcile_open"))
+            phases["reconciliation"] = {"status": "pending" if enabled else "skipped"}
     return value
 
 
@@ -155,6 +170,35 @@ def audit_concurrency(state: dict[str, Any]) -> int:
     return value
 
 
+def validate_reconciliation_summary(summary: Any) -> None:
+    if not isinstance(summary, dict):
+        raise ValueError("reconciliation completion requires a summary object")
+    fields = (
+        "snapshot_open_issues",
+        "snapshot_open_pulls",
+        "classified_issues",
+        "classified_pulls",
+        "skipped_issues",
+        "skipped_pulls",
+    )
+    for field in fields:
+        value = summary.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"reconciliation summary {field} must be a non-negative integer")
+    if summary["classified_issues"] + summary["skipped_issues"] != summary["snapshot_open_issues"]:
+        raise ValueError("reconciliation summary does not account for every open issue")
+    if summary["classified_pulls"] + summary["skipped_pulls"] != summary["snapshot_open_pulls"]:
+        raise ValueError("reconciliation summary does not account for every open pull request")
+    digest = summary.get("coverage_digest")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("reconciliation summary requires a SHA-256 coverage_digest")
+    if (
+        not isinstance(summary.get("snapshot_watermark"), str)
+        or not summary["snapshot_watermark"].strip()
+    ):
+        raise ValueError("reconciliation summary requires a snapshot_watermark")
+
+
 def audit_defaults(supplied: dict[str, Any], now: str) -> dict[str, Any]:
     value = dict(supplied)
     value.setdefault("inputs", {})
@@ -165,7 +209,16 @@ def audit_defaults(supplied: dict[str, Any], now: str) -> dict[str, Any]:
             "sha": value["sha"],
             "recorded_at": now,
         }
-    value.setdefault("phases", phases)
+    existing_phases = value.setdefault("phases", phases)
+    if "reconciliation" not in existing_phases:
+        existing_phases["reconciliation"] = {
+            "status": "pending" if value["inputs"].get("reconcile_open") else "skipped"
+        }
+    elif (
+        not value["inputs"].get("reconcile_open")
+        and existing_phases["reconciliation"].get("status") == "pending"
+    ):
+        existing_phases["reconciliation"] = {"status": "skipped"}
     value.setdefault("shards", {})
     value.setdefault("tasks", {})
     value.setdefault("candidates", {})
@@ -529,6 +582,8 @@ def audit_scheduler_status(state: dict[str, Any]) -> dict[str, Any]:
             next_action = "establish-source"
         elif phases.get("history", {}).get("status") != "complete":
             next_action = "synchronize-history"
+        elif phases.get("reconciliation", {}).get("status") not in {"complete", "skipped"}:
+            next_action = "reconcile-open"
         elif phases.get("structure", {}).get("status") != "complete":
             next_action = "prepare-structure"
         elif not state.get("shards") and phases.get("discovery", {}).get("status") == "pending":
@@ -1048,6 +1103,14 @@ def audit_event(args: argparse.Namespace) -> None:
         status = value.get("status", existing.get("status"))
         if status not in AUDIT_PHASE_STATUSES:
             raise ValueError("phase-set requires a supported status")
+        if phase == "reconciliation":
+            enabled = bool(state.get("inputs", {}).get("reconcile_open"))
+            if status == "complete":
+                if not enabled:
+                    raise ValueError("open reconciliation is not enabled for this run")
+                validate_reconciliation_summary(value)
+            elif status != "skipped" and not enabled:
+                raise ValueError("open reconciliation is not enabled for this run")
         state["phases"][phase] = {**existing, **value, "status": status}
         detail = {"phase": phase, "phase_status": status}
     elif event_type == "directive-update":

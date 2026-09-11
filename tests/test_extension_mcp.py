@@ -359,6 +359,9 @@ class TestExtensionMcp:
                 assert "n" in run_properties
                 assert "repository" in run_properties
                 assert "instructions" in run_properties
+                assert "implement" in run_properties
+                assert "reconcile_open" in run_properties
+                assert "newly created issues" in run_properties["implement"]["description"]
                 assert "confirmed_source_sha" in run_properties
                 assert "acknowledge_pending_publication" in run_properties
                 assert set(run_properties["outcome"]["enum"]) == {
@@ -541,6 +544,30 @@ class TestExtensionMcp:
                 assert audit_request.invocation()["instructions"] == (
                     "Prioritize public CLI behavior"
                 )
+                chained_audit = RunManageRequest(
+                    action="start",
+                    workflow="gh-audit-repo",
+                    repository="example/repo",
+                    n=5,
+                    implement=True,
+                )
+                assert chained_audit.invocation()["implement"] is True
+                assert chained_audit.invocation()["n"] == 5
+                reconciled_audit = RunManageRequest(
+                    action="start",
+                    workflow="gh-audit-repo",
+                    repository="example/repo",
+                    reconcile_open=True,
+                )
+                assert reconciled_audit.invocation()["reconcile_open"] is True
+                with pytest.raises(ValueError, match="incompatible with dry_run"):
+                    RunManageRequest(
+                        action="start",
+                        workflow="gh-audit-repo",
+                        repository="example/repo",
+                        dry_run=True,
+                        implement=True,
+                    )
                 with pytest.raises(ValidationError):
                     RunManageRequest(
                         action="start",
@@ -2573,6 +2600,32 @@ class TestExtensionMcp:
         assert "complete desired state per issue and linked PR" in curator
         assert "Never resubmit an identical complete label set" in curator
         assert "record a true no-op and perform no GitHub write" in curator
+
+    def test_audit_can_handoff_new_and_partial_issues_for_implementation(self) -> None:
+        audit = skill_text(EXTENSION / "skills/gh-audit-repo/SKILL.md")
+        handoff = (
+            EXTENSION / "skills/gh-audit-repo/references/validation-and-publication.md"
+        ).read_text(encoding="utf-8")
+        implementation = skill_text(EXTENSION / "skills/gh-implement-issue/SKILL.md")
+
+        assert "--dry-run | --implement" in audit
+        assert "same\n`-n`" in audit
+        assert "successful create receipts" in handoff
+        assert "exact `partial` label" in handoff
+        assert "continue independent units without asking the user" in handoff
+        assert "preflight and\nauthorization carry into this workflow" in implementation
+
+    def test_audit_can_reconcile_every_open_issue_and_pull_before_discovery(self) -> None:
+        audit = skill_text(EXTENSION / "skills/gh-audit-repo/SKILL.md")
+        reconciliation = (
+            EXTENSION / "skills/gh-audit-repo/references/open-reconciliation.md"
+        ).read_text(encoding="utf-8")
+
+        assert "--reconcile-open" in audit
+        assert "connected issue/PR graphs" in reconciliation
+        assert "Age and inactivity are never disposition evidence" in reconciliation
+        assert "Never apply `ready-to-merge`" in reconciliation
+        assert "detached managed\nworktree" in reconciliation
 
     def test_implementation_pr_template_omits_empty_and_validation_sections(self) -> None:
         template = (EXTENSION / "references/github-pr-template.md").read_text(encoding="utf-8")

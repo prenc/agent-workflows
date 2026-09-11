@@ -58,6 +58,8 @@ RUN_ACTION_FIELDS: dict[str, frozenset[str]] = {
             "refresh_history",
             "regression_sweep",
             "dry_run",
+            "implement",
+            "reconcile_open",
             "separate",
             "confirmed_source_sha",
             "acknowledge_pending_publication",
@@ -79,6 +81,8 @@ RUN_START_WORKFLOW_FIELDS: dict[WorkflowName, frozenset[str]] = {
             "refresh_history",
             "regression_sweep",
             "dry_run",
+            "implement",
+            "reconcile_open",
             "confirmed_source_sha",
             "acknowledge_pending_publication",
         }
@@ -156,6 +160,20 @@ class RunManageRequest(StrictRequest):
     refresh_history: bool = False
     regression_sweep: bool = False
     dry_run: bool = False
+    implement: bool = Field(
+        default=False,
+        description=(
+            "After a successful audit, implement its newly created issues and open partial "
+            "issues with the same concurrency. Accepted only for audit starts."
+        ),
+    )
+    reconcile_open: bool = Field(
+        default=False,
+        description=(
+            "Before discovery, reconcile every issue and pull request open at the "
+            "post-sync snapshot. Accepted only for audit starts."
+        ),
+    )
     separate: bool = False
     pending: list[str] = Field(default_factory=list)
     confirmed_source_sha: FullSha | None = Field(
@@ -217,6 +235,8 @@ class RunManageRequest(StrictRequest):
                 raise ValueError(f"workflow={self.workflow} does not accept {fields}")
             if self.workflow == "gh-implement-issue" and not self.targets:
                 raise ValueError("gh-implement-issue start requires at least one target")
+            if self.workflow == "gh-audit-repo" and self.dry_run and self.implement:
+                raise ValueError("audit implement handoff is incompatible with dry_run")
         return self
 
     def invocation(self) -> dict[str, Any]:
@@ -229,6 +249,8 @@ class RunManageRequest(StrictRequest):
                 "refresh_history": self.refresh_history,
                 "regression_sweep": self.regression_sweep,
                 "dry_run": self.dry_run,
+                "implement": self.implement,
+                "reconcile_open": self.reconcile_open,
             }
         if self.workflow == "gh-curate-issues":
             return {
@@ -609,7 +631,15 @@ class ProbeRequest(ActionRequest, RootModel[ProbeAction]):
     """Run one bounded probe with kind-specific required inputs."""
 
 
-PhaseName = Literal["source", "history", "structure", "discovery", "verification", "publication"]
+PhaseName = Literal[
+    "source",
+    "history",
+    "reconciliation",
+    "structure",
+    "discovery",
+    "verification",
+    "publication",
+]
 PhaseStatus = Literal["pending", "in-progress", "complete", "skipped", "partial", "failed"]
 ShardStatus = Literal["pending", "running", "partial", "complete", "skipped", "failed"]
 CandidateStatus = Literal[

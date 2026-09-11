@@ -159,8 +159,9 @@ it is unavailable, record the unresolved capability gap as a limitation.
 Build an area-aware GitHub history view from compact summaries, then use live full reads
 to establish root cause, paths/symbols, failure mode, requested outcome, required outcomes,
 state, labels, and delivered/rejected/superseded status. Cached summaries select
-candidates and never support publication or mutation conclusions. Closed issues and all
-PRs are read-only evidence. For every matching
+candidates and never support publication or mutation conclusions. Closed issues are
+read-only evidence. PRs are also read-only unless `--reconcile-open` authorizes
+a verified disposition under its dedicated contract. For every matching
 open issue, classify it as:
 
 - `update-existing` when the candidate describes the same root cause/outcome

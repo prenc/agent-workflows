@@ -448,6 +448,66 @@ class TestRuntimeSafety:
             validation = runtime.state("gh-audit-repo")["validations"]["probe-src"]
             assert validation["status"] == "succeeded"
 
+    def test_pull_candidate_probe_is_bound_to_captured_head(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-pull-probe-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime)
+            head_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=runtime.workspace,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            runtime.audit_record(
+                AuditRecordRequest(
+                    action="candidate",
+                    candidate={
+                        "id": "pull-7",
+                        "status": "discovered",
+                        "artifact_kind": "pull",
+                        "pull_number": 7,
+                        "head_sha": head_sha,
+                    },
+                )
+            )
+
+            def captured(args: Any) -> int:
+                artifact_dir = args.run_dir / "validation" / args.probe_id
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                (artifact_dir / "result.json").write_text(
+                    json.dumps(
+                        {
+                            "probe_id": args.probe_id,
+                            "repo_sha": head_sha,
+                            "probe_status": "succeeded",
+                            "returncode": 0,
+                            "timed_out": False,
+                            "worktree_unchanged": True,
+                            "stdout_excerpt": "",
+                            "stderr_excerpt": "",
+                        }
+                    )
+                )
+                return 0
+
+            with (
+                mock.patch.object(runtime, "_pull_probe_worktree", return_value=runtime.workspace),
+                mock.patch("github_workflows.runtime.audit_probe.run_probe", side_effect=captured),
+            ):
+                runtime.audit_probe(
+                    ProbeRequest(
+                        kind="python",
+                        probe_id="probe-pull-7",
+                        candidate_id="pull-7",
+                        code="pass",
+                    )
+                )
+
+            validation = runtime.state("gh-audit-repo")["validations"]["probe-pull-7"]
+            assert validation["source_kind"] == "pull"
+            assert validation["source_sha"] == head_sha
+
     def test_terminal_candidate_probe_is_refused_before_execution(self) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-probe-terminal-") as directory:
             runtime = self.make_runtime(Path(directory))
@@ -897,6 +957,32 @@ class TestRuntimeSafety:
                 "status": "verification-pending",
             }
 
+    def test_public_audit_record_completes_reconciliation_with_flattened_summary(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-reconciliation-phase-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            self.initialize_audit(runtime, reconcile_open=True)
+            summary = {
+                "snapshot_open_issues": 2,
+                "snapshot_open_pulls": 1,
+                "classified_issues": 1,
+                "classified_pulls": 1,
+                "skipped_issues": 1,
+                "skipped_pulls": 0,
+                "coverage_digest": "a" * 64,
+                "snapshot_watermark": "2026-09-10T00:00:00Z",
+            }
+
+            result = runtime.audit_record(
+                AuditRecordRequest(
+                    action="phase",
+                    phase={"name": "reconciliation", "status": "complete", "summary": summary},
+                )
+            )
+
+            assert result["operation"] == "updated"
+            phase = runtime.state("gh-audit-repo")["phases"]["reconciliation"]
+            assert phase == {"status": "complete", **summary}
+
     def make_runtime(self, root: Path) -> WorkflowRuntime:
         workspace = root / "repo"
         workspace.mkdir()
@@ -914,7 +1000,7 @@ class TestRuntimeSafety:
         )
         return WorkflowRuntime(workspace, root / "qwen-project")
 
-    def initialize_audit(self, runtime: WorkflowRuntime) -> None:
+    def initialize_audit(self, runtime: WorkflowRuntime, *, reconcile_open: bool = False) -> None:
         sha = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             cwd=runtime.workspace,
@@ -924,7 +1010,7 @@ class TestRuntimeSafety:
         ).stdout.strip()
         inputs = {
             "repository": "example/repo",
-            "inputs": {"n": 1},
+            "inputs": {"n": 1, "reconcile_open": reconcile_open},
             "audit_worktree": str(runtime.workspace),
             "primary_worktree": str(runtime.workspace),
             "branch": "main",

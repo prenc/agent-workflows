@@ -212,3 +212,24 @@ recoveries, candidate-to-issue grouping, telemetry/token/tool totals, other vali
 and exact resume command (`/gh-audit-repo --resume`). Never claim
 complete coverage when any page, area, scope, verification, or publication is
 unfinished.
+
+## Implementation handoff
+
+After a successful non-dry-run audit with `inputs.implement=true`, refresh the
+repository's open issues and build a deduplicated target list from:
+
+- issue numbers in this run's successful create receipts; and
+- every open issue carrying the exact `partial` label.
+
+Exclude issues that are closed, already claimed, or cannot be resolved
+unambiguously. Record each exclusion. If no targets remain, report a completed no-op. Otherwise start
+`gh-implement-issue` through `run_manage` with the audit repository, target
+list, and `n=inputs.n`, then follow that workflow through finalization.
+
+This handoff is one continuous authorized invocation. Do not repeat the
+interactive preflight. If intake or implementation encounters ambiguity,
+missing authority, an unsafe operation, an unavailable prerequisite, or a
+decision without a conservative default, release workflow-owned claims,
+finalize any usable incomplete work under the implementation contract, record
+the target as skipped, and continue independent units without asking the user.
+Report implemented and skipped targets separately.
