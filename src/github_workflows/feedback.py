@@ -586,6 +586,15 @@ def relative_cutoff(value: str | None, *, now: dt.datetime | None = None) -> str
     current = now or dt.datetime.now(dt.UTC)
     if current.tzinfo is None:
         current = current.replace(tzinfo=dt.UTC)
+    # Reject ages whose cutoff would leave datetime's range before building the timedelta.
+    # The subtraction ranges the stored wall-clock fields and the UTC conversion ranges the
+    # absolute instant, so the usable span is the smaller of the two.
+    usable_span = min(
+        current.replace(tzinfo=None) - dt.datetime.min,  # noqa: DTZ901 - wall-clock range floor
+        current - dt.datetime.min.replace(tzinfo=dt.UTC),
+    )
+    if seconds > usable_span.days * 86400 + usable_span.seconds:
+        raise ValueError("feedback since must be a positive age such as 24h, 30d, or 4w")
     return _iso_utc(current - dt.timedelta(seconds=seconds))
 
 
