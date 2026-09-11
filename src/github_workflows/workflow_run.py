@@ -14,6 +14,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# Mirrors runtime.GIT_TIMEOUT_SECONDS; workflow_run cannot import runtime.
+GIT_TIMEOUT_SECONDS = 10
 WORKFLOWS = {"gh-audit-repo", "gh-curate-issues", "gh-implement-issue"}
 RESUMABLE = {"in-progress", "suspended", "partial"}
 TERMINAL = {"complete", "blocked", "aborted"}
@@ -270,9 +272,18 @@ def append_journal(current: Path, event: str, **detail: Any) -> None:
 
 
 def git(primary: Path, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", "-C", str(primary), *arguments], check=check, capture_output=True, text=True
-    )
+    try:
+        return subprocess.run(
+            ["git", "-C", str(primary), *arguments],
+            check=check,
+            capture_output=True,
+            text=True,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise ValueError(
+            f"git {' '.join(arguments)} timed out after {GIT_TIMEOUT_SECONDS} s"
+        ) from error
 
 
 def audit_source(args: argparse.Namespace) -> None:

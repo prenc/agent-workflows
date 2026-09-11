@@ -4,8 +4,11 @@ import json
 import subprocess
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 import pytest
+
+from github_workflows import workflow_run
 
 HELPER = Path(__file__).parents[1] / "src/github_workflows/workflow_run.py"
 
@@ -976,6 +979,15 @@ class TestWorkflowRun:
         assert source["branch"] == "main"
         assert source["excluded_dirty_state"]["tracked_entries"] == 1
         assert not source["confirmation_required"]
+
+    def test_git_helper_times_out_with_typed_error(self) -> None:
+        blocked = subprocess.TimeoutExpired(cmd=["git"], timeout=10)
+        with mock.patch("github_workflows.workflow_run.subprocess.run", side_effect=blocked) as run:
+            with pytest.raises(
+                ValueError, match="git worktree list --porcelain timed out after 10 s"
+            ):
+                workflow_run.git(self.project, "worktree", "list", "--porcelain")
+        assert run.call_args.kwargs["timeout"] == workflow_run.GIT_TIMEOUT_SECONDS
 
     def test_non_depth_one_validation_artifacts_are_rejected_at_record_time(self) -> None:
         self.initialize()
