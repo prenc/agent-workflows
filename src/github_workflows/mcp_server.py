@@ -111,11 +111,19 @@ class ValidationIssue:
     requirement: str
 
 
-def _field_path(location: tuple[Any, ...], arguments: dict[str, Any]) -> str:
+def _field_path(
+    location: tuple[Any, ...],
+    arguments: dict[str, Any],
+    tag_prefixed: bool = True,
+) -> str:
     parts = list(location)
-    discriminator = arguments.get("action", arguments.get("kind"))
-    if parts and parts[0] == discriminator:
-        parts.pop(0)
+    if tag_prefixed:
+        # Request-model locs lead with the discriminator value, which is dropped;
+        # SDK arg-model locs are flat (param, *subpath) pairs whose field
+        # segment is kept even when it repeats the action value.
+        discriminator = arguments.get("action", arguments.get("kind"))
+        if parts and parts[0] == discriminator:
+            parts.pop(0)
     rendered: list[str] = []
     for part in parts:
         if isinstance(part, int):
@@ -128,12 +136,16 @@ def _field_path(location: tuple[Any, ...], arguments: dict[str, Any]) -> str:
     return ".".join(rendered) or "request"
 
 
-def _validation_issues(error: ValidationError, arguments: dict[str, Any]) -> list[ValidationIssue]:
+def _validation_issues(
+    error: ValidationError,
+    arguments: dict[str, Any],
+    tag_prefixed: bool = True,
+) -> list[ValidationIssue]:
     """Return distinct field requirements without rejected values or framework prose."""
     issues: list[ValidationIssue] = []
     seen: set[ValidationIssue] = set()
     for detail in error.errors(include_url=False, include_input=False):
-        field = _field_path(detail["loc"], arguments)
+        field = _field_path(detail["loc"], arguments, tag_prefixed)
         kind = detail["type"]
         context = detail.get("ctx") or {}
         if kind == "missing":
@@ -142,7 +154,7 @@ def _validation_issues(error: ValidationError, arguments: dict[str, Any]) -> lis
             requirement = "is not accepted"
         elif kind in {"list_type", "list_parsing"}:
             requirement = "must be a list"
-        elif kind in {"dict_type", "mapping_type"}:
+        elif kind in {"dict_type", "mapping_type", "model_type"}:
             requirement = "must be an object"
         elif kind == "string_type":
             requirement = "must be a string"
@@ -202,8 +214,12 @@ def _validation_issues(error: ValidationError, arguments: dict[str, Any]) -> lis
     return issues
 
 
-def _render_validation_error(error: ValidationError, arguments: dict[str, Any]) -> str:
-    issues = _validation_issues(error, arguments)
+def _render_validation_error(
+    error: ValidationError,
+    arguments: dict[str, Any],
+    tag_prefixed: bool = True,
+) -> str:
+    issues = _validation_issues(error, arguments, tag_prefixed)
     discriminator = "action" if "action" in arguments else "kind" if "kind" in arguments else None
     discriminator_value = arguments.get(discriminator) if discriminator is not None else None
     missing = [issue.field for issue in issues if issue.kind == "missing"]
@@ -711,7 +727,11 @@ class WorkflowMCPServer(MCPServer[Any]):
                     name,
                     validation.errors(include_url=False, include_input=False),
                 )
-                message = _render_validation_error(validation, arguments)
+                # SDK arg-model validation attaches its ValidationError directly
+                # as this ToolError's cause; request-model failures are wrapped
+                # one ToolError deeper, so only those locs are tag-prefixed.
+                tag_prefixed = error.__cause__ is not validation
+                message = _render_validation_error(validation, arguments, tag_prefixed)
             else:
                 message = _expected_message(error)
             raise ToolError(

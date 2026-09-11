@@ -1172,6 +1172,101 @@ class TestExtensionMcp:
         rendered = _render_validation_error(validation.value, {"action": "start"})
         assert rendered == "n must be a positive integer"
 
+    async def test_validation_corrections_keep_self_named_fields_and_expected_shape(
+        self,
+    ) -> None:
+        # The self-named audit_record parameters repeat their action value, so the
+        # flat SDK arg-model locs must keep the field segment; non-JSON strings on
+        # model-typed arguments name the expected shape instead of "is invalid".
+        with tempfile.TemporaryDirectory(prefix="github-workflows-correction-") as directory:
+            root = Path(directory)
+            workspace = root / "repo"
+            workspace.mkdir()
+            runtime = WorkflowRuntime(workspace, root / "qwen-project")
+            cases = [
+                (
+                    "audit_record",
+                    {"action": "phase", "phase": "not-json"},
+                    "phase must be an object",
+                ),
+                (
+                    "audit_record",
+                    {"action": "shard", "shard": "not-json"},
+                    "shard must be an object",
+                ),
+                (
+                    "audit_record",
+                    {"action": "candidate", "candidate": "not-json"},
+                    "candidate must be an object",
+                ),
+                (
+                    "audit_record",
+                    {"action": "verdict", "verdict": "not-json"},
+                    "verdict must be an object",
+                ),
+                (
+                    "audit_record",
+                    {"action": "limitation", "limitation": 5},
+                    "limitation must be a string",
+                ),
+                (
+                    "audit_record",
+                    {"action": "pending", "pending": "not-json"},
+                    "pending must be a list",
+                ),
+                (
+                    "audit_record",
+                    {"action": "head_drift", "head_drift": "not-json"},
+                    "head_drift must be an object",
+                ),
+                (
+                    "audit_record",
+                    {"action": "phase", "phase": {"name": "bad-phase"}},
+                    "phase.name must be one of:",
+                ),
+                (
+                    "audit_record",
+                    {"action": "phase", "phase": {}},
+                    "action=phase requires phase.name",
+                ),
+                (
+                    "task_manage",
+                    {
+                        "action": "plan",
+                        "workflow": "gh-curate-issues",
+                        "task": "not-json",
+                    },
+                    "task must be an object",
+                ),
+            ]
+            async with Client(
+                create_server(runtime),
+                raise_exceptions=False,
+                read_timeout_seconds=0.1,
+            ) as client:
+                for tool_name, arguments, correction in cases:
+                    result = await client.call_tool(tool_name, arguments)
+                    assert result.is_error, (tool_name, arguments)
+                    assert result.content[0].text.startswith(correction), (
+                        tool_name,
+                        result.content[0].text,
+                    )
+
+        # Tag-prefixed request-model locs still drop only the discriminator segment.
+        with pytest.raises(ValidationError) as validation:
+            AuditRecordRequest.model_validate({"action": "phase", "phase": {"name": "bad-phase"}})
+        issues = _validation_issues(validation.value, {"action": "phase"})
+        assert [(issue.field, issue.kind) for issue in issues] == [("phase.name", "literal_error")]
+
+        with pytest.raises(ValidationError) as validation:
+            TaskManageRequest.model_validate(
+                {"action": "plan", "workflow": "gh-curate-issues", "task": "not-json"}
+            )
+        issues = _validation_issues(validation.value, {"action": "plan"})
+        assert [(issue.field, issue.kind, issue.requirement) for issue in issues] == [
+            ("task", "model_type", "must be an object")
+        ]
+
     async def test_expected_runtime_failure_is_actionable_tool_error(
         self, caplog: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
