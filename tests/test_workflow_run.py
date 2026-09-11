@@ -982,11 +982,12 @@ class TestWorkflowRun:
 
     def test_git_helper_times_out_with_typed_error(self) -> None:
         blocked = subprocess.TimeoutExpired(cmd=["git"], timeout=10)
-        with mock.patch("github_workflows.workflow_run.subprocess.run", side_effect=blocked):
+        with mock.patch("github_workflows.workflow_run.subprocess.run", side_effect=blocked) as run:
             with pytest.raises(
                 ValueError, match="git worktree list --porcelain timed out after 10 s"
             ):
                 workflow_run.git(self.project, "worktree", "list", "--porcelain")
+        assert run.call_args.kwargs["timeout"] == workflow_run.GIT_TIMEOUT_SECONDS
 
     def test_non_depth_one_validation_artifacts_are_rejected_at_record_time(self) -> None:
         self.initialize()

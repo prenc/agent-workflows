@@ -468,21 +468,28 @@ class WorkflowRuntime:
                                 and not worktree.is_symlink()
                                 and worktree.is_dir()
                             ):
-                                subprocess.run(
-                                    [
-                                        "git",
-                                        "-C",
-                                        str(self.workspace),
-                                        "worktree",
-                                        "remove",
-                                        "--force",
-                                        str(worktree),
-                                    ],
-                                    check=True,
-                                    stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE,
-                                    text=True,
-                                )
+                                try:
+                                    subprocess.run(
+                                        [
+                                            "git",
+                                            "-C",
+                                            str(self.workspace),
+                                            "worktree",
+                                            "remove",
+                                            "--force",
+                                            str(worktree),
+                                        ],
+                                        check=True,
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE,
+                                        text=True,
+                                        timeout=GIT_TIMEOUT_SECONDS,
+                                    )
+                                except subprocess.TimeoutExpired as error:
+                                    raise ValueError(
+                                        "stale probe worktree removal timed out "
+                                        f"after {GIT_TIMEOUT_SECONDS} s"
+                                    ) from error
                 repo = state.get("repository")
                 if isinstance(repo, str) and repo:
                     try:
@@ -518,27 +525,39 @@ class WorkflowRuntime:
 
     def _ensure_local_worktree_ignored(self) -> None:
         probe = ".worktrees/probe"
-        ignored = subprocess.run(
-            ["git", "-C", str(self.workspace), "check-ignore", "-q", "--no-index", probe],
-            check=False,
-        )
+        try:
+            ignored = subprocess.run(
+                ["git", "-C", str(self.workspace), "check-ignore", "-q", "--no-index", probe],
+                check=False,
+                timeout=GIT_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise ValueError(
+                f"worktree root check-ignore timed out after {GIT_TIMEOUT_SECONDS} s"
+            ) from error
         if ignored.returncode == 0:
             return
         if ignored.returncode != 1:
             raise ValueError("Git could not determine whether .worktrees is ignored")
-        exclude_result = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(self.workspace),
-                "rev-parse",
-                "--path-format=absolute",
-                "--git-common-dir",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        try:
+            exclude_result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(self.workspace),
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-common-dir",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=GIT_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise ValueError(
+                f"Git common directory rev-parse timed out after {GIT_TIMEOUT_SECONDS} s"
+            ) from error
         exclude_value = exclude_result.stdout.strip()
         if exclude_result.returncode != 0 or not exclude_value:
             raise ValueError("Git could not resolve its private info exclude file")
@@ -591,10 +610,16 @@ class WorkflowRuntime:
                 os.close(info_descriptor)
         finally:
             os.close(common_descriptor)
-        verified = subprocess.run(
-            ["git", "-C", str(self.workspace), "check-ignore", "-q", "--no-index", probe],
-            check=False,
-        )
+        try:
+            verified = subprocess.run(
+                ["git", "-C", str(self.workspace), "check-ignore", "-q", "--no-index", probe],
+                check=False,
+                timeout=GIT_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise ValueError(
+                f"worktree exclude verification check-ignore timed out after {GIT_TIMEOUT_SECONDS} s"
+            ) from error
         if verified.returncode != 0:
             raise ValueError("Git info exclude did not ignore .worktrees")
 

@@ -30,7 +30,7 @@ from github_workflows.models import (
     RunManageRequest,
     TaskManageRequest,
 )
-from github_workflows.runtime import WorkflowRuntime
+from github_workflows.runtime import GIT_TIMEOUT_SECONDS, WorkflowRuntime
 
 ROOT = Path(__file__).parents[1]
 EXTENSION = ROOT / "extensions/github-workflows"
@@ -4082,7 +4082,7 @@ class TestRuntimeSafety:
             runtime = self.make_runtime(Path(directory))
             monkeypatch.setenv("XDG_CACHE_HOME", str(Path(directory) / "xdg-cache"))
             started = threading.Event()
-            first_slow = threading.Event()
+            release = threading.Event()
             confirmed_source_sha = subprocess.run(
                 ["git", "-C", str(runtime.workspace), "rev-parse", "HEAD"],
                 check=True,
@@ -4092,10 +4092,9 @@ class TestRuntimeSafety:
             real = WorkflowRuntime._source_and_worktree
 
             def slow(self: WorkflowRuntime, confirmed_sha: str | None) -> dict[str, Any]:
-                if not first_slow.is_set():
-                    first_slow.set()
+                if threading.current_thread() is thread:
                     started.set()
-                    time.sleep(2.0)
+                    assert release.wait(10)
                 return real(self, confirmed_sha)
 
             errors: list[Exception] = []
@@ -4117,17 +4116,19 @@ class TestRuntimeSafety:
             with mock.patch.object(WorkflowRuntime, "_source_and_worktree", slow):
                 thread = threading.Thread(target=audit_start)
                 thread.start()
-                assert started.wait(10)
-                time.sleep(0.3)
-                receipts["main"] = runtime.run_manage(
-                    RunManageRequest(
-                        action="start",
-                        workflow="gh-audit-repo",
-                        repository="example/repo",
-                        confirmed_source_sha=confirmed_source_sha,
+                try:
+                    assert started.wait(10)
+                    receipts["main"] = runtime.run_manage(
+                        RunManageRequest(
+                            action="start",
+                            workflow="gh-audit-repo",
+                            repository="example/repo",
+                            confirmed_source_sha=confirmed_source_sha,
+                        )
                     )
-                )
-                thread.join(timeout=60)
+                finally:
+                    release.set()
+                    thread.join(timeout=10)
 
             assert not thread.is_alive()
             assert "thread" not in receipts
@@ -4174,13 +4175,32 @@ class TestRuntimeSafety:
                     {"audit_worktree": "/missing", "sha": "a" * 40}
                 )
 
-    def test_worktree_root_check_ignore_times_out(self) -> None:
+    @pytest.mark.parametrize(
+        ("stalled_call", "message"),
+        [
+            (1, "check-ignore timed out"),
+            (2, "rev-parse timed out"),
+            (3, "verification check-ignore timed out"),
+        ],
+    )
+    def test_worktree_root_git_times_out(self, stalled_call, message) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-check-ignore-") as directory:
             runtime = self.make_runtime(Path(directory))
-            blocked = subprocess.TimeoutExpired(cmd=["git"], timeout=10)
-            with mock.patch("github_workflows.runtime.subprocess.run", side_effect=blocked):
-                with pytest.raises(ValueError, match="check-ignore timed out"):
+            real_run = subprocess.run
+            calls = 0
+
+            def stalled(cmd, *args, **kwargs):
+                nonlocal calls
+                calls += 1
+                assert kwargs["timeout"] == GIT_TIMEOUT_SECONDS
+                if calls == stalled_call:
+                    raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs["timeout"])
+                return real_run(cmd, *args, **kwargs)
+
+            with mock.patch("github_workflows.runtime.subprocess.run", side_effect=stalled):
+                with pytest.raises(ValueError, match=message):
                     runtime._worktree_root()
+            assert calls == stalled_call
 
     def test_audit_worktree_add_times_out(self, monkeypatch) -> None:
         with tempfile.TemporaryDirectory(prefix="runtime-worktree-add-") as directory:
@@ -4196,9 +4216,30 @@ class TestRuntimeSafety:
 
             def stalled_add(cmd, *args, **kwargs):
                 if "worktree" in cmd and "add" in cmd:
-                    raise subprocess.TimeoutExpired(cmd=cmd, timeout=10)
+                    assert kwargs["timeout"] == GIT_TIMEOUT_SECONDS
+                    assert "core.hooksPath=/dev/null" in cmd
+                    raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs["timeout"])
                 return real_run(cmd, *args, **kwargs)
 
             with mock.patch("github_workflows.runtime.subprocess.run", side_effect=stalled_add):
                 with pytest.raises(ValueError, match="worktree creation timed out"):
                     runtime._source_and_worktree(confirmed_source_sha)
+
+    @pytest.mark.parametrize("cached", [False, True])
+    def test_discard_stale_run_worktree_removal_times_out(self, monkeypatch, cached) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-stale-timeout-") as directory:
+            runtime = self.make_runtime(Path(directory))
+            monkeypatch.setenv("XDG_CACHE_HOME", str(Path(directory) / "xdg-cache"))
+            self.initialize_audit(runtime)
+            state = runtime.state("gh-audit-repo")
+            root = runtime._cache_worktree_path() if cached else runtime.workspace / ".worktrees"
+            worktree = root / f"gh-audit-pr-{runtime._run_ref(state['run_id'])}-95-abcdef0"
+            worktree.mkdir(parents=True)
+            blocked = subprocess.TimeoutExpired(cmd=["git"], timeout=GIT_TIMEOUT_SECONDS)
+            with mock.patch("github_workflows.runtime.subprocess.run", side_effect=blocked) as run:
+                with pytest.raises(ValueError, match="stale probe worktree removal timed out"):
+                    runtime._discard_stale_run("gh-audit-repo")
+            assert run.call_args.kwargs["timeout"] == GIT_TIMEOUT_SECONDS
+            assert run.call_args.args[0][-4:] == ["worktree", "remove", "--force", str(worktree)]
+            assert runtime.state("gh-audit-repo") == state
+            assert worktree.is_dir()
