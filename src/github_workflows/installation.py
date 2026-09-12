@@ -1,4 +1,4 @@
-"""Install the repository's user policies, Qwen extension, and Codex skills."""
+"""Install the repository's Qwen extension and Codex skills."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 POLARS_URL = "https://github.com/polars-inc/skills"
-USER_POLICY_MARKER = "<!-- managed by agent-workflows; edit user-policies sources -->"
+LEGACY_USER_POLICY_MARKER = b"<!-- managed by agent-workflows; edit user-policies sources -->"
 MCP_SERVERS = {
     "github": "https://api.githubcopilot.com/mcp/",
     "context7": "https://mcp.context7.com/mcp",
@@ -303,59 +303,6 @@ class Installer:
             else:
                 self.warnings.append(f"refusing unmanaged retired Codex skill: {target}")
 
-    def user_policy_targets(self) -> tuple[tuple[Path, Path, str], ...]:
-        return (
-            (
-                self.root / "user-policies" / "codex.md",
-                self.home / ".codex" / "AGENTS.md",
-                "Codex user instructions",
-            ),
-            (
-                self.root / "user-policies" / "qwen.md",
-                self.home / ".qwen" / "QWEN.md",
-                "Qwen user instructions",
-            ),
-        )
-
-    def rendered_user_policy(self, source: Path) -> str:
-        sections = [USER_POLICY_MARKER, source.read_text(encoding="utf-8").strip()]
-        if self.args.machine_role == "remote":
-            sections.append(
-                (self.root / "user-policies" / "remote-compute.md")
-                .read_text(encoding="utf-8")
-                .strip()
-            )
-        return "\n\n".join(sections) + "\n"
-
-    def managed_user_policy(self, target: Path) -> bool:
-        linked = resolved_link(target)
-        sources = {source.resolve() for source, _target, _label in self.user_policy_targets()}
-        if linked in sources:
-            return True
-        if not target.is_file() or target.is_symlink():
-            return False
-        content = target.read_text(encoding="utf-8")
-        if content.startswith(USER_POLICY_MARKER):
-            return True
-        return any(content == source.read_text(encoding="utf-8") for source in sources)
-
-    def plan_user_policies(self) -> None:
-        for source, target, label in self.user_policy_targets():
-            expected = self.rendered_user_policy(source)
-            if target.is_file() and not target.is_symlink() and target.read_text() == expected:
-                self.notice(f"{label} are current")
-            elif (not target.exists() and not target.is_symlink()) or self.managed_user_policy(
-                target
-            ):
-                group = "Codex" if "Codex" in label else "Qwen"
-                self.add_change(
-                    f"install {label}",
-                    group=group,
-                    component="user-policies",
-                )
-            else:
-                self.warnings.append(f"refusing unmanaged {label}: {target}")
-
     def plan_qwen(self) -> None:
         if command_path("qwen") is None:
             self.warnings.append("Qwen Code is unavailable; extension linking will be skipped")
@@ -371,6 +318,28 @@ class Installer:
             self.add_change("link the github-workflows extension", group="Qwen", component="qwen")
         else:
             self.warnings.append(f"refusing unmanaged Qwen extension: {target}")
+
+    def legacy_user_policy_targets(self) -> tuple[tuple[Path, str], ...]:
+        return (
+            (self.home / ".codex" / "AGENTS.md", "Codex user instructions"),
+            (self.home / ".qwen" / "QWEN.md", "Qwen user instructions"),
+        )
+
+    @staticmethod
+    def legacy_user_policy(target: Path) -> bool:
+        if target.is_symlink() or not target.is_file():
+            return False
+        with target.open("rb") as handle:
+            return handle.read(len(LEGACY_USER_POLICY_MARKER)) == LEGACY_USER_POLICY_MARKER
+
+    def plan_legacy_user_policies(self) -> None:
+        for target, label in self.legacy_user_policy_targets():
+            if self.legacy_user_policy(target):
+                self.add_change(
+                    f"remove legacy managed {label}",
+                    group="Shared",
+                    component="legacy-user-policies",
+                )
 
     def _inspect_mcp(self, client: str, executable: str) -> set[str] | None:
         """Return configured server names without connecting to them."""
@@ -648,22 +617,6 @@ class Installer:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.symlink_to(source, target_is_directory=source.is_dir())
 
-    def apply_user_policies(self) -> None:
-        for source, target, label in self.user_policy_targets():
-            if f"install {label}" not in self.changes:
-                continue
-            expected = self.rendered_user_policy(source)
-            if target.is_file() and not target.is_symlink() and target.read_text() == expected:
-                continue
-            if (not target.exists() and not target.is_symlink()) or self.managed_user_policy(
-                target
-            ):
-                self.apply_notice(f"install {label}")
-                if target.is_symlink() or target.is_file():
-                    target.unlink()
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(expected, encoding="utf-8")
-
     def apply_codex(self) -> None:
         destination = self.home / ".codex" / "skills"
         for source in sorted((self.root / "codex" / "skills").iterdir()):
@@ -675,6 +628,7 @@ class Installer:
             if not target.exists() and not target.is_symlink():
                 self.apply_notice(f"link skill {source.name}")
                 self.replace_link(source, target)
+
             elif self._link_points_into(target, (*_CODEX_SKILL_ROOT, source.name)):
                 self.apply_notice(f"re-link skill {source.name}")
                 self.replace_link(source, target)
@@ -685,6 +639,13 @@ class Installer:
             target = destination / name
             if self._link_points_into(target, (*_CODEX_SKILL_ROOT, name)):
                 self.apply_notice(change)
+                target.unlink()
+
+    def apply_legacy_user_policies(self) -> None:
+        for target, label in self.legacy_user_policy_targets():
+            description = f"remove legacy managed {label}"
+            if description in self.changes and self.legacy_user_policy(target):
+                self.apply_notice(description)
                 target.unlink()
 
     def apply_qwen(self) -> None:
@@ -772,7 +733,7 @@ class Installer:
     def install(self) -> int:
         self.plan_runtime()
         self.plan_agent_command()
-        self.plan_user_policies()
+        self.plan_legacy_user_policies()
         self.plan_codex()
         self.plan_qwen()
         self.plan_mcp()
@@ -785,8 +746,8 @@ class Installer:
             self.apply_runtime()
         if "agent-command" in self.changed_components:
             self.apply_agent_command()
-        if "user-policies" in self.changed_components:
-            self.apply_user_policies()
+        if "legacy-user-policies" in self.changed_components:
+            self.apply_legacy_user_policies()
         if "codex" in self.changed_components:
             self.apply_codex()
         if "qwen" in self.changed_components:
@@ -800,12 +761,6 @@ class Installer:
 
 
 def add_install_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--machine-role",
-        choices=("local", "remote"),
-        default="local",
-        help="include remote compute-environment instructions only on remote machines",
-    )
     parser.add_argument(
         "--dev", action="store_true", help="also install development tools and Git hook"
     )

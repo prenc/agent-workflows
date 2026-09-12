@@ -18,21 +18,17 @@ uv run agent-workflows install
 The `gh` CLI supports the `gh-pickup-work` managed-comment helper and is the
 fallback when GitHub MCP is unavailable.
 
-The command installs the project into `.venv`, renders the user-level Codex and
-Qwen instruction files, links this checkout as the Qwen extension, links the
-Codex skills, and installs the official Polars skill for both agents.
+The command installs the project into `.venv`, links this checkout as the Qwen
+extension, links the Codex skills, and installs the official Polars skill for
+both agents.
 It also detects missing GitHub and Context7 MCP registrations for each client
 and presents pending work in separate Codex, Qwen, and Shared sections. Press
 Enter to install everything, enter numbers or ranges such as `2 4-6` to exclude
 those entries, or enter `A` to exclude everything. Existing named MCP servers
 are preserved. Use `--skip-mcp` to leave MCP configuration unchanged; `--yes`
 selects every listed integration without prompting.
-The neutral source artifacts live under `user-policies/`; their filenames do
-not trigger repository instruction discovery before installation.
 It is safe to rerun. Use `--dry-run` to inspect changes, `--yes` for unattended
 installation, and `--verbose` to include unchanged integrations. The default
-`--machine-role local` omits cluster-specific compute instructions; use
-`--machine-role remote` when installing on a shared remote or HPC machine.
 
 Manual workflow recovery is available through `agent-workflows workflow --help`. Qwen starts the MCP server through the private `agent-workflows mcp`
 subcommand declared in `qwen-extension.json`.
